@@ -1,0 +1,85 @@
+/**
+ * @denel/ui — shared theme (palette + token→utility map).
+ *
+ * The single source of truth for Denel Dental's app colours. Every app except
+ * the public website imports it (portal, team, patient, hr, reports), so they
+ * all render the same navy + gold theme. An app that wants a different accent can
+ * override individual tokens in its own `:root` AFTER this import; by default it
+ * inherits the full palette below.
+ *
+ *   @import "tailwindcss";
+ *   @import "@denel/ui/theme/base.css";
+ *
+ * `@theme inline` emits `hsl(var(--token))` into each utility, so token values are
+ * resolved by the browser at runtime from the `:root` below (or from
+ * theme/dark.css, which HR and reports add on top to follow the OS dark mode).
+ */
+
+:root {
+  /* Light by default. The portal, team and patient apps are light-only; HR and
+     reports import theme/dark.css, which switches this to dark with the OS. */
+  color-scheme: light;
+  /* Brand palette — navy #24296A (235.7 49.3% 27.8%, sampled from the approved
+     logo artwork — the brand guide's own written swatch, #001472, doesn't match
+     any shipped logo file and disagrees with its own listed RGB breakdown, so
+     the artwork wins) + gold #B8873A (36.7 52.1% 47.5%, also sampled from the
+     logo's gradient mark), with cool neutrals. */
+  --background: 0 0% 100%;
+  --foreground: 222 20% 12%;
+  --card: 0 0% 100%;
+  --card-foreground: 222 20% 12%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 222 20% 12%;
+  /* Primary = brand navy (actions, headings emphasis). */
+  --primary: 236 49% 28%;
+  --primary-foreground: 210 40% 98%;
+  --secondary: 220 14% 96%;
+  --secondary-foreground: 236 49% 28%;
+  --muted: 220 14% 96%;
+  --muted-foreground: 220 9% 46%;
+  /* Accent = soft neutral tint (hover/active surfaces) — the vivid gold lives
+     in --brand below, not here, matching shadcn's usual muted-hover role. */
+  --accent: 220 14% 96%;
+  --accent-foreground: 236 49% 28%;
+  --destructive: 0 84.2% 60.2%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 220 20% 90%;
+  --input: 220 20% 90%;
+  /* Focus ring = brand gold. */
+  --ring: 36.7 52.1% 47.5%;
+  --radius: 0.5rem;
+
+  /* Brand gold — use via `bg-brand` / `text-brand` / `from-brand`. Sparingly:
+     the brand guide treats gold as an accent, not a fill color. */
+  --brand: 36.7 52.1% 47.5%;
+  --brand-foreground: 236 49% 28%;
+
+  /* PWA-specific */
+  --nav-height: 4rem;
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --color-brand: hsl(var(--brand));
+  --color-brand-foreground: hsl(var(--brand-foreground));
+  --radius: var(--radius);
+}

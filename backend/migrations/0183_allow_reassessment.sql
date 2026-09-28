@@ -1,0 +1,1 @@
+ALTER TABLE "training_materials" ADD COLUMN "allowReassessment" boolean DEFAULT false NOT NULL;

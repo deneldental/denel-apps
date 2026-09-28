@@ -1,0 +1,1 @@
+CREATE INDEX "idx_staff_requests_staff_id" ON "staff_requests" USING btree ("staffId");

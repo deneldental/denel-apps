@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -r \"from ''@/lib/db\\\\b\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/components/\")",
+      "Bash(grep -rn \"from ''pg''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/\")",
+      "Bash(grep -l \"\"\"pg\"\"\" \"a:/2026/DEV PROJECTS/framada-projects/node_modules/.pnpm/better-auth@1.5.2_@prisma+c_27569c588d315e9ba7c2b0e763fec5f4/node_modules/better-auth/package.json\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''deps:'', list\\(d.get\\(''dependencies'',{}\\).keys\\(\\)\\)[:20]\\); print\\(''peerDeps:'', list\\(d.get\\(''peerDependencies'',{}\\).keys\\(\\)\\)[:20]\\)\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); exports=d.get\\(''exports'',{}\\); react=exports.get\\(''./react'',{}\\); print\\(json.dumps\\(react, indent=2\\)\\)\")",
+      "Bash(grep -l \"from ''pg''\" \"a:/2026/DEV PROJECTS/framada-projects/node_modules/.pnpm/drizzle-orm@0.45.1/node_modules/drizzle-orm/dist/pg-core/index.js\")",
+      "Bash(grep -c \"from ''pg''\\\\|require.*pg\" \"a:/2026/DEV PROJECTS/framada-projects/node_modules/.pnpm/better-auth@1.5.2_@prisma+c_27569c588d315e9ba7c2b0e763fec5f4/node_modules/better-auth/dist/index.mjs\")",
+      "Bash(grep \"from ''pg''\\\\|require.*[''\"\"]pg[''\"\"]\" \"a:/2026/DEV PROJECTS/framada-projects/node_modules/.pnpm/better-auth@1.5.2_@prisma+c_27569c588d315e9ba7c2b0e763fec5f4/node_modules/better-auth/dist/index.mjs\")",
+      "Bash(grep -rn \"from ''@/lib/db''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/lib/actions/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/components/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/src/\")",
+      "Bash(grep -rn \"from ''@/lib/db''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); optimized=d.get\\(''optimized'',{}\\); [print\\(k,''->'',v.get\\(''src'',''?''\\)\\) for k,v in optimized.items\\(\\) if ''pg'' in k.lower\\(\\) or ''node-postgres'' in k.lower\\(\\) or ''drizzle'' in k.lower\\(\\)]\")",
+      "Bash(grep -l \"chunk-S7VY6UO5\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/node_modules/.vite/deps/\"*.js)",
+      "Bash(python -c \" import sys, json d = json.load\\(sys.stdin\\) # Check optimized list for what imports what optimized = d.get\\(''optimized'', {}\\) chunks = d.get\\(''chunks'', {}\\) print\\(''optimized keys:'', list\\(optimized.keys\\(\\)\\)\\) \")",
+      "Bash(grep -rn \"from ''next/\\\\|from \"\"next/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/components/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/lib/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/src/\")",
+      "Bash(grep -rn \"from ''next/headers''\\\\|from \"\"next/headers\"\"\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/components/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/lib/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/src/\")",
+      "Bash(grep -rn \"from ''next/image''\\\\|from \"\"next/image\"\"\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/components/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/src/\")",
+      "Bash(grep -rn \"from ''next/dynamic''\\\\|from \"\"next/dynamic\"\"\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/components/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/src/\")",
+      "Bash(grep -rn \"from ''next/server''\\\\|from \"\"next/server\"\"\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/components/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/lib/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/src/\")",
+      "Bash(grep -rn \"from ''pino''\\\\|from ''ioredis''\\\\|from ''dotenv''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/components/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/lib/actions/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/src/\")",
+      "Bash(grep -rn \"from ''pg''\\\\|from ''drizzle-orm/node-postgres''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/lib/\")",
+      "Bash(grep -rn \"from ''ioredis''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/lib/\")",
+      "Bash(grep -rn \"from ''ioredis''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/\")",
+      "Bash(grep -rn \"from ''@/lib/logger''\\\\|from ''../logger''\\\\|from ''../../lib/logger''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/lib/actions/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/components/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/src/\")",
+      "Bash(grep -rn \"from ''@/lib/logger''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/\")",
+      "Bash(grep -rn \"from ''@/lib/db''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/lib/actions/\")",
+      "Bash(grep -rn \"from ''@/lib/cache''\\\\|from ''@/lib/startup''\\\\|from ''@/lib/rbac''\\\\|from ''@/lib/audit''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/lib/actions/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/components/\")",
+      "Bash(grep -rn \"from ''@/lib/constants''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/lib/actions/\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/components/\")",
+      "Bash(grep -rn \"from ''@/lib/cache''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/lib/actions/\")",
+      "Bash(grep -rn \"from ''@/lib/cache''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/\")",
+      "Bash(grep -rn \"from ''@/lib/rbac''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/src/\")",
+      "Bash(grep -rn \"from ''@/lib/rbac''\\\\|from ''@/lib/audit''\\\\|from ''@/lib/cache''\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/src/\")",
+      "Bash(pnpm install --no-frozen-lockfile)",
+      "Bash(sed -i \"s|import LedgerAdjustmentsPage from ''./pages/ledger-adjustments/index''|import LedgerAdjustmentsPage from ''./pages/ledger-adjustments/index''\\\\nimport AnalyticsPage from ''./pages/analytics/index''|\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/src/App.tsx\")",
+      "Bash(sed -i \"s|<Route path=\"\"/ledger-adjustments\"\" element={<LedgerAdjustmentsPage />} />|<Route path=\"\"/ledger-adjustments\"\" element={<LedgerAdjustmentsPage />} />\\\\n                        <Route path=\"\"/analytics\"\" element={<AnalyticsPage />} />|\" \"a:/2026/DEV PROJECTS/framada-projects/mini-clinic/src/App.tsx\")",
+      "Bash(rm portals/.husky/pre-commit)",
+      "Bash(rmdir portals/.husky)",
+      "Bash(npx tsc *)"
+    ]
+  }
+}

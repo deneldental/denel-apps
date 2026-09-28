@@ -1,0 +1,313 @@
+@import "tailwindcss";
+@import "@denel/ui/theme/base.css";
+@source "../../packages/ui/src/**/*.{ts,tsx}";
+
+/* Palette (colors + --brand gold accent) now lives in @denel/ui/theme/base.css
+ * — the single source shared with team/patient. Portal only adds what's
+ * genuinely its own: fonts and the `font-heading` utility for Playfair
+ * Display (brand guide: headings/titles only, never body copy). */
+@theme inline {
+  --font-sans: "Montserrat", Arial, Helvetica, sans-serif;
+  --font-heading: "Playfair Display", Georgia, serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+
+/* Portal is light-only, matching @denel/ui/theme/base.css (see its header
+ * comment) — no dark-mode token overrides. A previous OS-driven dark block
+ * here still had the pre-rebrand palette; removed rather than left to silently
+ * reactivate stale colors for anyone with a dark-mode OS preference. */
+
+/* Bind Tailwind's `dark:` variant to an explicit `.dark` class (which the portal
+ * never sets) instead of the default `prefers-color-scheme` media query — the
+ * same rule team and patient use. Without it the portal's `dark:` utilities
+ * (status pills, badges) switch on for anyone whose OS is in dark mode while the
+ * tokens stay light, and their light-on-dark treatments lose contrast. */
+@custom-variant dark (&:is(.dark *));
+
+@layer base {
+  * {
+    border-color: hsl(var(--border));
+  }
+
+  /* Chrome paints its own background + text colour on autofilled inputs, which
+   * is why the password field rendered solid while the email field next to it
+   * kept the form styling. Repaint it with our own tokens; the long transition
+   * is the standard trick to stop the UA background ever winning. */
+  input:-webkit-autofill,
+  input:-webkit-autofill:hover,
+  input:-webkit-autofill:focus,
+  input:-webkit-autofill:active {
+    -webkit-text-fill-color: hsl(var(--foreground));
+    -webkit-box-shadow: 0 0 0 1000px hsl(var(--background)) inset;
+    caret-color: hsl(var(--foreground));
+    transition: background-color 9999s ease-in-out 0s;
+  }
+}
+
+body {
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: var(--font-sans);
+}
+
+@layer utilities {
+  @keyframes progress {
+    0% {
+      transform: translateX(-100%);
+    }
+    50% {
+      transform: translateX(0%);
+    }
+    100% {
+      transform: translateX(100%);
+    }
+  }
+
+  .animate-progress {
+    animation: progress 1.5s infinite linear;
+  }
+
+  /* Cross-browser scrollbar hide — keeps scroll behavior, hides the rail. */
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Auth panel photo slideshow (features/auth/components/auth-layout.tsx).
+ *
+ * N photos share one cycle of `--auth-slide` x N, staggered a slide apart, so
+ * exactly one is at full strength at a time and the hand-off is a cross-fade,
+ * not a cut. Each scales slowly while it is up; direction alternates (odd
+ * frames push in, even frames pull back out) so the panel breathes instead of
+ * pulsing the same way every time. Timing matches the approved motion artifact.
+ *
+ * `@keyframes` percentages cannot read a custom property, so the plateau — the
+ * 1/N of the cycle each photo owns — has to be baked per count. Hence one
+ * keyframe set per supported frame count, picked by `.auth-panel-<n>`.
+ * Admins can configure up to 6; a single photo renders as a still.
+ *
+ * `nth-of-type` counts img siblings, so the gold lockup — also an img, but
+ * without this class — is never matched by these rules.
+ */
+@layer utilities {
+  .auth-panel {
+    --auth-slide: 7s;
+    --auth-zoom: 1.12;
+    --auth-vis: 0.35;
+  }
+
+  .auth-panel-slide {
+    position: absolute;
+    inset: 0;
+    z-index: -10;
+    height: 100%;
+    width: 100%;
+    object-fit: cover;
+    opacity: 0;
+    mix-blend-mode: luminosity;
+    transform-origin: center center;
+    pointer-events: none;
+    will-change: transform, opacity;
+    --from: 1;
+    --to: var(--auth-zoom);
+    animation-timing-function: ease-in-out;
+    animation-iteration-count: infinite;
+  }
+
+  /* One photo: nothing to cross-fade to, so it simply holds. */
+  .auth-panel-1 .auth-panel-slide {
+    animation: none;
+    opacity: var(--auth-vis);
+  }
+
+  .auth-panel-2 .auth-panel-slide {
+    animation-name: auth-panel-kenburns-2;
+    animation-duration: calc(var(--auth-slide) * 2);
+  }
+  .auth-panel-3 .auth-panel-slide {
+    animation-name: auth-panel-kenburns-3;
+    animation-duration: calc(var(--auth-slide) * 3);
+  }
+  .auth-panel-4 .auth-panel-slide {
+    animation-name: auth-panel-kenburns-4;
+    animation-duration: calc(var(--auth-slide) * 4);
+  }
+  .auth-panel-5 .auth-panel-slide {
+    animation-name: auth-panel-kenburns-5;
+    animation-duration: calc(var(--auth-slide) * 5);
+  }
+  .auth-panel-6 .auth-panel-slide {
+    animation-name: auth-panel-kenburns-6;
+    animation-duration: calc(var(--auth-slide) * 6);
+  }
+
+  .auth-panel-slide:nth-of-type(1) {
+    animation-delay: 0s;
+  }
+  .auth-panel-slide:nth-of-type(2) {
+    animation-delay: calc(var(--auth-slide) * 1);
+  }
+  .auth-panel-slide:nth-of-type(3) {
+    animation-delay: calc(var(--auth-slide) * 2);
+  }
+  .auth-panel-slide:nth-of-type(4) {
+    animation-delay: calc(var(--auth-slide) * 3);
+  }
+  .auth-panel-slide:nth-of-type(5) {
+    animation-delay: calc(var(--auth-slide) * 4);
+  }
+  .auth-panel-slide:nth-of-type(6) {
+    animation-delay: calc(var(--auth-slide) * 5);
+  }
+
+  .auth-panel-slide:nth-of-type(even) {
+    --from: var(--auth-zoom);
+    --to: 1;
+  }
+
+  @keyframes auth-panel-kenburns-2 {
+    0% {
+      opacity: 0;
+      transform: scale(var(--from));
+    }
+    9% {
+      opacity: var(--auth-vis);
+    }
+    50% {
+      opacity: var(--auth-vis);
+    }
+    59% {
+      opacity: 0;
+      transform: scale(var(--to));
+    }
+    100% {
+      opacity: 0;
+      transform: scale(var(--from));
+    }
+  }
+
+  @keyframes auth-panel-kenburns-3 {
+    0% {
+      opacity: 0;
+      transform: scale(var(--from));
+    }
+    6% {
+      opacity: var(--auth-vis);
+    }
+    33.333% {
+      opacity: var(--auth-vis);
+    }
+    39.333% {
+      opacity: 0;
+      transform: scale(var(--to));
+    }
+    100% {
+      opacity: 0;
+      transform: scale(var(--from));
+    }
+  }
+
+  @keyframes auth-panel-kenburns-4 {
+    0% {
+      opacity: 0;
+      transform: scale(var(--from));
+    }
+    4.5% {
+      opacity: var(--auth-vis);
+    }
+    25% {
+      opacity: var(--auth-vis);
+    }
+    29.5% {
+      opacity: 0;
+      transform: scale(var(--to));
+    }
+    100% {
+      opacity: 0;
+      transform: scale(var(--from));
+    }
+  }
+
+  @keyframes auth-panel-kenburns-5 {
+    0% {
+      opacity: 0;
+      transform: scale(var(--from));
+    }
+    3.6% {
+      opacity: var(--auth-vis);
+    }
+    20% {
+      opacity: var(--auth-vis);
+    }
+    23.6% {
+      opacity: 0;
+      transform: scale(var(--to));
+    }
+    100% {
+      opacity: 0;
+      transform: scale(var(--from));
+    }
+  }
+
+  @keyframes auth-panel-kenburns-6 {
+    0% {
+      opacity: 0;
+      transform: scale(var(--from));
+    }
+    3% {
+      opacity: var(--auth-vis);
+    }
+    16.667% {
+      opacity: var(--auth-vis);
+    }
+    19.667% {
+      opacity: 0;
+      transform: scale(var(--to));
+    }
+    100% {
+      opacity: 0;
+      transform: scale(var(--from));
+    }
+  }
+
+  /* The motion is decoration, so it goes entirely when asked — the first
+   * photo simply holds. */
+  @media (prefers-reduced-motion: reduce) {
+    .auth-panel-slide {
+      animation: none;
+      transform: none;
+      opacity: 0;
+    }
+    .auth-panel-slide:nth-of-type(1) {
+      opacity: var(--auth-vis);
+    }
+  }
+}
+
+/* react-phone-number-input overrides for shadcn/ui consistency */
+.PhoneInput {
+  @apply flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background;
+}
+.PhoneInput:focus-within {
+  @apply outline-none ring-2 ring-ring ring-offset-2;
+}
+.PhoneInputInput {
+  @apply flex-1 bg-transparent border-none outline-none min-w-0;
+}
+.PhoneInputInput:focus {
+  @apply outline-none ring-0;
+}
+.PhoneInputCountry {
+  @apply mr-2;
+}
+
+/* Fix Chromium PDF rasterization bug caused by SVG clip-paths in Recharts */
+@media print {
+  .recharts-wrapper * {
+    clip-path: none !important;
+  }
+}

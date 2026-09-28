@@ -1,0 +1,45 @@
+# Reminder: production RBAC reseed.
+#
+# `bundles.config.ts` / `roles.config.ts` are the source of truth for role
+# permissions, but nothing applies them automatically — the DB only picks up a
+# change when `seed:rbac` runs against it. A 2026-08-15 audit found the dev/
+# staging DB had drifted far enough that reception could delete patient records
+# and doctors held `labs:*`. Dev + staging are reseeded; production is not.
+#
+# Fires on every push, loudly for `main` (the branch that deploys production).
+# Never blocks — always exits 0.
+
+remote_ref_list=$(cat)
+pushing_to_main=0
+
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+  case "$remote_ref" in
+    refs/heads/main) pushing_to_main=1 ;;
+  esac
+done <<EOF
+$remote_ref_list
+EOF
+
+if [ "$pushing_to_main" -eq 1 ]; then
+  printf '\n'
+  printf '  ┌──────────────────────────────────────────────────────────────┐\n'
+  printf '  │  PUSHING TO main — PRODUCTION DEPLOY                          │\n'
+  printf '  └──────────────────────────────────────────────────────────────┘\n'
+  printf '\n'
+  printf '  Reseed production RBAC after this deploys:\n'
+  printf '\n'
+  printf '    doppler run --project framada-projects --config prd -- \\\n'
+  printf '      pnpm --filter backend seed:rbac\n'
+  printf '\n'
+  printf '  Then confirm the drift is gone:\n'
+  printf '    GET /api/auth/permissions  ->  receptionist must NOT have\n'
+  printf '    patients:delete, and must HAVE reports:create.\n'
+  printf '\n'
+  printf '  Safe to run: it only rewrites roles defined in config, leaves\n'
+  printf '  custom roles untouched, and is idempotent.\n'
+  printf '\n'
+else
+  printf '\n  Reminder: production RBAC reseed is still outstanding (runs on the main deploy).\n\n'
+fi
+
+exit 0

@@ -1,0 +1,75 @@
+{
+  "name": "framada-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Framada monorepo — clinic management, finance viewer, marketing website, staff PWA",
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=20",
+    "pnpm": ">=9"
+  },
+  "scripts": {
+    "prepare": "husky",
+    "dev": "turbo run dev",
+    "dev:portal": "turbo run dev --filter=portal",
+    "dev:team": "turbo run dev --filter=team",
+    "dev:patient": "turbo run dev --filter=patient",
+    "dev:hr": "turbo run dev --filter=hr",
+    "dev:reports": "turbo run dev --filter=reports",
+    "dev:website": "turbo run dev --filter=website",
+    "dev:backend": "turbo run dev --filter=backend",
+    "build": "turbo run build",
+    "build:portal": "turbo run build --filter=portal",
+    "build:team": "turbo run build --filter=team",
+    "build:patient": "turbo run build --filter=patient",
+    "build:hr": "turbo run build --filter=hr",
+    "build:reports": "turbo run build --filter=reports",
+    "build:website": "turbo run build --filter=website",
+    "lint": "turbo run lint",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "db:migrate": "turbo run db:migrate --filter=backend",
+    "db:generate": "turbo run db:generate --filter=backend",
+    "db:drift": "pnpm --filter backend db:drift",
+    "audit:contracts": "node scripts/api-contract-audit.mjs",
+    "clean": "turbo run clean && rm -rf node_modules",
+    "deploy:trigger": "echo 'Triggering full deployment'"
+  },
+  "keywords": [
+    "monorepo",
+    "clinic",
+    "dental"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.11",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.4.0",
+    "turbo": "^2.9.14",
+    "wrangler": "4.69.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "lightningcss": "^1.29.1",
+      "react": "19.2.5",
+      "react-dom": "19.2.5"
+    }
+  },
+  "optionalDependencies": {
+    "@next/swc-linux-x64-gnu": "^16.1.6",
+    "@next/swc-linux-x64-musl": "^16.1.6",
+    "@tailwindcss/oxide-linux-x64-gnu": "^4.2.1",
+    "@tailwindcss/oxide-linux-x64-musl": "^4.2.1",
+    "lightningcss-linux-x64-gnu": "^1.29.1",
+    "lightningcss-linux-x64-musl": "^1.29.1"
+  },
+  "lint-staged": {
+    "*.{js,jsx,ts,tsx,json,jsonc,css}": "biome check --write --no-errors-on-unmatched"
+  },
+  "dependencies": {
+    "dinero.js": "^2.0.2"
+  }
+}

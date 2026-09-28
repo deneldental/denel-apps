@@ -1,0 +1,56 @@
+{
+  "$schema": "https://v2-9-14.turborepo.dev/schema.json",
+  "ui": "tui",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".next/**"],
+      // Turbo runs tasks in strict env mode (the default since v2), so a task
+      // only sees the vars declared here plus the `VITE_*` set that framework
+      // inference adds for Vite packages. The per-app names are NOT `VITE_*`-
+      // prefixed, so without this list they are filtered out and each app's
+      // vite.config.ts remaps `undefined` into the bundle.
+      // Keep in sync with the `define` block of each app's vite.config.ts.
+      "env": [
+        "PORTAL_VITE_SENTRY_DSN",
+        "PORTAL_VITE_APP_URL",
+        "PWA_VITE_SENTRY_DSN",
+        "PWA_VITE_APP_URL",
+        "PATIENT_VITE_SENTRY_DSN",
+        "PATIENT_VITE_APP_URL",
+        "HR_VITE_SENTRY_DSN",
+        "HR_VITE_APP_URL",
+        "REPORTS_VITE_APP_URL",
+        "SENTRY_AUTH_TOKEN",
+        "SENTRY_ORG",
+        "PWA_SENTRY_PROJECT",
+        "PATIENT_SENTRY_PROJECT",
+        "VITE_GIT_SHA"
+      ]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "typecheck": {
+      "dependsOn": ["^build"],
+      "cache": true
+    },
+    "lint": {
+      "cache": true
+    },
+    "test": {
+      "cache": true,
+      "outputs": ["coverage/**"],
+      "env": ["DATABASE_URL", "BETTER_AUTH_SECRET", "NODE_ENV", "CI"]
+    },
+    "db:migrate": {
+      "cache": false,
+      "env": ["DATABASE_URL"]
+    },
+    "db:generate": {
+      "cache": false,
+      "outputs": ["migrations/**"]
+    }
+  }
+}

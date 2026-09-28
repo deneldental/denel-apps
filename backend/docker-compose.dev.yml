@@ -1,0 +1,41 @@
+# Local Postgres for backend dev — the DEFAULT dev database.
+#
+# Running against the remote Neon dev branch costs ~1.5-18 s per authenticated
+# request (the Neon serverless WebSocket driver, not the network). A local
+# Postgres drops that to a few ms.
+#
+#   pnpm --filter backend db:local:up      # start this container
+#   pnpm --filter backend db:local:setup   # migrate + seed RBAC + admin login
+#   pnpm --filter backend dev:local        # run the backend against it
+#   pnpm --filter backend db:local:down    # stop it (data survives in a volume)
+#
+# Plain Compose spec — works with Podman OR Docker. `scripts/db-local.mjs` picks
+# the engine ($FRAMADA_CONTAINER_ENGINE, else podman, else docker) and drives
+# `<engine> compose` against this file. Nothing here is engine-specific.
+#
+# Host port defaults to 5433, NOT 5432, so it can't collide with a system
+# Postgres or another project's container. Override with FRAMADA_DB_PORT —
+# scripts/dev-local.mjs reads the same variable, so the two never drift.
+#
+# See project-docs/local-dev-database.md for the full workflow.
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: framada-dev-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: framada
+      POSTGRES_PASSWORD: framada
+      POSTGRES_DB: framada
+    ports:
+      - '${FRAMADA_DB_PORT:-5433}:5432'
+    volumes:
+      - framada-dev-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U framada -d framada']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  framada-dev-db:

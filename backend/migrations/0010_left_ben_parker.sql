@@ -1,0 +1,2 @@
+ALTER TABLE "website_bookings" ADD COLUMN "appointmentId" uuid;--> statement-breakpoint
+ALTER TABLE "website_bookings" ADD CONSTRAINT "website_bookings_appointmentId_appointments_id_fk" FOREIGN KEY ("appointmentId") REFERENCES "public"."appointments"("id") ON DELETE set null ON UPDATE no action;

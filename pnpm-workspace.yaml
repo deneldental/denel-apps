@@ -1,0 +1,9 @@
+packages:
+  - reports
+  - website
+  - portals
+  - backend
+  - team
+  - patient
+  - hr
+  - packages/*

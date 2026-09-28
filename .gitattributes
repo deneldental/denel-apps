@@ -1,0 +1,28 @@
+# Force LF line endings for all text files in the repo, regardless of
+# the contributor's platform. Pairs with biome.json's "lineEnding": "lf".
+#
+# Recommended local setting on Windows:
+#   git config core.autocrlf input
+#
+# This avoids the "every Windows save introduces a CRLF format error" cycle.
+
+* text=auto eol=lf
+
+# Lockfiles — leave alone, never reformat
+pnpm-lock.yaml -text
+*.lock         -text
+
+# Binary assets — explicit, no normalization
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.pdf   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.eot   binary
+*.zip   binary
+*.gz    binary

@@ -1,0 +1,31 @@
+@import "tailwindcss";
+@import "@denel/ui/theme/base.css";
+@import "@denel/ui/theme/dark.css";
+@source "../../packages/ui/src/**/*.{ts,tsx}";
+
+/* Palette = the shared Denel theme: base.css (light) plus dark.css, which
+ * re-values the same tokens when the OS is in dark mode. HR follows the
+ * OS setting; the portal, team and patient apps are light-only. Tailwind's
+ * `dark:` variant keeps its default `prefers-color-scheme` trigger, so the
+ * app's `dark:` utilities switch together with the tokens.
+ *
+ * Fonts match the portal: Montserrat for UI text, Playfair Display through the
+ * `font-heading` utility for titles only (brand guide: never body copy). Both
+ * are self-hosted and imported in main.tsx. */
+@theme inline {
+  --font-sans: "Montserrat", Arial, Helvetica, sans-serif;
+  --font-heading: "Playfair Display", Georgia, serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+
+@layer base {
+  * {
+    border-color: hsl(var(--border));
+  }
+}
+
+body {
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: var(--font-sans);
+}

@@ -1,0 +1,40 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "backend",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-02-27",
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "./public"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "compatibility_flags": ["nodejs_compat"],
+  /**
+   * Bindings
+   * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
+   * databases, object storage, AI inference, real-time communication and more.
+   * https://developers.cloudflare.com/workers/runtime-apis/bindings/
+   */
+  "vars": {
+    "BETTER_AUTH_URL": "https://api.deneldental.com",
+    "ALLOWED_ORIGINS": "https://portal.deneldental.com,https://team.deneldental.com,https://hr.deneldental.com,https://app.deneldental.com,https://reports.deneldental.com,https://deneldental.com",
+    "PORTAL_URL": "https://app.deneldental.com",
+    "DO_SPACES_BUCKET": "ortho-img",
+    "DO_RECORDS_BUCKET": "records-finance",
+    "DO_SPACES_ENDPOINT": "https://fra1.digitaloceanspaces.com",
+    "DO_SPACES_REGION": "FRA1",
+    "DO_STAFF_BUCKET": "staff-data",
+    "HUBTEL_SENDER_ID": "Framada",
+    "RESEND_FROM_EMAIL": "info@deneldental.com",
+    "APPOINTMENT_SMS": "Dear {Patientname}, your appointment has been scheduled for {date} at {time}. Please arrive 30 minutes before time. For any concerns call us +233322192924 | +233591348621",
+    "PREPAID_DEPOSIT_ID": "2023542",
+    "PAYMENT_SMS": "Dear {Patientname}, payment of GHS {amount} received for {treatmenttypes}. Thank you!",
+    "PAYMENT_PLAN_SMS": "Dear {Patientname}, payment of GHS {amount} received for {treatmenttypes}. Current Balance: GHS {balance}. Thank you!"
+  }
+}

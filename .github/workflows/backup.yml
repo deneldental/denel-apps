@@ -1,0 +1,68 @@
+name: Daily Database Backup
+
+on:
+  schedule:
+    - cron: '0 22 * * *' # 10pm UTC (midnight Ghana time, GMT+0)
+  workflow_dispatch:     # allow manual trigger
+
+jobs:
+  backup:
+    name: Dump production → Neon backup
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client
+
+      - name: Dump production and restore to Neon backup
+        env:
+          PROD_URL: ${{ secrets.DATABASE_URL }}
+          BACKUP_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+        run: |
+          if [ -z "$PROD_URL" ] || [ -z "$BACKUP_URL" ]; then
+            echo "::error::DATABASE_URL or BACKUP_DATABASE_URL secret is missing"
+            exit 1
+          fi
+
+          echo "Backup started at $(date -u)"
+
+          pg_dump "$PROD_URL" \
+            --no-owner \
+            --no-acl \
+            --format=custom \
+            --file=/tmp/framada.dump
+
+          echo "Dump complete ($(du -sh /tmp/framada.dump | cut -f1)). Restoring to backup DB..."
+
+          pg_restore \
+            --clean \
+            --if-exists \
+            --no-owner \
+            --no-acl \
+            --dbname="$BACKUP_URL" \
+            /tmp/framada.dump
+
+          echo "Backup complete at $(date -u)"
+
+      - name: Ping heartbeat on success
+        # Notify the uptime monitor that the backup ran successfully.
+        # Set BACKUP_HEARTBEAT_URL in GitHub Secrets to a Cronitor, Healthchecks.io,
+        # or UptimeRobot heartbeat URL. If the secret is absent the step is a no-op.
+        if: success()
+        env:
+          HEARTBEAT_URL: ${{ secrets.BACKUP_HEARTBEAT_URL }}
+        run: |
+          if [ -n "$HEARTBEAT_URL" ]; then
+            curl --silent --max-time 10 "$HEARTBEAT_URL" || true
+            echo "Heartbeat pinged at $(date -u)"
+          else
+            echo "BACKUP_HEARTBEAT_URL not configured — skipping heartbeat ping"
+          fi
+
+      - name: Alert on failure
+        if: failure()
+        run: |
+          echo "::error::Database backup FAILED at $(date -u) — investigate immediately"
+          echo "::error::Check that DATABASE_URL and BACKUP_DATABASE_URL secrets are set and valid"

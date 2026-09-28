@@ -1,0 +1,21 @@
+-- Phase 2A correction — disable Better Auth's twoFactor gate.
+--
+-- 0066 added the twoFactor plugin and backfilled user.twoFactorEnabled=true
+-- for every staff user. That gated EVERY sign-in path (signIn.email used by
+-- portal as well as signIn.username used by PWA), which broke portal: portal
+-- expects email+password → session, not email+password → OTP step.
+--
+-- Correct architecture:
+--   * Portal — email + password, NO OTP. Better Auth handles directly.
+--   * PWA    — staffId + password, then a separate device-trust OTP layer
+--              (custom routes in /api/staff-auth/*) running on top of the
+--              Better Auth session. Better Auth itself sees no 2FA.
+--
+-- This migration zeroes twoFactorEnabled so the (now-unloaded) twoFactor
+-- plugin has nothing to gate on if it ever gets re-registered, and so the
+-- column reflects reality. The `two_factor` and `user.twoFactorEnabled`
+-- columns are left in place rather than dropped — keeping them is harmless
+-- and avoids a destructive migration if we ever choose to re-enable 2FA on
+-- a per-user opt-in basis later.
+
+UPDATE "user" SET "twoFactorEnabled" = false WHERE "twoFactorEnabled" = true;

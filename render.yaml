@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: framada-backend-staging
+    runtime: docker
+    region: frankfurt
+    plan: starter
+    branch: staging
+    autoDeploy: false
+    rootDir: .
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: APP_ENV
+        value: staging
+      - key: PORT
+        value: 3000
+      # Sensitive runtime vars (DATABASE_URL, BETTER_AUTH_SECRET, BETTER_AUTH_URL,
+      # ALLOWED_ORIGINS, PORTAL_URL, HUBTEL_*, DO_SPACES_*, RESEND_*, *_SMS, etc.)
+      # are synced from Doppler `stg` via the Doppler-Render native integration
+      # configured in the Doppler dashboard.

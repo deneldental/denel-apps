@@ -1,0 +1,27 @@
+-- Drop the stale `payments_method_check` CHECK constraint.
+--
+-- ─── Why this exists ───────────────────────────────────────────────────
+-- Migration 0042 hardcoded payments.method to a closed list:
+--   ('cash', 'card', 'insurance', 'transfer', 'momo', 'bank_transfer')
+-- That predates payment methods becoming admin-configurable via the
+-- payment_methods lookup table (Settings → Finance & Billing → Payment
+-- Methods). The list was never updated since — it doesn't even include
+-- 'wallet' or 'cheque', which the app's own canonical PaymentMethod type
+-- (lib/channel-accounts.ts) has treated as valid all along.
+--
+-- In production this surfaced as a real incident: an admin had added
+-- 'hubtel_pos' and 'mobile_money' as real payment_methods rows (Ghana-
+-- specific channels), and every payment using either failed at INSERT
+-- with "violates check constraint payments_method_check" — a hard
+-- database-level rejection of a method the application layer had already
+-- validated and fully resolved a GL channel account for.
+--
+-- The application is the source of truth for valid methods now (the
+-- payment_methods table, editable from Settings) — a static DB-level enum
+-- fighting that is a bug generator, not a safety net. Drop it outright
+-- rather than re-widen the list, since any admin can add another method
+-- slug tomorrow and hit the exact same wall.
+--
+-- Idempotent: DROP CONSTRAINT IF EXISTS.
+
+ALTER TABLE payments DROP CONSTRAINT IF EXISTS payments_method_check;

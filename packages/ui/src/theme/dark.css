@@ -1,0 +1,45 @@
+/**
+ * @denel/ui — optional dark palette for Denel Dental apps that follow the
+ * OS dark-mode setting (HR and reports). Import it AFTER base.css:
+ *
+ *   @import "tailwindcss";
+ *   @import "@denel/ui/theme/base.css";
+ *   @import "@denel/ui/theme/dark.css";
+ *
+ * The portal, team and patient apps are light-only and do not import it.
+ *
+ * Same tokens as base.css, re-valued for dark surfaces: navy-black grounds, a
+ * light periwinkle `--primary` (brand navy #24296A has too little contrast on
+ * a dark ground to carry buttons or links), and the gold lifted a step so it
+ * still reads as gold. Every text pair clears WCAG AA 4.5:1 — body text 16.6:1,
+ * muted text 8.3:1, primary buttons 8.4:1, destructive buttons 5.0:1.
+ */
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --background: 234 36% 9%;
+    --foreground: 225 30% 95%;
+    --card: 234 32% 12%;
+    --card-foreground: 225 30% 95%;
+    --popover: 234 32% 12%;
+    --popover-foreground: 225 30% 95%;
+    /* Primary = light periwinkle on the navy hue, with navy text on it. */
+    --primary: 233 72% 80%;
+    --primary-foreground: 236 49% 15%;
+    --secondary: 234 24% 18%;
+    --secondary-foreground: 225 30% 95%;
+    --muted: 234 24% 18%;
+    --muted-foreground: 226 16% 70%;
+    --accent: 234 26% 21%;
+    --accent-foreground: 225 30% 95%;
+    --destructive: 0 66% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 234 22% 24%;
+    --input: 234 22% 26%;
+    /* Focus ring + brand accent = gold, lifted for dark surfaces. */
+    --ring: 37 64% 60%;
+    --brand: 37 62% 58%;
+    --brand-foreground: 236 49% 14%;
+  }
+}

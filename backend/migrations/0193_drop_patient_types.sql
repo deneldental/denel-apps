@@ -1,0 +1,24 @@
+-- Drop patient_types.
+--
+-- Superseded by patient tags in admin-v1 §2.7. That change dropped the
+-- `patients.type` column and replaced the single-select Patient Type with the
+-- multi-select tag picker, but left the lookup table and its Settings section
+-- behind. The result was an admin screen that edited a list nothing read —
+-- `patient_types` had no consumer anywhere in the backend or the portal, and
+-- lookups.ts already recorded the situation:
+--
+--     // §2.7: patients.type dropped — patient-types lookup rows are never blocking
+--
+-- The overlap was also literal: 'ortho' existed as a patient_type while 'Ortho'
+-- existed as a patient tag carrying real patients. Only the tag did anything.
+--
+-- No data migration is needed. Nothing references these rows: there is no FK
+-- into patient_types, and the patients table has no type column to carry across.
+-- The three seeded rows (general / ortho / surgical) have equivalents in the tag
+-- catalog where the clinic wants them.
+--
+-- This is a one-way door. The table is small and inert, so the alternative was
+-- to leave it — dropping it is deliberate, on explicit instruction, to stop it
+-- resurfacing as a half-implemented concept.
+
+DROP TABLE IF EXISTS "patient_types";

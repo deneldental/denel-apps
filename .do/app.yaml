@@ -1,0 +1,40 @@
+name: framada-backend-production
+region: fra
+
+services:
+  - name: api
+    source_dir: /
+    github:
+      repo: framadadental/framada-latest
+      branch: main
+      deploy_on_push: false  # Deployments are triggered via GitHub Actions workflow
+    build_command: npm install -g pnpm@9 && pnpm install --frozen-lockfile && pnpm --filter backend build
+    run_command: node backend/dist/node.js
+    http_port: 3000
+    environment_slug: node-js
+    instance_size_slug: basic-xs
+    instance_count: 1
+    health_check:
+      http_path: /api/health
+      initial_delay_seconds: 10
+      period_seconds: 30
+      timeout_seconds: 5
+      failure_threshold: 3
+    envs:
+      - key: NODE_ENV
+        value: production
+        scope: RUN_AND_BUILD_TIME
+      - key: APP_ENV
+        value: production
+        scope: RUN_AND_BUILD_TIME
+      - key: PORT
+        value: "3000"
+        scope: RUN_TIME
+      # Sensitive vars — set these in the DO dashboard, NOT here
+      # DATABASE_URL, BETTER_AUTH_SECRET, BETTER_AUTH_URL,
+      # HUBTEL_CLIENT_ID, HUBTEL_CLIENT_SECRET,
+      # DO_SPACES_KEY, DO_SPACES_SECRET, DO_SPACES_BUCKET,
+      # DO_SPACES_ENDPOINT, DO_SPACES_REGION, DO_RECORDS_BUCKET,
+      # RESEND_API_KEY, RESEND_FROM_EMAIL,
+      # ALLOWED_ORIGINS, PORTAL_URL,
+      # APPOINTMENT_SMS, PAYMENT_SMS, PAYMENT_PLAN_SMS, SMS_SENDER_NAME

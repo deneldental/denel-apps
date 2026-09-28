@@ -1,0 +1,146 @@
+@import "tailwindcss";
+@import "@denel/ui/theme/base.css";
+@source "../../packages/ui/src/**/*.{ts,tsx}";
+
+/* Palette + token → utility mapping now live in @denel/ui/theme/base.css */
+
+/* Team is light-only — no dark-mode token overrides (by design). Bind Tailwind's
+ * `dark:` variant to an explicit `.dark` class (which the app never sets) instead
+ * of the default `prefers-color-scheme` media query. Otherwise raw `dark:`
+ * utilities (e.g. badge/status-pill variants) fire when the OS is in dark mode
+ * while the app's own tokens stay light — so a status pill renders its dark
+ * treatment (light text on a dark-tinted fill) on a white page and the text
+ * no longer contrasts its background. */
+@custom-variant dark (&:is(.dark *));
+
+/* === Brand fonts ===
+ * Montserrat for UI text, Playfair Display for titles via `font-heading` (brand
+ * guide: never body copy) — the same self-hosted @fontsource files the portal
+ * uses, imported in main.tsx. No Google Fonts CDN: a render-blocking
+ * third-party request is the wrong trade for a PWA on unreliable clinic
+ * networks, and a hard failure offline. `font-display: swap` paints in the
+ * fallback stack first, so the shell never blocks on a font. */
+@theme inline {
+  --font-sans:
+    "Montserrat", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "Noto Sans", sans-serif;
+  --font-heading: "Playfair Display", Georgia, serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+
+/* === Base Reset === */
+@layer base {
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+  }
+
+  body {
+    /* --font-sans names the platform UI faces after Montserrat, so the shell
+     * is legible before (or without) the web font. */
+    font-family: var(--font-sans);
+    background: hsl(var(--background));
+    color: hsl(var(--foreground));
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* === Scrollable Areas === */
+.scroll-area {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--border)) transparent;
+}
+
+.scroll-area::-webkit-scrollbar {
+  width: 4px;
+}
+
+.scroll-area::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scroll-area::-webkit-scrollbar-thumb {
+  background: hsl(var(--border));
+  border-radius: 999px;
+}
+
+/* === Page Transitions === */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.page-enter {
+  animation: fadeIn 0.25s ease forwards;
+}
+
+/* === Shimmer Skeleton === */
+@keyframes shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: hsl(var(--muted));
+  border-radius: var(--radius);
+}
+
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, hsl(var(--accent) / 0.5), transparent);
+  animation: shimmer 1.5s infinite;
+}
+
+/* Weekly questionnaire sliders */
+.question-slider {
+  accent-color: hsl(var(--primary));
+  cursor: pointer;
+  width: 100%;
+  height: 20px;
+}
+
+/* === Loading Progress === */
+@layer utilities {
+  @keyframes progress {
+    0% {
+      transform: translateX(-100%);
+    }
+    50% {
+      transform: translateX(0%);
+    }
+    100% {
+      transform: translateX(100%);
+    }
+  }
+
+  .animate-progress {
+    animation: progress 1.5s infinite linear;
+  }
+}

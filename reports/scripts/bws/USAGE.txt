@@ -1,0 +1,41 @@
+Bitwarden Secrets Manager sync (this repo)
+=========================================
+
+This repo keeps .env.local out of git, but lets you generate it from Bitwarden.
+
+Prereqs
+------
+1) Install the Bitwarden Secrets Manager CLI (bws) and put it on PATH:
+   - https://bitwarden.com/help/secrets-manager-cli/
+
+2) Create a Machine Account + Access Token in Bitwarden Secrets Manager.
+
+3) Create ONE Bitwarden secret whose *value* is JSON (KEY: VALUE), e.g.
+   {
+     "DATABASE_URL": "postgres://...",
+     "NEXTAUTH_SECRET": "..."
+   }
+
+Local setup (do NOT commit)
+---------------------------
+Create a file named .env.bws.local in the project root with:
+
+  BWS_ACCESS_TOKEN=...your access token...
+  BWS_SECRET_ID=...uuid of the JSON secret...
+
+Optional:
+  BWS_OUT_FILE=.env.local   (default)
+  BWS_IN_FILE=.env.local    (default)
+  BWS_BIN=bws               (default)
+
+Commands
+--------
+Pull Bitwarden -> .env.local
+  npm run env:pull
+
+Push .env.local -> Bitwarden (overwrites the secret value)
+  npm run env:push
+
+Run dev after pulling secrets
+  npm run dev:pull-env
+

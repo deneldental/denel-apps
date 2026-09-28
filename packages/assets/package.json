@@ -1,0 +1,10 @@
+{
+  "name": "@denel/assets",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Shared brand/static assets imported (and bundled) by the Framada apps.",
+  "exports": {
+    "./*": "./src/*"
+  }
+}

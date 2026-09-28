@@ -1,0 +1,27 @@
+-- Give `payment_methods` a GL account code so admin-configured methods post to
+-- the right cash/bank/clearing account.
+--
+-- ─── Why this exists ───────────────────────────────────────────────────
+-- `resolveChannelAccountId()` (lib/channel-accounts.ts) maps a payment
+-- `method` string to a GL account via `METHOD_TO_CODE`, a closed record of 8
+-- canonical slugs (cash, card, insurance, transfer, momo, bank_transfer,
+-- cheque, wallet). Any method whose slug is not in that map falls through to
+-- `'1000'` (Cash on Hand). The `payment_methods` lookup is admin-editable from
+-- Settings and its `name` is generated from the display name, so clinics
+-- routinely create slugs like `mobile_money` / `hubtel_pos` that the map does
+-- not know — their receipts silently mis-post to Cash.
+--
+-- This column lets an admin pin each method to a known GL channel. When set,
+-- `resolveChannelAccountId()` prefers it; otherwise it falls back to the map,
+-- then to `'1000'`, exactly as before.
+--
+-- ─── What this does, and does NOT, do ──────────────────────────────────
+-- SCHEMA ONLY. It adds one nullable column and nothing else — no backfill, no
+-- INSERT, no UPDATE. Existing rows keep `glAccountCode = NULL` and continue to
+-- resolve through `METHOD_TO_CODE`. Admins assign codes going forward from the
+-- Settings → Payment Methods dialog.
+--
+-- Idempotent: `ADD COLUMN IF NOT EXISTS`. The runner wraps each migration in
+-- its own transaction, so this file carries no explicit BEGIN/COMMIT.
+
+ALTER TABLE "payment_methods" ADD COLUMN IF NOT EXISTS "glAccountCode" text;

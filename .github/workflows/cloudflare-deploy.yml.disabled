@@ -1,0 +1,227 @@
+name: Deploy to Cloudflare
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+jobs:
+  # ── Quality gates — runs on every PR and push ───────────────────────────────
+  check:
+    runs-on: ubuntu-latest
+    name: Quality Gates
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (Biome)
+        run: pnpm lint
+
+      # Typecheck — blocking for clean apps (0 errors in backend/portals/pwa/website-backend).
+      # `reports/` still has ~21 pre-existing errors and is tracked as follow-up cleanup;
+      # it runs non-blocking so the PR isn't rejected for errors outside the author's scope.
+      - name: Typecheck — backend
+        run: pnpm --filter backend typecheck
+      - name: Typecheck — portals
+        run: pnpm --filter portal typecheck
+      - name: Typecheck — pwa
+        run: pnpm --filter pwa typecheck
+      - name: Typecheck — website-backend
+        run: pnpm --filter website-backend typecheck
+      - name: Typecheck — reports (non-blocking)
+        run: pnpm --filter reports exec tsc --noEmit || true
+
+      - name: Unit Tests
+        run: pnpm turbo run test
+
+  # ── Frontend apps → Cloudflare Pages ───────────────────────────────────────
+  deploy-pages:
+    needs: check
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    name: Pages · ${{ matrix.app }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        app: [reports, website, portal, pwa]
+        include:
+          - app: reports
+            dir: reports
+            output: dist
+            cf_project: reports
+          - app: website
+            dir: website
+            output: .next
+            cf_project: website
+          - app: portal
+            dir: portals
+            output: dist
+            cf_project: portal
+
+          - app: team
+            dir: team/dist
+            output: '.'
+            cf_project: team
+          - app: patient
+            dir: patient/dist
+            output: '.'
+            cf_project: patient
+    permissions:
+      actions: read
+      contents: read
+      deployments: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Create Env File
+        working-directory: ${{ matrix.dir }}
+        run: |
+          touch .env.local
+          echo "VITE_API_URL=${{ secrets.VITE_API_URL }}" >> .env.local
+          echo "VITE_API_BASE_URL=${{ secrets.VITE_API_BASE_URL }}" >> .env.local
+          echo "VITE_BETTER_AUTH_URL=${{ secrets.VITE_BETTER_AUTH_URL }}" >> .env.local
+          echo "NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }}" >> .env.local
+          echo "CLOUDFLARE_API_TOKEN=${{ secrets.CLOUDFLARE_API_TOKEN }}" >> .env.local
+          echo "CLOUDFLARE_ACCOUNT_ID=${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" >> .env.local
+          echo "STAGING_DATABASE_URL=${{ secrets.STAGING_DATABASE_URL }}" >> .env.local
+          echo "BETTER_AUTH_SECRET=${{ secrets.BETTER_AUTH_SECRET }}" >> .env.local
+          echo "BETTER_AUTH_URL=${{ secrets.BETTER_AUTH_URL }}" >> .env.local
+          echo "NEXT_PUBLIC_BETTER_AUTH_URL=${{ secrets.NEXT_PUBLIC_BETTER_AUTH_URL }}" >> .env.local
+
+      - name: Build ${{ matrix.app }}
+        run: pnpm turbo run build --filter=${{ matrix.app }}
+        env:
+          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+          VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
+          NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+
+      - name: Strip sourcemaps (website)
+        if: matrix.app == 'website'
+        run: find ${{ matrix.dir }}/.next -name '*.map' -delete
+
+      - name: Strip sourcemaps (Vite apps)
+        if: matrix.app != 'website'
+        run: find ${{ matrix.dir }}/dist -name '*.map' -delete
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy ${{ matrix.dir }}/${{ matrix.output }} --project-name ${{ matrix.cf_project }} --branch ${{ github.ref_name }}
+
+  # ── Cloudflare Workers backend ──────────────────────────────────────────────
+  deploy-workers:
+    needs: [check, deploy-pages]
+    if: |
+      github.event_name == 'push' &&
+      (needs.deploy-pages.result == 'success' || needs.deploy-pages.result == 'skipped')
+    runs-on: ubuntu-latest
+    name: Worker · backend
+    environment: backend
+    permissions:
+      actions: read
+      contents: read
+      deployments: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Sync backend Worker secrets
+        working-directory: backend
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          put_secret() {
+            local name=$1
+            local value=$2
+            local attempts=0
+            local max_attempts=3
+
+            while [ $attempts -lt $max_attempts ]; do
+              echo "Uploading secret: $name (Attempt $((attempts + 1))/$max_attempts)..."
+              if echo "$value" | pnpm exec wrangler secret put "$name"; then
+                return 0
+              fi
+              attempts=$((attempts + 1))
+              if [ $attempts -lt $max_attempts ]; then
+                echo "Warning: Failed to upload $name. Retrying in 10 seconds..."
+                sleep 10
+              fi
+            done
+
+            echo "Error: Failed to upload $name after $max_attempts attempts."
+            return 1
+          }
+
+          put_secret "DATABASE_URL" "${{ secrets.DATABASE_URL }}" || exit 1
+          put_secret "BETTER_AUTH_SECRET" "${{ secrets.BETTER_AUTH_SECRET }}" || exit 1
+          put_secret "RESEND_API_KEY" "${{ secrets.RESEND_API_KEY }}" || exit 1
+          put_secret "HUBTEL_CLIENT_ID" "${{ secrets.HUBTEL_CLIENT_ID }}" || exit 1
+          put_secret "HUBTEL_CLIENT_SECRET" "${{ secrets.HUBTEL_CLIENT_SECRET }}" || exit 1
+          put_secret "DO_SPACES_KEY" "${{ secrets.DO_SPACES_KEY }}" || exit 1
+          put_secret "DO_SPACES_SECRET" "${{ secrets.DO_SPACES_SECRET }}" || exit 1
+
+      - name: Run database migrations
+        working-directory: backend
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            export DATABASE_URL="${{ secrets.DATABASE_URL }}"
+          else
+            export DATABASE_URL="${{ secrets.STAGING_DATABASE_URL }}"
+          fi
+          if [ -z "$DATABASE_URL" ]; then
+            echo "ERROR: DATABASE_URL is empty — check that the secret is set for this branch."
+            exit 1
+          fi
+          echo "Running drizzle migrations for branch: ${{ github.ref_name }}"
+          node migrate.mjs
+
+      - name: Deploy backend
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: backend
+          command: deploy

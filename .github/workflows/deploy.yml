@@ -1,0 +1,893 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main, staging, dev]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Detect Changes ────────────────────────────────────────────────────────
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      frontend_matrix: ${{ steps.set-matrix.outputs.matrix }}
+      portal: ${{ steps.filter.outputs.portal }}
+      team: ${{ steps.filter.outputs.team }}
+      patient: ${{ steps.filter.outputs.patient }}
+      reports: ${{ steps.filter.outputs.reports }}
+      hr: ${{ steps.filter.outputs.hr }}
+      website: ${{ steps.filter.outputs.website }}
+      backend: ${{ steps.filter.outputs.backend }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            portal:
+              - 'portals/**'
+              - 'packages/**'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - 'pnpm-lock.yaml'
+            team:
+              - 'team/**'
+              - 'packages/**'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - 'pnpm-lock.yaml'
+            patient:
+              - 'patient/**'
+              - 'packages/**'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - 'pnpm-lock.yaml'
+            reports:
+              - 'reports/**'
+              - 'packages/**'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - 'pnpm-lock.yaml'
+            hr:
+              - 'hr/**'
+              - 'packages/**'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - 'pnpm-lock.yaml'
+            website:
+              - 'website/**'
+              - 'packages/**'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - 'pnpm-lock.yaml'
+            backend:
+              - 'backend/**'
+              - 'packages/**'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - 'pnpm-lock.yaml'
+      - id: set-matrix
+        run: |
+          apps=()
+          [[ "${{ steps.filter.outputs.portal }}" == 'true' ]] && apps+=('{"app":"portal","dist":"portals/dist","cf_project":"portal","build_cmd":"pnpm turbo run build --filter=portal"}')
+          [[ "${{ steps.filter.outputs.team }}" == 'true' ]] && apps+=('{"app":"team","dist":"team/dist","cf_project":"team","build_cmd":"pnpm turbo run build --filter=team"}')
+          [[ "${{ steps.filter.outputs.patient }}" == 'true' ]] && apps+=('{"app":"patient","dist":"patient/dist","cf_project":"patient","build_cmd":"pnpm turbo run build --filter=patient"}')
+          [[ "${{ steps.filter.outputs.reports }}" == 'true' ]] && apps+=('{"app":"reports","dist":"reports/dist","cf_project":"reports","build_cmd":"pnpm turbo run build --filter=reports"}')
+          [[ "${{ steps.filter.outputs.hr }}" == 'true' ]] && apps+=('{"app":"hr","dist":"hr/dist","cf_project":"hr","build_cmd":"pnpm turbo run build --filter=hr"}')
+          
+          if [ ${#apps[@]} -eq 0 ]; then
+            echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
+          else
+            json_array=$(IFS=,; echo "[${apps[*]}]")
+            echo "matrix={\"include\":$json_array}" >> $GITHUB_OUTPUT
+          fi
+
+  # ── Quality gates — runs on every PR and push ───────────────────────────────
+  check:
+    name: Quality Gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (Biome)
+        run: pnpm lint
+
+      # Warning ratchet. `pnpm lint` only fails on Biome *errors*, and the repo
+      # carries ~2,250 warnings, so a new one arrives as number 2,251 and is
+      # invisible in review. This fails when any workspace's count rises above
+      # lint-baseline.json. Paying the backlog down is optional; adding to it
+      # is not. Re-baseline deliberately with:
+      #   node scripts/lint-ratchet.mjs --update
+      - name: Lint ratchet (no new warnings)
+        run: node scripts/lint-ratchet.mjs
+
+      # ── API contract guard (D8) ──────────────────────────────────────────────
+      # Statically diffs every backend route against every frontend call site
+      # (hr/, portals/, team/) and exits non-zero on an unmatched path or a verb
+      # mismatch. This is the class of bug that TypeScript cannot see: the path
+      # is a string, the client is generic, and the failure is a runtime 404.
+      #
+      # Purely static — no secrets, no network, no database — so it runs on
+      # EVERY invocation of this job, pull requests included. HARD GATE: never
+      # add continue-on-error here; a guard that cannot fail is not a guard.
+      - name: API contract audit (backend ↔ frontend)
+        run: node scripts/api-contract-audit.mjs
+
+      - name: Typecheck — backend
+        run: pnpm --filter backend typecheck
+      - name: Build — backend
+        run: pnpm --filter backend build
+      - name: Typecheck — portal
+        run: pnpm --filter portal typecheck
+      - name: Typecheck — team
+        run: pnpm --filter team typecheck
+      - name: Typecheck — patient
+        run: pnpm --filter patient typecheck
+      - name: Typecheck — hr
+        run: pnpm --filter hr typecheck
+      - name: Typecheck — reports
+        run: pnpm --filter reports exec tsc --noEmit
+
+      # Run with --force so a stale Turbo cache can never serve a green result
+      # for tests that did not change — the gate always executes fresh. This is
+      # cheap insurance: pure unit + mocked-route tests finish in seconds.
+      - name: Unit tests
+        run: pnpm turbo run test --force
+
+      # ── E2E smoke tests ──────────────────────────────────────────────────────
+      # Build the portal, start `vite preview` on :4173, run Playwright smoke
+      # tests against it, then kill the preview server.
+      #
+      # NOTE: These tests exercise the frontend in isolation — they do not reach
+      # a live backend. Any spec that calls the real API (login, data fetch) must
+      # either stub the network (MSW / Playwright route mocking) or be tagged
+      # @needs-backend and skipped here. If integration-style E2E is required,
+      # add a separate post-deploy job (see the `e2e-smoke` job below which runs
+      # after staging deploy) rather than expanding this step.
+      - name: Install Doppler CLI
+        uses: dopplerhq/cli-action@v3
+
+      # Per-app vars (PORTAL_VITE_SENTRY_DSN etc.) are remapped onto the shared
+      # VITE_* names by each app's vite.config.ts, and listed in turbo.json's
+      # `build.env` so Turbo's strict env mode passes them through. Nothing to
+      # map here — doppler run injects them and the build picks them up.
+      - name: Build portal (for E2E preview)
+        run: doppler run -- pnpm turbo run build --filter=portal
+        timeout-minutes: 5
+        env:
+          DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN_STAGING }}
+
+      - name: Install Playwright browsers
+        run: pnpm --filter portal exec playwright install chromium --with-deps
+
+      # Wake the staging backend before the redirect tests run. The pre-deploy
+      # build bakes in the staging backend URL (VITE_BETTER_AUTH_URL), so the
+      # "unauthenticated → /auth/login" redirect waits on a real getSession
+      # round-trip. A cold first request (~9s) blew the tests' redirect timeout
+      # and failed whichever route ran first (rbac-gates /access-management).
+      # Warming /api/health then /api/auth/get-session primes the instance + the
+      # auth/DB path so the first in-test getSession is fast. Best-effort and
+      # NON-FATAL: if the backend is unreachable, getSession rejects quickly and
+      # the app still redirects to login, so the gate stays valid either way.
+      - name: Warm staging backend (best-effort)
+        env:
+          DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN_STAGING }}
+        run: |
+          AUTH_URL=$(doppler secrets get VITE_BETTER_AUTH_URL --plain 2>/dev/null || true)
+          [ -z "$AUTH_URL" ] && AUTH_URL=$(doppler secrets get VITE_API_URL --plain 2>/dev/null || true)
+          if [ -z "$AUTH_URL" ]; then
+            echo "::warning::Could not resolve backend URL from Doppler — skipping warm-up"
+            exit 0
+          fi
+          AUTH_URL=${AUTH_URL%/}
+          echo "Warming $AUTH_URL ..."
+          for path in /api/health /api/auth/get-session; do
+            for i in $(seq 1 12); do
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+                -H "X-App-Id: portal" "$AUTH_URL$path" 2>/dev/null || echo 000)
+              echo "  $path attempt $i: HTTP $code"
+              [ "$code" -ge 200 ] && [ "$code" -lt 500 ] && break
+              sleep 5
+            done
+          done
+          echo "warm-up complete (non-fatal)"
+
+      # `--strictPort` makes vite fail loudly if :4173 is already taken instead
+      # of silently picking another port (which would make the wait + tests
+      # below hang on the wrong URL). The `&` backgrounds it; the next step
+      # blocks until it is actually accepting connections.
+      - name: Start portal preview server
+        run: pnpm --filter portal exec vite preview --port 4173 --strictPort &
+        env:
+          CI: true
+
+      # Poll until the preview server accepts connections. Without this the E2E
+      # step can start before vite has bound the port and every test fails with
+      # ECONNREFUSED — historically the #1 cause of flaky pre-deploy runs.
+      - name: Wait for portal preview server
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:4173 >/dev/null 2>&1; then
+              echo "Portal preview is up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Portal preview server never came up on :4173 within 60s"
+          exit 1
+
+      - name: E2E smoke tests (portal, pre-deploy)
+        working-directory: portals
+        run: pnpm test:e2e
+        timeout-minutes: 10
+        continue-on-error: false
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:4173
+          CI: true
+
+      # Always capture the report when the pre-deploy E2E fails so the failure
+      # is diagnosable from the Actions UI (traces, screenshots, video) instead
+      # of only the raw terminal log.
+      - name: Upload pre-deploy Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-portal-pre-deploy
+          path: portals/playwright-report/
+          retention-days: 7
+
+  # ── Schema drift guard (D8) ────────────────────────────────────────────────
+  # Catches the `lab_services.clinicPrice` class of bug: a column declared in
+  # `backend/src/db/schema/*.ts` that no migration ever emits. Snapshot-based
+  # tooling cannot see it — the drizzle snapshot is the thing that lied — so the
+  # only trustworthy comparison is schema-code vs a real `information_schema`.
+  #
+  # This job builds that "real database" hermetically: an empty Postgres 17
+  # service (same major version as prod and as backend/docker-compose.dev.yml),
+  # the FULL migration chain replayed from zero, then `db:drift` against the
+  # result. So `DATABASE_URL` here is the throwaway service container, NOT a
+  # Doppler secret — which is deliberate:
+  #   * it needs no secrets, so it runs on every PR (fork PRs included);
+  #   * there are no false positives from "migration not applied to staging
+  #     yet", because the PR's own migrations are what built this database;
+  #   * it doubles as a from-scratch migration test — a migration chain that
+  #     cannot replay onto an empty database fails here too.
+  # A second, complementary drift check runs against the LIVE staging database
+  # after `migrate-staging` applies migrations there (see that job).
+  #
+  # Unconditional on purpose: no `needs: changes` filter, no `if:`. A skipped
+  # job does not block a deploy, and this gate exists precisely so schema drift
+  # can never slip through unnoticed. HARD GATE: no continue-on-error.
+  schema-drift:
+    name: Schema Drift Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: framada
+          POSTGRES_PASSWORD: framada
+          POSTGRES_DB: framada_drift
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U framada -d framada_drift"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # `isLocalHost()` in schema-drift-check.ts matches @localhost and disables
+      # SSL for it, which is what an unencrypted service container needs.
+      DATABASE_URL: postgresql://framada:framada@localhost:5432/framada_drift
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Replay every migration onto the empty database. This is the same runner
+      # production uses (`node migrate.mjs`), so the DDL the drift check diffs
+      # against is exactly the DDL a real deploy would produce.
+      - name: Apply migrations to ephemeral Postgres
+        working-directory: backend
+        run: node migrate.mjs
+
+      - name: Schema drift check (schema code ↔ migrated database)
+        run: pnpm --filter backend db:drift
+
+  # ── Backend staging → Render ────────────────────────────────────────────────
+  # Build/start commands and health check are declared in `render.yaml` at the
+  # repo root. Runtime env vars are synced from Doppler `stg` to the Render
+  # service via the Doppler-Render native integration (configured in Doppler
+  # dashboard, not CI). Render auto-deploy is disabled; this step is the only
+  # trigger, so quality gates above gate every deploy.
+  deploy-backend-staging:
+    name: Backend · Render (staging)
+    needs: [check, schema-drift, changes]
+    if: github.event_name == 'push' && github.ref_name == 'staging' && needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deployment
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "::error::RENDER_DEPLOY_HOOK_URL secret is not set"
+            exit 1
+          fi
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$RENDER_DEPLOY_HOOK_URL")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          # Render returns 202 Accepted for async deploy hook triggers (the
+          # deploy is queued, not yet started). Treat any 2xx as success.
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::Render deploy hook returned HTTP $HTTP_CODE: $BODY"
+            exit 1
+          fi
+
+          DEPLOY_ID=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deploy',{}).get('id','unknown'))" 2>/dev/null || echo "unknown")
+          echo "Render deployment triggered: $DEPLOY_ID (HTTP $HTTP_CODE)"
+
+  # ── Database migrations → staging ──────────────────────────────────────────
+  migrate-staging:
+    name: Database Migrations (staging)
+    needs: [check, schema-drift, changes]
+    if: github.event_name == 'push' && github.ref_name == 'staging' && needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: pnpm/action-setup@v4
+
+      - name: Install Doppler CLI
+        uses: dopplerhq/cli-action@v3
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run migrations
+        working-directory: backend
+        run: doppler run -- node migrate.mjs
+        env:
+          DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN_STAGING }}
+
+      # ── Schema drift guard, live DB (D8) ─────────────────────────────────────
+      # The `schema-drift` job proves the schema matches what the migrations
+      # PRODUCE. This proves it matches what the staging database ACTUALLY HAS —
+      # which diverges the moment someone hand-edits the DB, or a migration is
+      # partially reverted, or a branch's migration is applied out of order.
+      #
+      # DATABASE_URL comes from Doppler `stg` (confirmed present in that config)
+      # via the same DOPPLER_TOKEN_STAGING service token the migration step above
+      # uses. Runs immediately AFTER migrations, so a newly-added column is
+      # already applied and cannot produce a false MISSING.
+      #
+      # The check is read-only: SELECTs against information_schema, never DDL.
+      # It exits 2 if DATABASE_URL is unset, so a broken/absent Doppler token
+      # fails this job loudly rather than passing silently. HARD GATE.
+      - name: Schema drift check (live staging database)
+        run: doppler run -- pnpm --filter backend db:drift
+        env:
+          DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN_STAGING }}
+
+
+  # ── Backend production → Hetzner ───────────────────────────────────────────
+  # Builds the Docker image, pushes to GHCR, and triggers a pull + restart on
+  # the Hetzner VPS via SSH.
+  deploy-backend-production:
+    name: Backend · Hetzner (production)
+    needs: [check, schema-drift, changes]
+    if: github.event_name == 'push' && github.ref_name == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/framada-backend:latest
+          
+      # ── Production runtime env: Doppler prd overlaid onto the VPS .env ───────
+      # Until now /opt/framada/.env was hand-edited on the server and Doppler
+      # prd was never read by production at all, so a var changed in Doppler
+      # (ALLOWED_ORIGINS, say) silently had no effect — while the frontend
+      # builds, which DO use `doppler run`, picked their changes up right away.
+      # That asymmetry is what these steps remove.
+      #
+      # MERGE, not replace. Doppler prd does not contain DATABASE_URL, NODE_ENV,
+      # RESEND_*, GOOGLE_OAUTH_*, PORTAL_URL, CLINIC_* or the SMS templates —
+      # those exist only on the VPS. Overwriting .env outright would boot
+      # production with no database and NODE_ENV silently back to 'development'.
+      # Keys Doppler defines win; keys only on the VPS are preserved untouched.
+      # To move a var under Doppler's control, just add it to the prd config.
+      - name: Install Doppler CLI
+        uses: dopplerhq/cli-action@v3
+
+      # `--format docker` emits bare KEY=VALUE lines, which is what compose's
+      # `env_file:` expects (the `env` format quotes values and compose v2
+      # strips those inconsistently). Verified against prd: 22 secrets, each a
+      # single line, so no value can straddle a newline and corrupt the file.
+      # Never echoed — written straight to disk, count only.
+      - name: Render Doppler prd env file
+        run: |
+          doppler secrets download --no-file --format docker | grep -vE '^DOPPLER_(PROJECT|CONFIG|ENVIRONMENT)=' > doppler.prd.env
+          echo "Rendered $(grep -cE '^[A-Za-z_][A-Za-z0-9_]*=' doppler.prd.env) secrets from Doppler prd"
+        env:
+          DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN_PRODUCTION }}
+
+      - name: Copy env file to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USERNAME }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          source: doppler.prd.env
+          target: /opt/framada
+
+      - name: Deploy to Hetzner
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USERNAME }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          script: |
+            set -eu
+            cd /opt/framada
+
+            SRC=doppler.prd.env
+            if [ ! -s "$SRC" ]; then
+              echo "ERROR: $SRC missing or empty - aborting before touching the container"
+              exit 1
+            fi
+
+            TS=$(date +%Y%m%d%H%M%S)
+            if [ -f .env ]; then cp .env ".env.bak.$TS"; fi
+
+            # Keys Doppler owns on this deploy.
+            awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/ { print substr($0, 1, index($0, "=") - 1) }' "$SRC" | sort -u > doppler.keys
+
+            # VPS-only lines first (comments and blanks preserved), Doppler
+            # appended last so it wins on any duplicate key.
+            : > merged.env
+            if [ -f .env ]; then
+              while IFS= read -r line || [ -n "$line" ]; do
+                case "$line" in
+                  ''|'#'*) printf '%s\n' "$line" >> merged.env; continue ;;
+                esac
+                key=${line%%=*}
+                if ! grep -qxF "$key" doppler.keys; then
+                  printf '%s\n' "$line" >> merged.env
+                fi
+              done < .env
+            fi
+            cat "$SRC" >> merged.env
+
+            # HARD GATE - never restart the container with a broken env. This
+            # runs BEFORE .env is replaced, so a failure here leaves the running
+            # production container exactly as it was.
+            # PRIVATE_FILE_REF_SECRET: the backend refuses to start without it
+            # (config/env.ts), so checking it here keeps the old container up.
+            for required in DATABASE_URL BETTER_AUTH_SECRET BETTER_AUTH_URL ALLOWED_ORIGINS PRIVATE_FILE_REF_SECRET; do
+              val=$(grep -E "^${required}=" merged.env | tail -n1 | cut -d= -f2-)
+              if [ -z "$val" ]; then
+                echo "ERROR: ${required} is empty or missing after merge - aborting, running container untouched"
+                rm -f merged.env doppler.keys "$SRC"
+                exit 1
+              fi
+            done
+
+            install -m 600 merged.env .env
+            rm -f merged.env doppler.keys "$SRC"
+
+            docker compose config >/dev/null
+
+            docker compose pull backend
+            docker compose up -d
+
+            # Health gate. Probes from inside the container so this does not
+            # depend on curl or wget being installed on the host.
+            ok=0
+            i=0
+            while [ $i -lt 30 ]; do
+              if docker compose exec -T backend node -e "fetch('http://127.0.0.1:3000/api/health').then(function(r){process.exit(r.ok?0:1)}).catch(function(){process.exit(1)})" >/dev/null 2>&1; then
+                ok=1
+                break
+              fi
+              i=$((i+1))
+              sleep 3
+            done
+
+            if [ "$ok" -ne 1 ]; then
+              echo "ERROR: backend did not become healthy after the env change - rolling back .env"
+              if [ -f ".env.bak.$TS" ]; then
+                install -m 600 ".env.bak.$TS" .env
+                docker compose up -d
+              fi
+              exit 1
+            fi
+
+            docker compose run --rm backend node migrate.mjs
+
+            # RBAC + admin seed, both idempotent and both bundled into dist/ by
+            # tsup (the image has no src/ and no tsx). Order matters: seed-admin
+            # aborts with "Admin role not found" if seed-rbac has not run.
+            # seed-admin re-syncs the credential password from
+            # SEED_ADMIN_PASSWORD, which now reaches the container via the
+            # Doppler merge above, so the seeded admin is always reachable.
+            docker compose run --rm backend node dist/scripts/seed-rbac.js
+            docker compose run --rm backend node dist/scripts/seed-admin.js
+
+            # Keep the 10 most recent env backups.
+            ls -1t .env.bak.* 2>/dev/null | tail -n +11 | xargs -r rm -f || true
+
+      - name: Remove rendered env file from runner
+        if: always()
+        run: rm -f doppler.prd.env
+
+  # ── Portal / PWA / Reports → Cloudflare Pages ──────────────────────────────
+  # Build happens here in CI with Doppler-injected env vars baked into the
+  # bundle, then wrangler uploads the prebuilt dist to CF Pages.
+  #   - main push    → production deployment (Doppler prd values)
+  #   - staging push → preview deployment on staging branch (Doppler stg values)
+  deploy-frontends:
+    name: Cloudflare Pages · ${{ matrix.app }}
+    needs: [check, changes]
+    if: github.event_name == 'push' && needs.changes.outputs.frontend_matrix != '{"include":[]}'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.frontend_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: pnpm/action-setup@v4
+      - name: Install Doppler CLI
+        uses: dopplerhq/cli-action@v3
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      # Each app's vite.config.ts remaps its own per-app vars (PORTAL_VITE_*,
+      # PWA_VITE_*, PATIENT_VITE_*, HR_VITE_*, REPORTS_VITE_*) onto the shared
+      # VITE_* names, falling back to VITE_SENTRY_DSN when no per-app DSN is
+      # set. Those names are listed in turbo.json's `build.env` so Turbo's
+      # strict env mode does not filter them out. Deriving the prefix here from
+      # the matrix app name is deliberately NOT done: it broke `team`, whose
+      # Doppler vars are still named PWA_VITE_*.
+      - name: Build ${{ matrix.app }}
+        run: doppler run -- ${{ matrix.build_cmd }}
+        env:
+          DOPPLER_TOKEN: ${{ github.ref_name == 'main' && secrets.DOPPLER_TOKEN_PRODUCTION || secrets.DOPPLER_TOKEN_STAGING }}
+      - name: Strip sourcemaps
+        run: find ${{ matrix.dist }} -name '*.map' -delete 2>/dev/null || true
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: >
+            pages deploy ${{ matrix.dist }}
+            --project-name ${{ matrix.cf_project }}
+            --branch ${{ github.ref_name }}
+
+  # ── Website → Cloudflare Workers (Workers + Assets) ────────────────────────
+  # @opennextjs/cloudflare produces a Workers+Assets bundle (worker.js + assets/).
+  # Workers+Assets is deployed via `wrangler deploy` (not `pages deploy`) so that
+  # wrangler.toml is read for compatibility_flags (nodejs_compat for googleapis).
+  #   - main push    → production worker "website"    (Doppler prd values)
+  #   - staging push → staging worker "website-staging" via [env.staging] (Doppler stg values)
+  deploy-website:
+    name: Website · Cloudflare Workers
+    needs: [check, changes]
+    if: github.event_name == 'push' && needs.changes.outputs.website == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+      - name: Install Doppler CLI
+        uses: dopplerhq/cli-action@v3
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build website
+        run: doppler run -- pnpm --filter website run build:cf
+        env:
+          DOPPLER_TOKEN: ${{ github.ref_name == 'main' && secrets.DOPPLER_TOKEN_PRODUCTION || secrets.DOPPLER_TOKEN_STAGING }}
+      - name: Deploy to Cloudflare Workers
+        working-directory: website
+        run: pnpm exec wrangler deploy ${{ github.ref_name == 'staging' && '--env staging' || '' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  # ── E2E smoke tests against deployed staging ──────────────────────────────
+  # Runs after staging frontend + backend are both live. Results gate the
+  # staging → main promotion PR — if smoke fails, don't merge to production.
+  # Requires STAGING_PORTAL_URL secret (e.g. https://staging.portal.pages.dev).
+  e2e-smoke:
+    name: E2E Smoke Tests (portal)
+    needs: [deploy-frontends, deploy-backend-staging]
+    if: always() && !cancelled() && !contains(needs.*.result, 'failure') && github.event_name == 'push' && github.ref_name == 'staging'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # STAGING_PORTAL_URL gates this job: until it is set, every real step is
+    # skipped (the job goes green with a warning) so a missing secret never
+    # hard-fails the pipeline. The moment the secret is added the job activates
+    # and becomes the staging→main promotion gate. STAGING_API_URL (backend
+    # health) is optional — without it the health poll is skipped.
+    env:
+      PORTAL_URL: ${{ secrets.STAGING_PORTAL_URL }}
+      API_URL: ${{ secrets.STAGING_API_URL }}
+    steps:
+      - name: Skip notice — STAGING_PORTAL_URL not set
+        if: env.PORTAL_URL == ''
+        run: echo "::warning::STAGING_PORTAL_URL is not set — skipping post-deploy portal E2E. Add it in repo secrets to enable the staging→main promotion gate (see project-docs/ci-testing.md)."
+
+      - uses: actions/checkout@v4
+        if: env.PORTAL_URL != ''
+
+      - uses: actions/setup-node@v4
+        if: env.PORTAL_URL != ''
+        with:
+          node-version: 20
+
+      - uses: pnpm/action-setup@v4
+        if: env.PORTAL_URL != ''
+
+      - name: Install dependencies
+        if: env.PORTAL_URL != ''
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        if: env.PORTAL_URL != ''
+        run: pnpm --filter portal exec playwright install chromium --with-deps
+
+      # Wait for the freshly-triggered deploys to actually be live before
+      # testing. CF Pages edge propagation can lag a few seconds, and
+      # deploy-backend-staging only *triggers* the Render build (minutes to
+      # build + cold-start). Polling here stops the smoke from racing an
+      # unfinished deploy (the #1 cause of false-negative staging failures).
+      - name: Wait for staging stack to be live
+        if: env.PORTAL_URL != ''
+        run: |
+          wait_for() {
+            name="$1"; url="$2"; tries="$3"
+            echo "Waiting for $name at $url ..."
+            for i in $(seq 1 "$tries"); do
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$url" || echo 000)
+              if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then
+                echo "  $name is live (HTTP $code) after $((i * 5))s"
+                return 0
+              fi
+              echo "  attempt $i/$tries: HTTP $code"
+              sleep 5
+            done
+            echo "::error::$name never became healthy at $url"
+            return 1
+          }
+          # Portal must be reachable — tests load it directly (≤2 min).
+          wait_for "portal" "$PORTAL_URL" 24 || exit 1
+          # Backend health gates promotion (≤8 min for a Render rebuild + cold
+          # start). Skipped cleanly if STAGING_API_URL isn't set.
+          if [ -n "$API_URL" ]; then
+            wait_for "backend" "$API_URL/api/health" 96 || exit 1
+          else
+            echo "::warning::STAGING_API_URL not set — skipping backend health gate"
+          fi
+
+      - name: Run portal smoke tests
+        if: env.PORTAL_URL != ''
+        working-directory: portals
+        run: pnpm test:e2e
+        env:
+          PLAYWRIGHT_BASE_URL: ${{ env.PORTAL_URL }}
+          CI: true
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-portal
+          path: portals/playwright-report/
+          retention-days: 7
+
+  # ── E2E smoke tests · PWA (post-deploy, staging) ───────────────────────────
+  # The PWA smoke spec is almost entirely frontend-only (unauthenticated
+  # routing, security contract, manifest, data-leakage); one assertion submits
+  # the login form and tolerates either a 401 or an unreachable backend, so the
+  # health gate below makes it deterministic. It runs chromium-only against the
+  # deployed PWA. NON-BLOCKING for now (continue-on-error) because this job has
+  # not yet accrued a green track record in CI — promote it to a hard gate once
+  # it has run clean for a few staging deploys (see project-docs/ci-testing.md).
+  #
+  # D6 (2026-09-03): the spec was migrated off the removed Account-ID/password
+  # login and the relocated /patient/* + /trainer/* trees, so it is no longer
+  # permanently red. `continue-on-error` STAYS for now by explicit decision:
+  # the rewritten spec has never run against a deployed staging app, and this
+  # job is additionally gated on STAGING_PWA_URL. Flip it to a hard gate (delete
+  # the `continue-on-error: true` below) after ONE green run on staging.
+  #
+  # global-setup.ts wipes an SMS stub file; SMS_STUB_FILE is overridden to a
+  # Linux path so it does not try to write the local-dev default (F:/tmp/...).
+  # DATABASE_URL is intentionally unset → global-setup skips the DB reset.
+  e2e-smoke-pwa:
+    name: E2E Smoke Tests (pwa)
+    needs: [deploy-frontends, deploy-backend-staging]
+    if: always() && !cancelled() && !contains(needs.*.result, 'failure') && github.event_name == 'push' && github.ref_name == 'staging'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    env:
+      PWA_URL: ${{ secrets.STAGING_PWA_URL }}
+      API_URL: ${{ secrets.STAGING_API_URL }}
+    steps:
+      - name: Skip notice — STAGING_PWA_URL not set
+        if: env.PWA_URL == ''
+        run: echo "::warning::STAGING_PWA_URL is not set — skipping post-deploy PWA E2E. Add it in repo secrets to enable it (see project-docs/ci-testing.md)."
+
+      - uses: actions/checkout@v4
+        if: env.PWA_URL != ''
+      - uses: actions/setup-node@v4
+        if: env.PWA_URL != ''
+        with:
+          node-version: 20
+      - uses: pnpm/action-setup@v4
+        if: env.PWA_URL != ''
+      - name: Install dependencies
+        if: env.PWA_URL != ''
+        run: pnpm install --frozen-lockfile
+      - name: Install Playwright browsers
+        if: env.PWA_URL != ''
+        run: pnpm --filter team exec playwright install chromium --with-deps
+      - name: Wait for PWA + backend to be live
+        if: env.PWA_URL != ''
+        run: |
+          wait_for() {
+            name="$1"; url="$2"; tries="$3"
+            echo "Waiting for $name at $url ..."
+            for i in $(seq 1 "$tries"); do
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$url" || echo 000)
+              if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then
+                echo "  $name is live (HTTP $code) after $((i * 5))s"
+                return 0
+              fi
+              echo "  attempt $i/$tries: HTTP $code"
+              sleep 5
+            done
+            echo "::error::$name never became healthy at $url"
+            return 1
+          }
+          wait_for "pwa" "$PWA_URL" 24 || exit 1
+          if [ -n "$API_URL" ]; then
+            wait_for "backend" "$API_URL/api/health" 96 || exit 1
+          else
+            echo "::warning::STAGING_API_URL not set — skipping backend health gate"
+          fi
+      - name: Run PWA smoke tests (chromium only)
+        if: env.PWA_URL != ''
+        working-directory: team
+        run: pnpm exec playwright test smoke.spec.ts --project=chromium
+        env:
+          PLAYWRIGHT_BASE_URL: ${{ env.PWA_URL }}
+          SMS_STUB_FILE: /tmp/pwa-otp-stub.ndjson
+          CI: true
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-pwa
+          path: team/playwright-report/
+          retention-days: 7
+
+  # ── E2E smoke tests · Reports (post-deploy, staging) ───────────────────────
+  # Reports smoke is fully frontend-only (load, auth-redirect, read-only
+  # contract, no data leakage). chromium-only against the deployed reports URL.
+  # NON-BLOCKING for now — promote to a hard gate once proven green.
+  e2e-smoke-reports:
+    name: E2E Smoke Tests (reports)
+    needs: [deploy-frontends]
+    if: always() && !cancelled() && !contains(needs.*.result, 'failure') && github.event_name == 'push' && github.ref_name == 'staging'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    env:
+      REPORTS_URL: ${{ secrets.STAGING_REPORTS_URL }}
+    steps:
+      - name: Skip notice — STAGING_REPORTS_URL not set
+        if: env.REPORTS_URL == ''
+        run: echo "::warning::STAGING_REPORTS_URL is not set — skipping post-deploy Reports E2E. Add it in repo secrets to enable it (see project-docs/ci-testing.md)."
+
+      - uses: actions/checkout@v4
+        if: env.REPORTS_URL != ''
+      - uses: actions/setup-node@v4
+        if: env.REPORTS_URL != ''
+        with:
+          node-version: 20
+      - uses: pnpm/action-setup@v4
+        if: env.REPORTS_URL != ''
+      - name: Install dependencies
+        if: env.REPORTS_URL != ''
+        run: pnpm install --frozen-lockfile
+      - name: Install Playwright browsers
+        if: env.REPORTS_URL != ''
+        run: pnpm --filter reports exec playwright install chromium --with-deps
+      - name: Wait for Reports to be live
+        if: env.REPORTS_URL != ''
+        run: |
+          echo "Waiting for reports at $REPORTS_URL ..."
+          for i in $(seq 1 24); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$REPORTS_URL" || echo 000)
+            if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then
+              echo "  reports is live (HTTP $code) after $((i * 5))s"
+              exit 0
+            fi
+            echo "  attempt $i/24: HTTP $code"
+            sleep 5
+          done
+          echo "::error::reports never became healthy at $REPORTS_URL"
+          exit 1
+      - name: Run Reports smoke tests
+        if: env.REPORTS_URL != ''
+        working-directory: reports
+        run: pnpm test:e2e
+        env:
+          PLAYWRIGHT_BASE_URL: ${{ env.REPORTS_URL }}
+          CI: true
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-reports
+          path: reports/playwright-report/
+          retention-days: 7

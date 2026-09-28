@@ -1,0 +1,33 @@
+# Version control
+.git
+.github
+
+# All node_modules — Docker installs its own inside the image
+**/node_modules
+
+# Frontend apps — not part of the backend image
+portals/
+pwa/
+reports/
+website/
+website-backend/
+
+# Build outputs (builder stage generates its own)
+backend/dist/
+**/dist/
+**/.turbo/
+
+# Secrets — never bake into an image
+.env
+.env.*
+.doppler*
+
+# Dev / editor artefacts
+*.log
+.DS_Store
+*.local
+.vscode/
+.idea/
+
+# pnpm store (local cache, not needed in build context)
+.pnpm-store/
