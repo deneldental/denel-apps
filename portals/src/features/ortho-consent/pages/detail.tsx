@@ -22,7 +22,7 @@ export default function ConsentFormPage() {
 
   useEffect(() => {
     if (formsQuery.isError || (!formsQuery.isLoading && !consentForm)) {
-      navigate('/ortho-consent')
+      navigate('/consents/ortho')
     }
   }, [formsQuery.isError, formsQuery.isLoading, consentForm, navigate])
 

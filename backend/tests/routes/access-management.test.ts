@@ -161,4 +161,65 @@ describe('PATCH /api/access-management/staff/:userId/role', () => {
     })
     expect(res.status).toBe(403)
   })
+
+  // 'doctor' needs a linked `specialists` record that this endpoint never
+  // creates — assigning it here previously produced an account with full clinical
+  // permissions invisible to the appointment-booking system (GET /api/doctors reads
+  // `specialists`, never `user.roleId`). Rejected before the (mocked, empty) DB is
+  // ever touched. (`external_trainer` used to be refused too; it is assignable by
+  // administrators since D15 — see tests/integration/role-assignment-authority.test.ts.)
+  it.each([
+    'doctor',
+  ] as const)('rejects role=%s with a message pointing at Portal → Specialists', async (role) => {
+    mockGetCurrentUser.mockResolvedValue(fakeUser)
+    mockCheckPermission.mockResolvedValue(true)
+    const res = await makeApp().request('/api/access-management/staff/user-abc/role', {
+      method: 'PATCH',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ role }),
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toMatch(/doctor.*Add specialist/is)
+  })
+})
+
+describe('POST /api/access-management/staff/bulk-role', () => {
+  afterEach(() => vi.clearAllMocks())
+
+  it('returns 401 when unauthenticated', async () => {
+    mockGetCurrentUser.mockResolvedValue(null)
+    const res = await makeApp().request('/api/access-management/staff/bulk-role', {
+      method: 'POST',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ userIds: ['user-abc'], role: 'staff' }),
+    })
+    expect(res.status).toBe(401)
+  })
+
+  it('returns 403 when authenticated but lacking UPDATE permission', async () => {
+    mockGetCurrentUser.mockResolvedValue(fakeUser)
+    mockCheckPermission.mockResolvedValue(false)
+    const res = await makeApp().request('/api/access-management/staff/bulk-role', {
+      method: 'POST',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ userIds: ['user-abc'], role: 'staff' }),
+    })
+    expect(res.status).toBe(403)
+  })
+
+  it.each([
+    'doctor',
+  ] as const)('rejects role=%s with a message pointing at Portal → Specialists', async (role) => {
+    mockGetCurrentUser.mockResolvedValue(fakeUser)
+    mockCheckPermission.mockResolvedValue(true)
+    const res = await makeApp().request('/api/access-management/staff/bulk-role', {
+      method: 'POST',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ userIds: ['user-abc'], role }),
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toMatch(/doctor.*Add specialist/is)
+  })
 })

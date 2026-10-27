@@ -1,5 +1,5 @@
 import { relations } from 'drizzle-orm'
-import { boolean, integer, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core'
+import { boolean, integer, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core'
 
 import { user } from './auth'
 import { appointments } from './clinical'
@@ -160,6 +160,35 @@ export const appointmentTypeReminders = pgTable('appointment_type_reminders', {
   updatedAt: timestamp('updatedAt').defaultNow().notNull(),
 })
 
+// H3 — one row per (appointment, policy) reminder actually sent. Unlike
+// scheduled_reminders (one row, one lastRunAt stamp), a `before_appointment`
+// policy fires against many appointments per tick, so there's no single
+// column to stamp — this table is the idempotency record instead. The
+// unique index is what makes a manual re-run of the scheduler (or two
+// overlapping ticks) safe: the second attempt's insert is a no-op
+// (`onConflictDoNothing`), so `processAppointmentTypeReminders` never
+// re-sends the same reminder for the same appointment twice. See
+// project-docs/patient-records-and-scheduling-audit.md, H3.
+export const appointmentTypeReminderSends = pgTable(
+  'appointment_type_reminder_sends',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    appointmentId: uuid('appointmentId')
+      .notNull()
+      .references(() => appointments.id, { onDelete: 'cascade' }),
+    policyId: uuid('policyId')
+      .notNull()
+      .references(() => appointmentTypeReminders.id, { onDelete: 'cascade' }),
+    sentAt: timestamp('sentAt').defaultNow().notNull(),
+  },
+  (t) => ({
+    appointmentPolicyUniq: uniqueIndex('appt_type_reminder_sends_appt_policy_uniq').on(
+      t.appointmentId,
+      t.policyId
+    ),
+  })
+)
+
 // ── Relations ─────────────────────────────────────────────────────────────────
 
 export const messagesRelations = relations(messages, ({ one }) => ({
@@ -218,6 +247,20 @@ export const appointmentTypeRemindersRelations = relations(appointmentTypeRemind
     references: [reminderTemplates.id],
   }),
 }))
+
+export const appointmentTypeReminderSendsRelations = relations(
+  appointmentTypeReminderSends,
+  ({ one }) => ({
+    appointment: one(appointments, {
+      fields: [appointmentTypeReminderSends.appointmentId],
+      references: [appointments.id],
+    }),
+    policy: one(appointmentTypeReminders, {
+      fields: [appointmentTypeReminderSends.policyId],
+      references: [appointmentTypeReminders.id],
+    }),
+  })
+)
 
 // User relations are consolidated in `schema/index.ts` (`userRelations`) to avoid
 // Drizzle's "multiple relations(user, ...) calls" footgun. sentMessages and

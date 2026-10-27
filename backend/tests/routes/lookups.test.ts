@@ -83,9 +83,15 @@ const hrAdminUser = {
 describe('GET /api/lookups/:type/all', () => {
   afterEach(() => vi.clearAllMocks())
 
+  // Reading a list needs a module grant (F23); writing is the separate gate under test here, so
+  // these cases may read but not write.
+  const mayReadNotWrite = async (_c: unknown, _u: string, _m: string, action: string) =>
+    action === 'read'
+
   it('returns only active rows to a non-admin', async () => {
     mockGetCurrentUser.mockResolvedValue(hrAdminUser)
     mockIsAdmin.mockResolvedValue(false)
+    mockCheckPermission.mockImplementation(mayReadNotWrite)
     const res = await makeApp().request('/api/lookups/units/all')
     expect(res.status).toBe(200)
     const body = (await res.json()) as JsonBody
@@ -95,6 +101,7 @@ describe('GET /api/lookups/:type/all', () => {
   it('returns inactive rows too for an admin', async () => {
     mockGetCurrentUser.mockResolvedValue(adminUser)
     mockIsAdmin.mockResolvedValue(true)
+    mockCheckPermission.mockImplementation(mayReadNotWrite)
     const res = await makeApp().request('/api/lookups/units/all')
     expect(res.status).toBe(200)
     const body = (await res.json()) as JsonBody
@@ -126,7 +133,13 @@ describe('GET /api/lookups/:type/all', () => {
     const res = await makeApp().request('/api/lookups/units/all')
     expect(res.status).toBe(200)
     expect(((await res.json()) as JsonBody).data).toEqual(activeRows)
-    expect(mockCheckPermission).not.toHaveBeenCalled()
+    // Non-HR types never fall back to staff:update (the read check is a different question).
+    expect(mockCheckPermission).not.toHaveBeenCalledWith(
+      expect.anything(),
+      hrAdminUser.id,
+      'staff',
+      'update'
+    )
   })
 })
 

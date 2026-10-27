@@ -28,6 +28,12 @@ export interface ResolvedPrice {
   name: string
   /** Resolved unit price (matrix cell, else the service's flat `amount`). */
   unitPrice: number
+  /**
+   * First-unit / additional-unit tariff: the price of each unit after the first, in cents, when the
+   * service's application type is billed in steps AND the service has the price — whichever variant
+   * is chosen. Null → every unit costs `unitPrice`. 0 is a price (further units free).
+   */
+  additionalUnitPrice: number | null
   /** Quantity after scope rules (single-scope forces 1; multi caps at maxQuantity). */
   quantity: number
   /** Guided range for the resolved cell/service, if any. */
@@ -114,6 +120,7 @@ export async function resolveServicePrice(
           .select({
             quantityMode: applicationScopes.quantityMode,
             maxQuantity: applicationScopes.maxQuantity,
+            additionalUnitPriceEnabled: applicationScopes.additionalUnitPriceEnabled,
           })
           .from(applicationScopes)
           .where(eq(applicationScopes.id, svc.scopeId))
@@ -133,11 +140,16 @@ export async function resolveServicePrice(
   const unitPrice = cell ? toNum(cell.price) : toNum(svc.amount)
   const priceMin = cell ? toNullNum(cell.priceMin) : toNullNum(svc.priceMin)
   const priceMax = cell ? toNullNum(cell.priceMax) : toNullNum(svc.priceMax)
+  // Stepped only when the type's switch is on AND the service has the price; either missing → flat.
+  const additionalUnitPrice = scope?.additionalUnitPriceEnabled
+    ? toNullNum(svc.additionalUnitPrice)
+    : null
 
   return {
     serviceId: svc.id,
     name: svc.name,
     unitPrice,
+    additionalUnitPrice,
     quantity,
     priceMin,
     priceMax,

@@ -705,6 +705,10 @@ export const services = pgTable('services', {
   // below min only via a logged discount. Null → no guide (use `amount`).
   priceMin: integer('priceMin'),
   priceMax: integer('priceMax'),
+  // First-unit / additional-unit tariff (0234): pesewas for each unit after the first, applied only
+  // while the service's application type has `additionalUnitPriceEnabled`. Null → no step: every
+  // unit costs the unit price. 0 is a price (further units free), not "none".
+  additionalUnitPrice: integer('additionalUnitPrice'),
 
   // ── Pricing refinements (0170) ─────────────────────────────────────────────
   // Stacked sales taxes: array of tax_configurations ids. Effective tax rate =
@@ -832,6 +836,10 @@ export const applicationScopes = pgTable('application_scopes', {
   displayName: text('displayName').notNull(),
   quantityMode: text('quantityMode').default('single').notNull(), // 'single' | 'multi'
   maxQuantity: integer('maxQuantity'),
+  // First-unit / additional-unit tariff (0234): when on, a service of this type costs its unit price
+  // for the first unit and its own `additionalUnitPrice` for each further one. Only meaningful for a
+  // 'multi' type (the routes keep it off for a 'single' one).
+  additionalUnitPriceEnabled: boolean('additionalUnitPriceEnabled').default(false).notNull(),
   // 'none' (no variants) | 'plain' (variants, no tooth class) | 'tooth_class'
   // (variants can carry a tooth class). Drives the Price-matrix step UI.
   variantType: text('variantType').default('none').notNull(),

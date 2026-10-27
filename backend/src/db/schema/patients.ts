@@ -1,4 +1,4 @@
-import { relations } from 'drizzle-orm'
+import { eq, relations } from 'drizzle-orm'
 import {
   boolean,
   index,
@@ -12,50 +12,71 @@ import {
 
 import { user } from './auth'
 
-export const patients = pgTable('patients', {
-  id: uuid('id').defaultRandom().primaryKey(),
-  name: text('name').notNull(),
-  email: text('email'),
-  phone: text('phone'),
-  dob: timestamp('dob').notNull(),
-  gender: text('gender').notNull(), // 'male', 'female', 'other'
-  address: text('address'),
-  occupation: text('occupation'),
-  profileImage: text('profileImage'), // URL or path to profile image
-  patientId: text('patientId').unique(), // Format: FD-YYMM-XXXX
-  // category replaces the old 'type' field
-  // 'ongoing' = patient receiving continuous care from Framada
-  // 'one_time' = referred/walk-in for a single procedure; not expected to return
-  category: text('category').default('ongoing').notNull(),
-  isChild: boolean('isChild').default(false).notNull(),
-  // §18.1 — comms consent: when true the patient has opted OUT of SMS/email outreach
-  // (DPA do-not-contact). Enforced server-side at every send point (§13.3 / §17.2).
-  doNotContact: boolean('doNotContact').default(false).notNull(),
-  // Guardian/Parent information (for child patients)
-  guardianName: text('guardianName'),
-  guardianPhone: text('guardianPhone'),
-  guardianEmail: text('guardianEmail'),
-  guardianAddress: text('guardianAddress'),
-  guardianOccupation: text('guardianOccupation'),
-  insuranceProvider: text('insuranceProvider'),
-  insurancePolicyNumber: text('insurancePolicyNumber'),
-  emergencyContactName: text('emergencyContactName'),
-  emergencyContactPhone: text('emergencyContactPhone'),
-  nationality: text('nationality').default('Ghanaian'),
-  howDidYouHear: text('howDidYouHear'), // 'friend_family', 'social_media', 'google', 'other'
-  howDidYouHearOther: text('howDidYouHearOther'), // free-text when 'other' is selected
-  // Patient PWA access
-  pwaAccessEnabled: boolean('pwaAccessEnabled').default(false).notNull(),
-  pwaPasswordHash: text('pwaPasswordHash'), // PBKDF2 hash; null until access is granted
-  pwaAccessGrantedAt: timestamp('pwaAccessGrantedAt'),
-  pwaAccessGrantedById: text('pwaAccessGrantedById').references(() => user.id, {
-    onDelete: 'set null',
-  }),
-  // clinicId — multi-tenancy prep (nullable; backfilled when multi-tenant is activated)
-  clinicId: uuid('clinicId'),
-  createdAt: timestamp('createdAt').defaultNow().notNull(),
-  updatedAt: timestamp('updatedAt').defaultNow().notNull(),
-})
+export const patients = pgTable(
+  'patients',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    name: text('name').notNull(),
+    email: text('email'),
+    phone: text('phone'),
+    dob: timestamp('dob').notNull(),
+    gender: text('gender').notNull(), // 'male', 'female', 'other'
+    address: text('address'),
+    occupation: text('occupation'),
+    profileImage: text('profileImage'), // URL or path to profile image
+    patientId: text('patientId').unique(), // Format: FD-YYMM-XXXX
+    // category replaces the old 'type' field
+    // 'ongoing' = patient receiving continuous care from Framada
+    // 'one_time' = referred/walk-in for a single procedure; not expected to return
+    category: text('category').default('ongoing').notNull(),
+    isChild: boolean('isChild').default(false).notNull(),
+    // §18.1 — comms consent: when true the patient has opted OUT of SMS/email outreach
+    // (DPA do-not-contact). Enforced server-side at every send point (§13.3 / §17.2).
+    doNotContact: boolean('doNotContact').default(false).notNull(),
+    // Guardian/Parent information (for child patients)
+    guardianName: text('guardianName'),
+    guardianPhone: text('guardianPhone'),
+    guardianEmail: text('guardianEmail'),
+    guardianAddress: text('guardianAddress'),
+    guardianOccupation: text('guardianOccupation'),
+    insuranceProvider: text('insuranceProvider'),
+    insurancePolicyNumber: text('insurancePolicyNumber'),
+    emergencyContactName: text('emergencyContactName'),
+    emergencyContactPhone: text('emergencyContactPhone'),
+    nationality: text('nationality').default('Ghanaian'),
+    howDidYouHear: text('howDidYouHear'), // 'friend_family', 'social_media', 'google', 'other'
+    howDidYouHearOther: text('howDidYouHearOther'), // free-text when 'other' is selected
+    // Patient PWA access
+    pwaAccessEnabled: boolean('pwaAccessEnabled').default(false).notNull(),
+    pwaPasswordHash: text('pwaPasswordHash'), // PBKDF2 hash; null until access is granted
+    pwaAccessGrantedAt: timestamp('pwaAccessGrantedAt'),
+    pwaAccessGrantedById: text('pwaAccessGrantedById').references(() => user.id, {
+      onDelete: 'set null',
+    }),
+    // clinicId — multi-tenancy prep (nullable; backfilled when multi-tenant is activated)
+    clinicId: uuid('clinicId'),
+    // Archive (soft-delete) — mirrors invoices/payment_plans' archived/archivedAt/
+    // archivedBy convention, not patient_cases' deletedAt one: this needed a
+    // working restore path, which only the invoices convention already had
+    // proven. A patient is never hard-deleted by the normal archive action
+    // anymore — see project-docs/patient-records-and-scheduling-audit.md C5.
+    // Hard delete is now DELETE /:id/permanent, admin + password gated.
+    archived: boolean('archived').default(false).notNull(),
+    archivedAt: timestamp('archivedAt'),
+    archivedBy: text('archivedBy').references(() => user.id, { onDelete: 'set null' }),
+    createdAt: timestamp('createdAt').defaultNow().notNull(),
+    updatedAt: timestamp('updatedAt').defaultNow().notNull(),
+  },
+  (t) => ({
+    // Every patient-portal login/OTP call resolves the caller's phone against
+    // this set (patient-auth.ts's findEnabledPatientsByPhone) — a small,
+    // heavily skewed minority of `patients`, so a partial index keeps that
+    // lookup an index scan instead of a full table scan as the table grows.
+    pwaAccessEnabledIdx: index('idx_patients_pwa_access_enabled')
+      .on(t.pwaAccessEnabled)
+      .where(eq(t.pwaAccessEnabled, true)),
+  })
+)
 
 // --- PATIENT PWA SESSIONS ---
 // Lightweight custom sessions for patient portal — separate from Better Auth staff sessions.

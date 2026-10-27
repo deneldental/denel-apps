@@ -13,7 +13,8 @@ import {
 import { KeyRound, Layers, Loader2, Lock, ShieldCheck } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { TEAM_ROLE_OPTIONS } from '@/features/staff/__mock__/team-members'
+import { roleOptionsFor } from '@/features/staff/__mock__/team-members'
+import { roleControlFor } from '@/features/staff/role-access'
 import {
   type AvailableBundle,
   grantUserBundle,
@@ -29,6 +30,7 @@ import { SheetFormLayout } from '@/shared/components/sheet-form-layout'
 import { StatusBadge } from '@/shared/components/status-badge'
 import { TagBadge } from '@/shared/components/tag-badge'
 import { useFormDirtyGuard } from '@/shared/hooks/use-form-dirty-guard'
+import { useCanAssignAnyRole } from '@/shared/hooks/use-role-authority'
 import { useSubmitGuard } from '@/shared/hooks/use-submit-guard'
 import { surfaceApiError } from '@/shared/lib/api-error'
 
@@ -69,6 +71,9 @@ export function EditAccessSheet({
   staff: StaffAccessProps
   onSaved: () => void
 }) {
+  // An administrator may give any role, change scopes and grant bundles; an HR administrator
+  // only the everyday roles, and not the scope/bundle controls (those calls need an administrator).
+  const canAssignAnyRole = useCanAssignAnyRole()
   const [positionTag, setPositionTag] = useState<PositionTag>('staff')
   const [role, setRole] = useState<string>(UNASSIGNED)
   // Initialised to null so scope rows render only after the data-fetch resolves,
@@ -110,6 +115,15 @@ export function EditAccessSheet({
     if (!open) return
     setPositionTag(initialState.positionTag)
     setRole(initialState.role)
+    // Scopes and bundles are administrator-only endpoints; do not call them as anyone else.
+    if (!canAssignAnyRole) {
+      setAvailable([])
+      setGrants([])
+      setPortalAccess(false)
+      setPwaAccess(true)
+      setLoading(false)
+      return
+    }
     setLoading(true)
     void (async () => {
       const [bundlesRes, grantsRes, permsRes] = await Promise.all([
@@ -130,7 +144,7 @@ export function EditAccessSheet({
       setPwaAccess(scopes?.pwa ?? true)
       setLoading(false)
     })()
-  }, [open, staff.userId, initialState.positionTag, initialState.role])
+  }, [open, staff.userId, initialState.positionTag, initialState.role, canAssignAnyRole])
 
   const isDirty = positionTag !== initialState.positionTag || role !== initialState.role
 
@@ -264,6 +278,15 @@ export function EditAccessSheet({
 
   const grantMap = new Map(grants.map((g) => [g.bundleId, g]))
 
+  // What the role control shows (role-access.ts): editable, or read-only for a doctor (set from
+  // Portal → Specialists) or for a role only an administrator may change. Detected off the SAVED
+  // role (initialState), not the live `role` state, since with no Select in the read-only
+  // branches the two never diverge anyway.
+  const roleControl = roleControlFor(
+    initialState.role === UNASSIGNED ? null : initialState.role,
+    canAssignAnyRole
+  )
+
   return (
     <>
       <SheetFormLayout
@@ -300,25 +323,63 @@ export function EditAccessSheet({
           {/* System role */}
           <div className="space-y-2">
             <Label htmlFor="edit-role">System role</Label>
-            <Select value={role} onValueChange={setRole} disabled={!staff.userId}>
-              <SelectTrigger id="edit-role">
-                <SelectValue placeholder="Pick a role…" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={UNASSIGNED}>
-                  <span className="italic text-muted-foreground">Unassigned</span>
-                </SelectItem>
-                {TEAM_ROLE_OPTIONS.map((opt) => (
-                  <SelectItem key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="text-xs text-muted-foreground">
-              The role's bundles set the baseline permissions. Use the bundle list below to add
-              extras for this person specifically.
-            </p>
+            {roleControl.kind === 'admin-only' ? (
+              <>
+                <div
+                  id="edit-role"
+                  className="flex items-center justify-between rounded-md border bg-muted/40 px-3 py-2 text-sm"
+                >
+                  <span className="font-medium">{roleControl.label}</span>
+                  <TagBadge label={roleControl.label} className="text-[10px]">
+                    Administrator only
+                  </TagBadge>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Only an administrator can change this role. HR administrators can give Staff,
+                  Receptionist and Lab Technician, and only to people who hold one of those or none.
+                </p>
+              </>
+            ) : roleControl.kind === 'specialist-only' ? (
+              <>
+                <div
+                  id="edit-role"
+                  className="flex items-center justify-between rounded-md border bg-muted/40 px-3 py-2 text-sm"
+                >
+                  <span className="font-medium">{roleControl.label}</span>
+                  <TagBadge label={roleControl.label} className="text-[10px]">
+                    Read-only here
+                  </TagBadge>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Set from Portal → Specialists, not here — this role links to a specialist record
+                  (specialty, licence, commission) that this screen doesn't manage. Change it from
+                  the Specialists page.
+                </p>
+              </>
+            ) : (
+              <>
+                <Select value={role} onValueChange={setRole} disabled={!staff.userId}>
+                  <SelectTrigger id="edit-role">
+                    <SelectValue placeholder="Pick a role…" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={UNASSIGNED}>
+                      <span className="italic text-muted-foreground">Unassigned</span>
+                    </SelectItem>
+                    {roleOptionsFor(canAssignAnyRole).map((opt) => (
+                      <SelectItem key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  The role's bundles set the baseline permissions. Use the bundle list below to add
+                  extras for this person specifically. Doctor isn't offered here — set it from
+                  Portal → Specialists.
+                </p>
+              </>
+            )}
           </div>
 
           <Separator />
@@ -365,103 +426,114 @@ export function EditAccessSheet({
             )}
           </div>
 
-          <Separator />
+          {canAssignAnyRole ? (
+            <>
+              <Separator />
 
-          {/* Scope toggles — save on flip (no batched submit) */}
-          <div className="space-y-3">
-            <div>
-              <h4 className="text-sm font-medium">Surface access</h4>
-              <p className="text-xs text-muted-foreground">
-                Where this person can sign in. Normally this follows their system role; a switch
-                here is a per-person exception. Toggling saves immediately.
-              </p>
-            </div>
-            {loading || portalAccess === null || pwaAccess === null ? (
-              <p className="text-xs text-muted-foreground">Loading…</p>
-            ) : (
-              <>
-                <ScopeRow
-                  label="Portal"
-                  description="Can sign into the clinic portal."
-                  checked={portalAccess}
-                  onChange={(v) => handleScopeToggle('portal', v)}
-                  disabled={!staff.userId}
-                />
-                <ScopeRow
-                  label="PWA"
-                  description="Can sign into the Team app on their phone."
-                  checked={pwaAccess}
-                  onChange={(v) => handleScopeToggle('pwa', v)}
-                  disabled={!staff.userId}
-                />
-              </>
-            )}
-          </div>
-
-          <Separator />
-
-          {/* Per-user bundle grants — save on flip */}
-          <div className="space-y-3">
-            <div>
-              <h4 className="text-sm font-medium flex items-center gap-1.5">
-                <Layers className="h-3.5 w-3.5" />
-                Granular access — per-user bundles
-              </h4>
-              <p className="text-xs text-muted-foreground">
-                Extra bundles attached directly to this person, on top of their role. Auto-granted
-                bundles (from the clinic tag) are read-only — flip the tag instead.
-              </p>
-            </div>
-            {loading ? (
-              <p className="text-xs text-muted-foreground">Loading bundles…</p>
-            ) : (
-              <div className="space-y-2">
-                {available.map((b) => {
-                  const grant = grantMap.get(b.id)
-                  const granted = !!grant
-                  const isAuto = grant?.grantSource === 'auto_position_tag'
-                  return (
-                    <div
-                      key={b.id}
-                      className="flex items-start justify-between gap-3 rounded-md border p-3"
-                    >
-                      <div className="min-w-0 space-y-0.5">
-                        <div className="flex items-center gap-2">
-                          <Label className="text-sm font-medium">{b.name}</Label>
-                          <TagBadge label={b.scope} className="h-4 px-1 text-[10px] capitalize">
-                            {b.scope}
-                          </TagBadge>
-                          {isAuto && (
-                            <StatusBadge tone="warning" className="h-4 gap-1 px-1 text-[10px]">
-                              <Lock className="h-2.5 w-2.5" />
-                              Auto
-                            </StatusBadge>
-                          )}
-                        </div>
-                        {b.description && (
-                          <p className="text-xs text-muted-foreground">{b.description}</p>
-                        )}
-                      </div>
-                      <Switch
-                        checked={granted}
-                        onCheckedChange={() => handleBundleToggle(b.id, granted)}
-                        disabled={isAuto || !staff.userId}
-                        aria-label={b.name}
-                        title={
-                          isAuto
-                            ? 'Auto-granted via clinic tag — flip the tag to revoke.'
-                            : undefined
-                        }
-                      />
-                    </div>
-                  )
-                })}
-                {available.length === 0 && (
-                  <p className="text-xs text-muted-foreground">No assignable bundles.</p>
+              {/* Scope toggles — save on flip (no batched submit) */}
+              <div className="space-y-3">
+                <div>
+                  <h4 className="text-sm font-medium">Surface access</h4>
+                  <p className="text-xs text-muted-foreground">
+                    Where this person can sign in. Normally this follows their system role; a switch
+                    here is a per-person exception. Toggling saves immediately.
+                  </p>
+                </div>
+                {loading || portalAccess === null || pwaAccess === null ? (
+                  <p className="text-xs text-muted-foreground">Loading…</p>
+                ) : (
+                  <>
+                    <ScopeRow
+                      label="Portal"
+                      description="Can sign into the clinic portal."
+                      checked={portalAccess}
+                      onChange={(v) => handleScopeToggle('portal', v)}
+                      disabled={!staff.userId}
+                    />
+                    <ScopeRow
+                      label="PWA"
+                      description="Can sign into the Team app on their phone."
+                      checked={pwaAccess}
+                      onChange={(v) => handleScopeToggle('pwa', v)}
+                      disabled={!staff.userId}
+                    />
+                  </>
                 )}
               </div>
-            )}
-          </div>
+
+              <Separator />
+
+              {/* Per-user bundle grants — save on flip */}
+              <div className="space-y-3">
+                <div>
+                  <h4 className="text-sm font-medium flex items-center gap-1.5">
+                    <Layers className="h-3.5 w-3.5" />
+                    Granular access — per-user bundles
+                  </h4>
+                  <p className="text-xs text-muted-foreground">
+                    Extra bundles attached directly to this person, on top of their role.
+                    Auto-granted bundles (from the clinic tag) are read-only — flip the tag instead.
+                  </p>
+                </div>
+                {loading ? (
+                  <p className="text-xs text-muted-foreground">Loading bundles…</p>
+                ) : (
+                  <div className="space-y-2">
+                    {available.map((b) => {
+                      const grant = grantMap.get(b.id)
+                      const granted = !!grant
+                      const isAuto = grant?.grantSource === 'auto_position_tag'
+                      return (
+                        <div
+                          key={b.id}
+                          className="flex items-start justify-between gap-3 rounded-md border p-3"
+                        >
+                          <div className="min-w-0 space-y-0.5">
+                            <div className="flex items-center gap-2">
+                              <Label className="text-sm font-medium">{b.name}</Label>
+                              <TagBadge label={b.scope} className="h-4 px-1 text-[10px] capitalize">
+                                {b.scope}
+                              </TagBadge>
+                              {isAuto && (
+                                <StatusBadge tone="warning" className="h-4 gap-1 px-1 text-[10px]">
+                                  <Lock className="h-2.5 w-2.5" />
+                                  Auto
+                                </StatusBadge>
+                              )}
+                            </div>
+                            {b.description && (
+                              <p className="text-xs text-muted-foreground">{b.description}</p>
+                            )}
+                          </div>
+                          <Switch
+                            checked={granted}
+                            onCheckedChange={() => handleBundleToggle(b.id, granted)}
+                            disabled={isAuto || !staff.userId}
+                            aria-label={b.name}
+                            title={
+                              isAuto
+                                ? 'Auto-granted via clinic tag — flip the tag to revoke.'
+                                : undefined
+                            }
+                          />
+                        </div>
+                      )
+                    })}
+                    {available.length === 0 && (
+                      <p className="text-xs text-muted-foreground">No assignable bundles.</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              <Separator />
+              <p className="text-xs text-muted-foreground">
+                Where this person can sign in and any extra permissions are set by an administrator.
+              </p>
+            </>
+          )}
 
           {/* Visual reminder */}
           <div className="flex items-start gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-xs text-muted-foreground">

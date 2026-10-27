@@ -302,8 +302,8 @@ export function AddSpecialistSheet({
                     onChange={(e) => set('password', e.target.value)}
                   />
                   <p className="text-xs text-muted-foreground">
-                    They sign in with {form.contactEmail.trim() || 'their email address'}. Ask them
-                    to change it after the first sign-in.
+                    They sign in with {form.contactEmail.trim() || 'their email address'}. They will
+                    be asked to choose their own password the first time they sign in.
                   </p>
                 </div>
               )}

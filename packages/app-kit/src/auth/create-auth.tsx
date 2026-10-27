@@ -21,12 +21,12 @@ import {
   useEffect,
   useState,
 } from 'react'
-import { Navigate } from 'react-router-dom'
+import { Navigate, useLocation } from 'react-router-dom'
 
 /**
  * User shape surfaced by Better Auth's session:
  *  - core `user` table (id, name, email, image)
- *  - `additionalFields` (roleId, phone)
+ *  - `additionalFields` (roleId, phone, mustChangePassword)
  *  - the `admin` plugin's `role` string
  */
 export interface User {
@@ -37,6 +37,12 @@ export interface User {
   role?: string | null
   roleId?: string | null
   phone?: string | null
+  /**
+   * F20 / D8 — an administrator set this person's password, so they must choose their
+   * own before anything else. `RequireAuth` sends them to `changePasswordPath`; the
+   * backend refuses every other call until they have.
+   */
+  mustChangePassword?: boolean
 }
 
 export interface AuthConfig {
@@ -48,6 +54,12 @@ export interface AuthConfig {
   cacheKey: string
   /** Where RequireAuth redirects when there's no session. Defaults to /auth/login. */
   loginPath?: string
+  /**
+   * Where RequireAuth sends a person who must choose a new password. The route that
+   * renders this screen must be inside RequireAuth (it needs the session) — RequireAuth
+   * lets that one path through. Defaults to /auth/change-password.
+   */
+  changePasswordPath?: string
 }
 
 export interface AuthContextValue {
@@ -56,6 +68,14 @@ export interface AuthContextValue {
   signIn: (email: string, password: string) => Promise<{ success: boolean; error?: string }>
   signOut: () => Promise<void>
   refreshSession: () => Promise<void>
+  /**
+   * Replace the signed-in person's password and end every other session. Refreshes the
+   * session on success, so `user.mustChangePassword` clears.
+   */
+  changePassword: (
+    currentPassword: string,
+    newPassword: string
+  ) => Promise<{ success: boolean; error?: string }>
 }
 
 function buildAuthClient(baseURL: string, appId: string) {
@@ -71,6 +91,7 @@ function buildAuthClient(baseURL: string, appId: string) {
         user: {
           roleId: { type: 'string', required: false },
           phone: { type: 'string', required: false },
+          mustChangePassword: { type: 'boolean', required: false },
         },
       }),
     ],
@@ -92,6 +113,7 @@ type RawUser = {
   role?: string | null
   roleId?: string | null
   phone?: string | null
+  mustChangePassword?: boolean | null
 }
 
 function toUser(data: RawUser): User {
@@ -103,12 +125,14 @@ function toUser(data: RawUser): User {
     role: data.role ?? null,
     roleId: data.roleId ?? null,
     phone: data.phone ?? null,
+    mustChangePassword: data.mustChangePassword === true,
   }
 }
 
 export function createAuth(config: AuthConfig): DenelAuth {
   const authClient = buildAuthClient(config.baseURL, config.appId)
   const loginPath = config.loginPath ?? '/auth/login'
+  const changePasswordPath = config.changePasswordPath ?? '/auth/change-password'
   const cacheKey = config.cacheKey
 
   function getCachedUser(): User | null {
@@ -173,8 +197,34 @@ export function createAuth(config: AuthConfig): DenelAuth {
       }
     }
 
+    const changePassword = async (currentPassword: string, newPassword: string) => {
+      // revokeOtherSessions: whoever was handed the old password might hold a session.
+      // Better Auth issues this browser a fresh one in the same call.
+      const { error } = await authClient.changePassword({
+        currentPassword,
+        newPassword,
+        revokeOtherSessions: true,
+      })
+      if (error) {
+        if (error.status === 429) {
+          return { success: false, error: 'Too many attempts — please wait before trying again.' }
+        }
+        if (error.code === 'INVALID_PASSWORD') {
+          return { success: false, error: 'The password you were given is not correct.' }
+        }
+        return {
+          success: false,
+          error: error.message || 'We could not change your password. Please try again.',
+        }
+      }
+      await refreshSession()
+      return { success: true }
+    }
+
     return (
-      <AuthContext.Provider value={{ user, loading, signIn, signOut, refreshSession }}>
+      <AuthContext.Provider
+        value={{ user, loading, signIn, signOut, refreshSession, changePassword }}
+      >
         {children}
       </AuthContext.Provider>
     )
@@ -188,6 +238,7 @@ export function createAuth(config: AuthConfig): DenelAuth {
 
   function RequireAuth({ children }: { children: ReactNode }) {
     const { user, loading } = useAuth()
+    const location = useLocation()
     if (loading && !user) {
       return (
         <div className="flex h-screen items-center justify-center bg-background">
@@ -196,6 +247,11 @@ export function createAuth(config: AuthConfig): DenelAuth {
       )
     }
     if (!user) return <Navigate to={loginPath} replace />
+    // An administrator set this password: nothing else until the person has chosen their
+    // own (F20 / D8). The change-password route itself is the one way through.
+    if (user.mustChangePassword && location.pathname !== changePasswordPath) {
+      return <Navigate to={changePasswordPath} replace />
+    }
     return <>{children}</>
   }
 

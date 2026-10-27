@@ -47,7 +47,11 @@ export function MedicalRecordsSubTabs({ patientId, patientName, canEdit = false 
 
       {activeTab === 'cases' && <PatientCasesTab patientId={patientId} canEdit={canEdit} />}
       {activeTab === 'prescriptions' && (
-        <PatientPrescriptionsTab patientId={patientId} patientName={patientName} />
+        <PatientPrescriptionsTab
+          patientId={patientId}
+          patientName={patientName}
+          canEdit={canEdit}
+        />
       )}
       {activeTab === 'estimates' && <PatientEstimatesTab patientId={patientId} canEdit={canEdit} />}
     </div>

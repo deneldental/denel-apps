@@ -3,16 +3,24 @@ import { Hono } from 'hono'
 import { getDb } from '../db'
 import { treatmentTypes, user as userSchema } from '../db/schema'
 import { logError } from '../lib/logger'
+import { LOOKUP_READ_RULES } from '../lib/lookup-access'
 import { ROLES } from '../lib/modules'
+import { isUniqueViolation } from '../lib/pg-errors'
 import { getCurrentUser } from '../lib/rbac'
+import { denyUnless } from '../lib/route-access'
 import type { HonoEnv } from '../lib/types'
 
 const treatmentsApp = new Hono<HonoEnv>()
+
+// These lists are the same data as the `treatment-types` lookup, so they are read by the same people.
+const TREATMENT_READ = LOOKUP_READ_RULES['treatment-types']
 
 // GET /api/treatments - Fetch active treatment types
 treatmentsApp.get('/', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, TREATMENT_READ)
+  if (denied) return denied
 
   const db = getDb(process.env.DATABASE_URL!)
 
@@ -33,6 +41,8 @@ treatmentsApp.get('/', async (c) => {
 treatmentsApp.get('/all', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, TREATMENT_READ)
+  if (denied) return denied
 
   const db = getDb(process.env.DATABASE_URL!)
 
@@ -85,6 +95,8 @@ export function normalizeAdaGroup(value: unknown): string {
 treatmentsApp.get('/ada-groups', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, TREATMENT_READ)
+  if (denied) return denied
   return c.json({ success: true, data: ADA_GROUPS })
 })
 
@@ -115,7 +127,7 @@ treatmentsApp.post('/', async (c) => {
 
     return c.json({ success: true, data: newItem })
   } catch (error: unknown) {
-    if (error && typeof error === 'object' && 'code' in error && error.code === '23505') {
+    if (isUniqueViolation(error)) {
       return c.json({ error: 'Already exists' }, 400)
     }
     logError(error, { context: '[POST /api/treatments] Error' })
@@ -149,8 +161,7 @@ treatmentsApp.patch('/:id', async (c) => {
     await db.update(treatmentTypes).set(patch).where(eq(treatmentTypes.id, id))
     return c.json({ success: true })
   } catch (error: unknown) {
-    if ((error as { code?: string })?.code === '23505')
-      return c.json({ error: 'Name already in use' }, 400)
+    if (isUniqueViolation(error)) return c.json({ error: 'Name already in use' }, 400)
     logError(error, { context: '[PATCH /api/treatments/:id] Error' })
     return c.json({ error: 'Failed' }, 500)
   }

@@ -21,10 +21,12 @@
  * Reversal mirrors the original entry and undoes the wallet/invoice deltas.
  */
 
+import { randomUUID } from 'node:crypto'
 import { Money, type MoneyLike } from '@denel/utils'
-import { and, desc, eq, gt, inArray } from 'drizzle-orm'
+import { and, desc, eq, gt, inArray, ne } from 'drizzle-orm'
 import type { DB } from '../db'
 import {
+  appointments,
   invoices,
   patientBalances,
   patients,
@@ -35,7 +37,13 @@ import {
   specialistCommissions,
 } from '../db/schema'
 import { applyBillPayment } from './ap-service'
-import { getAccountByCode, type PaymentMethod, resolveChannelAccountId } from './channel-accounts'
+import { NON_PAYABLE_APPOINTMENT_STATUSES } from './appointment-status'
+import {
+  getAccountByCode,
+  type PaymentMethod,
+  resolveChannelAccountId,
+  unknownPaymentMethods,
+} from './channel-accounts'
 import { recomputeForInvoice as recomputeCommissionsForInvoice } from './commission-service'
 import { lockBill, lockInvoice, lockInvoices, lockPatientWallet, lockPayment } from './db-locks'
 import { FINANCE_ACCOUNTS } from './finance-accounts'
@@ -51,6 +59,8 @@ import { creditWallet, debitWallet, getOrCreateWallet, writeTimeline } from './l
 import { logError } from './logger'
 import { applyDelta } from './patient-ar-service'
 import { recomputeScheduleStatuses, refreshPlanStatus } from './payment-plan-service'
+import { planTagForAllocations } from './payment-plan-tags'
+import { MAX_PAYMENT_AMOUNT, PaymentInputError, parsePaymentSources } from './payment-sources'
 import { nextNumber } from './sequence-service'
 
 export type AllocationInput = {
@@ -91,6 +101,50 @@ export async function createDraftPayment(
   return db.transaction(async (tx) => {
     const amount = Money.from(input.amount)
     if (!amount.isPositive()) throw new Error('amount must be positive')
+    // `payments.amount` is a 32-bit integer: a larger figure would reach the database and come
+    // back as its own error text, so it is refused here with a sentence.
+    if (amount.gt(Money.from(MAX_PAYMENT_AMOUNT))) {
+      throw new PaymentInputError('a payment amount must be at most GHS 21,474,836.47')
+    }
+
+    // A method nobody knows (not set up in Settings, or switched off) is refused instead of being
+    // posted to the Cash account (D23).
+    const [unknownMethod] = await unknownPaymentMethods(tx, [input.method])
+    if (unknownMethod !== undefined) {
+      throw new PaymentInputError(`unknown payment method "${unknownMethod}"`)
+    }
+
+    // A payment group is one patient's payment in several methods: the receipt and the payment
+    // text are made from the whole group. Its id comes from the caller, so one that already holds
+    // another patient's payment is refused, or that patient's receipt would carry this money.
+    if (input.paymentGroupId) {
+      const [other] = await tx
+        .select({ id: payments.id })
+        .from(payments)
+        .where(
+          and(
+            eq(payments.paymentGroupId, input.paymentGroupId),
+            ne(payments.patientId, input.patientId)
+          )
+        )
+        .limit(1)
+      if (other) throw new Error('that payment group belongs to another patient')
+    }
+
+    // A cancelled/no-show visit never properly happened — nothing stopped a
+    // payment being created against one until now. A completed appointment
+    // stays payable; that's the normal "visit finished → bill it" flow.
+    if (input.appointmentId) {
+      const appt = await tx.query.appointments.findFirst({
+        where: eq(appointments.id, input.appointmentId),
+        columns: { status: true },
+      })
+      if (appt && NON_PAYABLE_APPOINTMENT_STATUSES.has(appt.status)) {
+        throw new Error(
+          `cannot create a payment for a ${appt.status.replace('_', ' ')} appointment`
+        )
+      }
+    }
 
     // Wallet-method validation: the funds come from the patient's existing
     // deposit balance, so there must be enough to cover the amount. We
@@ -148,12 +202,18 @@ export async function createDraftPayment(
     const paymentNumber = await nextNumber(tx, 'payment', input.paymentDate ?? new Date())
     const unallocated = amount.sub(allocatedTotal)
 
+    // G07: a tag the caller sets is kept. Otherwise a payment whose every allocation pays one
+    // plan's invoices belongs to that plan, which is how a payment taken from the patient's
+    // ledger against a plan reaches the plan's history and the plan-money reports.
+    const paymentPlanId =
+      input.paymentPlanId || (await planTagForAllocations(tx, input.allocations ?? [])) || undefined
+
     const [payment] = await tx
       .insert(payments)
       .values({
         patientId: input.patientId,
         appointmentId: input.appointmentId || undefined,
-        paymentPlanId: input.paymentPlanId || undefined,
+        paymentPlanId,
         amount: amount.toDbValue(),
         method: input.method,
         status: 'draft',
@@ -422,10 +482,23 @@ export async function postPayment(
   })
 }
 
+/** One method, and the part of a split payment it paid. */
+export type LegacyPaymentSource = {
+  method: PaymentMethod
+  amount: MoneyLike
+  externalReference?: string | null
+}
+
 export type LegacyPaymentInput = {
   patientId: string
-  amount: MoneyLike
-  method: PaymentMethod
+  /** The one-method shape: `amount` and `method`. Not used when `sources` is given. */
+  amount?: MoneyLike
+  method?: PaymentMethod
+  /**
+   * The split shape: one payment across several methods, e.g. part cash and part card. Each
+   * method becomes its own payment, all sharing one `paymentGroupId`.
+   */
+  sources?: LegacyPaymentSource[]
   paymentDate?: Date
   description?: string | null
   appointmentId?: string | null
@@ -438,8 +511,8 @@ export type LegacyPaymentInput = {
 }
 
 export type LegacyPaymentResult = {
-  payment: typeof payments.$inferSelect
-  journalEntry: PostedEntry
+  /** One entry per method, in the order given. The one-method shape returns a list of one. */
+  payments: Array<{ payment: typeof payments.$inferSelect; journalEntry: PostedEntry }>
   targetInvoiceId: string | null
 }
 
@@ -455,14 +528,46 @@ export type LegacyPaymentResult = {
  * invoice. The allocation is capped at the target's outstanding balance — any
  * remainder lands in the patient's deposit wallet (2200), exactly as an
  * unallocated Phase-3 payment would.
+ *
+ * A split payment (`input.sources`, G03): one `payments` row per method, siblings sharing a
+ * `paymentGroupId` — the same primitive the estimate confirm and Receive Payment already use — and
+ * each posted on its own to its method's channel account. Everything is ONE transaction, so a
+ * failure on a later method leaves nothing recorded for the earlier ones. The allocation is worked
+ * out for the combined total (capped at the target's balance) and handed out method by method, in
+ * the order given. A method nobody knows (not set up in Settings, or switched off) is refused, in
+ * either shape, instead of being posted to Cash (D23): `createDraftPayment` does it for every
+ * payment, and the whole transaction rolls back.
  */
 export async function recordLegacyPayment(
   db: DB,
   input: LegacyPaymentInput,
   userId: string
 ): Promise<LegacyPaymentResult> {
-  const amount = Money.from(input.amount)
-  if (!amount.isPositive()) throw new Error('amount must be a positive number')
+  const isSplit = (input.sources?.length ?? 0) > 0
+  let sources: Array<{ method: PaymentMethod; amount: Money; externalReference: string | null }>
+  if (isSplit) {
+    const parsed = parsePaymentSources(input.sources)
+    if ('error' in parsed) throw new PaymentInputError(parsed.error)
+    sources = parsed.sources.map((s) => ({
+      method: s.method as PaymentMethod,
+      amount: Money.from(s.amount),
+      externalReference:
+        s.externalReference || input.transactionId || input.externalReference || null,
+    }))
+  } else {
+    if (!input.method || input.amount === undefined) {
+      throw new PaymentInputError('a payment needs a method and an amount')
+    }
+    const amount = Money.from(input.amount)
+    if (!amount.isPositive()) throw new Error('amount must be a positive number')
+    sources = [
+      {
+        method: input.method,
+        amount,
+        externalReference: input.transactionId || input.externalReference || null,
+      },
+    ]
+  }
 
   return db.transaction(async (tx) => {
     // Resolve the allocation target.
@@ -474,54 +579,95 @@ export async function recordLegacyPayment(
       targetInvoiceId = plan?.invoiceId ?? null
     }
 
-    let allocations: AllocationInput[] | undefined
+    // What the target can still take, up to the combined total; handed out method by method below.
+    let remainingAllocation = Money.zero()
     if (targetInvoiceId) {
       const inv = await tx.query.invoices.findFirst({
         where: eq(invoices.id, targetInvoiceId),
       })
       if (inv && inv.status !== 'void' && inv.status !== 'draft') {
         const balance = Money.from(inv.balance)
-        const allocAmount = amount.gt(balance) ? balance : amount
-        if (allocAmount.isPositive()) {
-          allocations = [
-            { targetType: 'invoice', targetId: targetInvoiceId, amount: allocAmount.toDbValue() },
-          ]
-        }
+        const total = sources.reduce((sum, s) => sum.add(s.amount), Money.zero())
+        remainingAllocation = total.gt(balance) ? balance : total
       } else {
         // Target isn't postable (void / still draft) — treat as unallocated.
         targetInvoiceId = null
       }
     }
 
-    const draft = await createDraftPayment(
-      tx,
-      {
-        patientId: input.patientId,
-        amount: input.amount,
-        method: input.method,
-        paymentDate: input.paymentDate,
-        externalReference: input.transactionId || input.externalReference || null,
-        description: input.description || null,
-        appointmentId: input.appointmentId || null,
-        paymentPlanId: input.paymentPlanId || null,
-        allocations,
-      },
-      userId
-    )
-    const result = await postPayment(tx, draft.payment.id, userId)
+    // Wallet credit can only pay an invoice. The unallocated part of a payment becomes wallet
+    // credit, so a wallet amount that pays no invoice would take the credit out and put it straight
+    // back: no money would move, yet a posted payment and its receipt would say it was paid. The
+    // methods take the invoice's share in order, as the loop below gives it to them.
+    let shareLeft = remainingAllocation
+    for (const source of sources) {
+      const share = shareLeft.gt(source.amount) ? source.amount : shareLeft
+      shareLeft = shareLeft.sub(share)
+      if (source.method === 'wallet' && !share.eq(source.amount)) {
+        throw new PaymentInputError(
+          'Wallet credit can only pay an invoice: take a payment that is not for an invoice (or the part above what it owes) by another method.'
+        )
+      }
+    }
 
-    // Preserve the legacy-only columns the Phase-3 service doesn't set.
-    const [payment] = await tx
-      .update(payments)
-      .set({
-        treatments: Array.isArray(input.treatments) ? (input.treatments as never) : [],
-        transactionId: input.transactionId || null,
-        sendNotification: Boolean(input.sendNotification),
-      })
-      .where(eq(payments.id, result.payment.id))
-      .returning()
+    const paymentGroupId = sources.length > 1 ? randomUUID() : null
+    const posted: LegacyPaymentResult['payments'] = []
 
-    return { payment, journalEntry: result.journalEntry, targetInvoiceId }
+    for (const source of sources) {
+      const allocatedHere = remainingAllocation.gt(source.amount)
+        ? source.amount
+        : remainingAllocation
+      remainingAllocation = remainingAllocation.sub(allocatedHere)
+      const allocations: AllocationInput[] | undefined =
+        targetInvoiceId && allocatedHere.isPositive()
+          ? [
+              {
+                targetType: 'invoice',
+                targetId: targetInvoiceId,
+                amount: allocatedHere.toDbValue(),
+              },
+            ]
+          : undefined
+
+      const draft = await createDraftPayment(
+        tx,
+        {
+          patientId: input.patientId,
+          amount: source.amount,
+          method: source.method,
+          paymentDate: input.paymentDate,
+          externalReference: source.externalReference,
+          description: input.description || null,
+          appointmentId: input.appointmentId || null,
+          paymentPlanId: input.paymentPlanId || null,
+          allocations,
+          paymentGroupId,
+        },
+        userId
+      )
+      const result = await postPayment(tx, draft.payment.id, userId)
+
+      // Preserve the legacy-only columns the Phase-3 service doesn't set. What the payment was for
+      // is the event's itemisation, so a split stores it once, on its first payment: anything that
+      // adds up `treatments` over payments (the revenue-by-treatment figures) would otherwise count
+      // it once per method. The receipt finds it on whichever payment of the group carries it.
+      const [payment] = await tx
+        .update(payments)
+        .set({
+          treatments:
+            posted.length === 0 && Array.isArray(input.treatments)
+              ? (input.treatments as never)
+              : [],
+          transactionId: input.transactionId || null,
+          sendNotification: Boolean(input.sendNotification),
+        })
+        .where(eq(payments.id, result.payment.id))
+        .returning()
+
+      posted.push({ payment, journalEntry: result.journalEntry })
+    }
+
+    return { payments: posted, targetInvoiceId }
   })
 }
 

@@ -49,9 +49,10 @@ import { AddStageSheet } from './add-stage-sheet'
 interface Props {
   patientId: string
   patientName?: string
+  canEdit?: boolean
 }
 
-export function PatientPrescriptionsTab({ patientId, patientName }: Props) {
+export function PatientPrescriptionsTab({ patientId, patientName, canEdit = false }: Props) {
   const [stages, setStages] = useState<PrescriptionStageRow[]>([])
   const [loading, setLoading] = useState(true)
   const [selectedStage, setSelectedStage] = useState<PrescriptionStageRow | null>(null)
@@ -166,7 +167,7 @@ export function PatientPrescriptionsTab({ patientId, patientName }: Props) {
         stage={selectedStage}
         open={sheetOpen}
         onOpenChange={setSheetOpen}
-        canEdit={true}
+        canEdit={canEdit}
         onEdit={() => {
           setSheetOpen(false)
           setEditSheetOpen(true)

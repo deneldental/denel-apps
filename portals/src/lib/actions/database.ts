@@ -4,6 +4,11 @@ export async function getManageableTables() {
   return api.get<string[]>('/api/database/tables')
 }
 
+/** The tables a CSV may be loaded into: the lookup tables only. */
+export async function getImportableTables() {
+  return api.get<string[]>('/api/database/importable-tables')
+}
+
 export async function getTableTemplate(tableName: string) {
   return api.get<string>(`/api/database/template/${tableName}`)
 }
@@ -22,31 +27,36 @@ export async function exportTableData(tableName: string) {
   return api.get<Record<string, unknown>[]>(`/api/database/export/${tableName}`)
 }
 
-export async function importTableData(tableName: string, csvContent: string) {
-  // Parsing CSV client side for simplicity, then sending JSON to backend
-  const lines = csvContent.split('\n').filter((line) => line.trim())
-  if (lines.length < 2) return { success: false, error: 'Empty or invalid CSV' }
+export interface ImportSkippedRow {
+  /** The line of the file, counting the header as row 1. */
+  row: number
+  reason: string
+}
 
-  const headers = lines[0].split(',').map((h) => h.trim())
-  const records: any[] = []
+export interface ImportResult {
+  success: boolean
+  /** Rows added. */
+  count?: number
+  /** Rows that were already in the table and were left as they are. */
+  existing?: number
+  /** The rows that were left out, with the reason (the server sends the first 200). */
+  skipped?: ImportSkippedRow[]
+  skippedTotal?: number
+  error?: string
+}
 
-  for (let i = 1; i < lines.length; i++) {
-    const values = lines[i].split(',').map((v) => v.trim())
-    if (values.length !== headers.length) continue
-    const record: any = {}
-    headers.forEach((h, idx) => {
-      let val: any = values[idx]
-      if (val === 'true') val = true
-      else if (val === 'false') val = false
-      else if (val === 'null' || val === '') val = null
-      else if (!Number.isNaN(Number(val)) && h !== 'phone') val = Number(val)
-      record[h] = val
-    })
-    records.push(record)
-  }
-
-  const res = await api.post<any>(`/api/database/import/${tableName}`, records)
-  return res
+/**
+ * Load a CSV into a lookup table. The text goes to the server exactly as it was read: the server
+ * parses it (quoting and line breaks included), checks every row against the table and answers with
+ * the rows it left out. This used to split lines on every comma here, so a quoted value such as
+ * "Crown, porcelain" lost its row, and a row with the wrong number of cells vanished without a word.
+ */
+export async function importTableData(
+  tableName: string,
+  csvContent: string
+): Promise<ImportResult> {
+  const res = await api.post<unknown>(`/api/database/import/${tableName}`, { csv: csvContent })
+  return res as unknown as ImportResult
 }
 
 /**

@@ -1,6 +1,6 @@
 ﻿import { formatAmount } from '@denel/utils'
 import { and, asc, desc, eq, inArray, isNotNull, or, sql } from 'drizzle-orm'
-import { Hono } from 'hono'
+import { type Context, Hono } from 'hono'
 import { z } from 'zod'
 import { getDb } from '../db'
 import {
@@ -23,6 +23,7 @@ import {
 } from '../lib/ledger-service'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
+import { getPlanDetail, postedPaidByPlan } from '../lib/payment-plan-detail'
 import {
   type CreatePlanInput,
   createPlan,
@@ -686,8 +687,22 @@ paymentPlansApp.delete('/:id', async (c) => {
   }
 })
 
-// GET /api/payment-plans/overdue
+// GET /api/payment-plans/overdue — overdue AND outstanding plans (the dashboard card and the
+// reminders page want both). `?status=overdue` or `?status=outstanding` narrows it: the Payments
+// page's two tabs used to receive this same list.
 paymentPlansApp.get('/overdue', async (c) => {
+  const status = c.req.query('status')
+  if (status !== undefined && status !== 'overdue' && status !== 'outstanding') {
+    return c.json({ error: 'status must be overdue or outstanding' }, 400)
+  }
+  return listPlansByStatus(c, status ? [status] : ['overdue', 'outstanding'])
+})
+
+// GET /api/payment-plans/outstanding — the plans marked outstanding (the Payments page's second
+// tab, and the reports app, which already asks for this path).
+paymentPlansApp.get('/outstanding', (c) => listPlansByStatus(c, ['outstanding']))
+
+async function listPlansByStatus(c: Context<HonoEnv>, statuses: readonly string[]) {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
 
@@ -697,7 +712,7 @@ paymentPlansApp.get('/overdue', async (c) => {
   const db = getDb(process.env.DATABASE_URL!)
   try {
     const plans = await db.query.paymentPlans.findMany({
-      where: or(eq(paymentPlans.status, 'overdue'), eq(paymentPlans.status, 'outstanding')),
+      where: inArray(paymentPlans.status, [...statuses]),
       with: {
         patient: {
           columns: {
@@ -714,26 +729,31 @@ paymentPlansApp.get('/overdue', async (c) => {
       orderBy: [desc(paymentPlans.createdAt)],
     })
 
+    // What counts as paid is the POSTED allocations to the plan's invoices; a draft, a reversed
+    // payment, or a payment nobody tagged to the plan must not move the figure.
+    const paid = await postedPaidByPlan(db, plans)
     const data = plans.map((plan) => ({
       ...plan,
-      overdueAmount: computeOverdueAmount(plan),
+      overdueAmount: computeOverdueAmount(plan, paid.get(plan.id) ?? 0),
     }))
 
     return c.json({ success: true, data })
   } catch (_error: unknown) {
     return c.json({ error: 'Failed' }, 500)
   }
-})
+}
 
 // Authoritative overdue-amount calc. Treats numeric DECIMAL columns as either
 // number or string (DECIMAL arrives as string from some drivers — see commit
 // 2da763f for the same trap on the finance side).
-function computeOverdueAmount(plan: {
-  amountPerInstallment: number | string | null
-  paymentFrequency: string | null
-  startDate: Date | string
-  payments: Array<{ amount: number | string; status: string | null }>
-}): number {
+function computeOverdueAmount(
+  plan: {
+    amountPerInstallment: number | string | null
+    paymentFrequency: string | null
+    startDate: Date | string
+  },
+  paid: number
+): number {
   const per = toNumber(plan.amountPerInstallment)
   if (!per || !plan.paymentFrequency) return 0
   const start = new Date(plan.startDate)
@@ -758,7 +778,6 @@ function computeOverdueAmount(plan: {
   }
 
   const expectedAmount = expectedInstallments * per
-  const paid = plan.payments.reduce((sum, p) => sum + toNumber(p.amount), 0)
   return Math.max(0, expectedAmount - paid)
 }
 
@@ -981,6 +1000,9 @@ paymentPlansApp.get('/:id/invoices', async (c) => {
         balance: Number(inv.balance ?? Number(inv.total ?? inv.amount) - Number(inv.paidAmount)),
         dueDate: inv.dueDate,
         description: inv.description,
+        // Invoices of the legacy plan path have no invoice lines; the services they were raised
+        // for live only here. Receive Payment lists them from this when there are no lines.
+        treatments: inv.treatments ?? null,
       }))
     return c.json({ success: true, data })
   } catch (_error: unknown) {
@@ -1050,6 +1072,30 @@ paymentPlansApp.post('/v2', async (c) => {
     return c.json({ success: true, data: result })
   } catch (err) {
     return c.json({ error: errMessage(err, 'Failed to create plan') }, 400)
+  }
+})
+
+// GET /api/payment-plans/:id — one plan with its patient, master invoice, totals and payment
+// history (F05). The plan page called this and got a 404, so it rendered nothing. Registered
+// last: a single-segment id route would otherwise swallow /overdue and /templates.
+paymentPlansApp.get('/:id', async (c) => {
+  const user = await getCurrentUser(c)
+  if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  if (!(await checkPermission(c, user.id, MODULE, ACTIONS.READ)))
+    return c.json({ error: 'Unauthorized' }, 403)
+
+  const { id } = c.req.param()
+  if (!z.string().uuid().safeParse(id).success) {
+    return c.json({ error: 'Invalid payment plan id' }, 400)
+  }
+  const db = getDb(process.env.DATABASE_URL as string)
+  try {
+    const data = await getPlanDetail(db, id)
+    if (!data) return c.json({ error: 'Payment plan not found' }, 404)
+    return c.json({ success: true, data })
+  } catch (err) {
+    logError(err, { context: 'getPlanDetail', planId: id })
+    return c.json({ error: 'Failed to load payment plan' }, 500)
   }
 })
 

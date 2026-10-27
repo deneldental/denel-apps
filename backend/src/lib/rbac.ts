@@ -33,6 +33,8 @@ export interface AuthUser {
   name: string
   role: string | null
   roleId: string | null
+  /** F20 / D8 — an admin set this person's password; see lib/password-change.ts. */
+  mustChangePassword?: boolean
 }
 
 interface BetterAuthSessionUser {
@@ -44,6 +46,8 @@ interface BetterAuthSessionUser {
   // Added to `user` by the admin() plugin and returned on the session.
   banned?: boolean | null
   banExpires?: Date | string | null
+  // An additionalField on the user table (src/auth.ts).
+  mustChangePassword?: boolean | null
 }
 
 /**
@@ -130,6 +134,7 @@ async function resolveUser(c: Context<HonoEnv>): Promise<AuthUser | null> {
       name: u.name,
       role: u.role ?? null,
       roleId: u.roleId ?? null,
+      mustChangePassword: u.mustChangePassword === true,
     }
   } catch {
     return null

@@ -36,6 +36,21 @@ const MAGIC: Record<string, Uint8Array[]> = {
   'application/pdf': [new Uint8Array([0x25, 0x50, 0x44, 0x46])], // %PDF
 }
 
+/**
+ * The type each extension names, for the formats checked by content. A file whose extension says one
+ * thing and whose declared type says another is refused, and a file that declares no type at all is
+ * held to the type its extension names — leaving the header out must not switch the content check off.
+ */
+const MIME_BY_EXT: Record<string, string> = {
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  pdf: 'application/pdf',
+  svg: 'image/svg+xml',
+}
+
 /** Well-known upload profiles used across the app. */
 export const uploadProfiles = {
   // Patient photos (intraoral, portrait, before/after), X-rays, staff docs
@@ -99,7 +114,12 @@ export const uploadProfiles = {
 }
 
 export type UploadValidationResult =
-  | { ok: true; buffer: ArrayBuffer }
+  | {
+      ok: true
+      buffer: ArrayBuffer
+      /** The declared type, or the one the extension names when the client declared none. */
+      contentType?: string
+    }
   | { ok: false; error: string }
 
 /**
@@ -148,12 +168,24 @@ export async function validateUpload(
     }
   }
 
+  // ── The extension and the declared type must agree ───────────────────────
+  const namedByExtension = MIME_BY_EXT[ext]
+  if (mime && namedByExtension && mime !== namedByExtension) {
+    return {
+      ok: false,
+      error: `File extension .${ext} does not match its declared type ${mime}.`,
+    }
+  }
+
   // ── Magic-byte check ─────────────────────────────────────────────────────
   const buffer = await file.arrayBuffer()
   const head = new Uint8Array(buffer.slice(0, 16))
 
-  // Only enforce magic check if we have signatures for the declared MIME.
-  const signatures = mime ? MAGIC[mime] : undefined
+  // The declared type decides what the content must look like; with no declared type it is the
+  // type the extension names. Sending no Content-Type used to skip this check altogether, so any
+  // bytes passed as long as the file was called photo.jpg.
+  const checkedAs = mime || namedByExtension
+  const signatures = checkedAs ? MAGIC[checkedAs] : undefined
   if (signatures && signatures.length > 0) {
     const matches = signatures.some((sig) => {
       if (head.length < sig.length) return false
@@ -162,16 +194,23 @@ export async function validateUpload(
       }
       return true
     })
-    if (!matches) {
+    // A WebP is a RIFF container whose form type, at bytes 8-11, is "WEBP"; WAV and AVI share the
+    // first four bytes.
+    const notWebp =
+      checkedAs === 'image/webp' &&
+      !(head[8] === 0x57 && head[9] === 0x45 && head[10] === 0x42 && head[11] === 0x50)
+    if (!matches || notWebp) {
       return {
         ok: false,
-        error: `File contents do not match declared type ${mime}. Possible tampering.`,
+        error: mime
+          ? `File contents do not match declared type ${mime}. Possible tampering.`
+          : `File contents do not match the .${ext} extension (${checkedAs}). Possible tampering.`,
       }
     }
   }
 
   // SVG: no binary magic bytes — validate content begins with <svg or <?xml
-  if (mime === 'image/svg+xml') {
+  if (checkedAs === 'image/svg+xml') {
     const textStart = new TextDecoder().decode(new Uint8Array(buffer.slice(0, 128)))
     const trimmed = textStart.trimStart()
     if (
@@ -183,5 +222,5 @@ export async function validateUpload(
     }
   }
 
-  return { ok: true, buffer }
+  return { ok: true, buffer, contentType: checkedAs }
 }

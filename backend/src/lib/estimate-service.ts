@@ -195,6 +195,7 @@ export async function createEstimateDraft(
       const computed = computeLine({
         quantity,
         unitPrice,
+        additionalUnitPrice: resolved?.additionalUnitPrice ?? null,
         surchargeType: surcharge?.type ?? 'none',
         surchargeValue: surcharge?.value ?? 0,
         discountType: discount?.type ?? 'none',

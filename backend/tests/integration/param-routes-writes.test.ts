@@ -67,13 +67,15 @@ vi.mock('../../src/lib/logger', () => ({
 
 // ── Imports (after the mocks) ────────────────────────────────────────────────
 
-import { eq, inArray, sql } from 'drizzle-orm'
+import { and, eq, inArray, sql } from 'drizzle-orm'
 import { type DB, getDb } from '../../src/db'
 import {
   appointments,
   doctors,
   expenses,
   invoices,
+  journalEntries,
+  journalLines,
   patients,
   staff,
   staffAttendanceSubmissions,
@@ -225,6 +227,31 @@ describe.skipIf(skip)('R10 — parameterised routes + write paths (local Postgre
 
   afterAll(async () => {
     if (skip || !db) return
+    // Posting an expense books a ledger entry whose source document is the expense, and nothing
+    // cascades from the expense to it. Remove that entry (and its lines) for every expense this run
+    // made — the ones it tracked and any it made but failed to track (stamped with TAG) — or each
+    // run leaves one behind, authored by the seeded admin, which no fixture sweep can see.
+    const stamped = await db.execute<{ id: string }>(
+      sql`SELECT id FROM expenses WHERE description LIKE ${`%${TAG}%`}`
+    )
+    const expenseIds = [...new Set([...created.expenses, ...stamped.rows.map((r) => r.id)])]
+    if (expenseIds.length) {
+      const entries = await db
+        .select({ id: journalEntries.id })
+        .from(journalEntries)
+        .where(
+          and(
+            eq(journalEntries.sourceDocType, 'expense'),
+            inArray(journalEntries.sourceDocId, expenseIds)
+          )
+        )
+      const entryIds = entries.map((e) => e.id)
+      if (entryIds.length) {
+        await db.delete(journalLines).where(inArray(journalLines.entryId, entryIds))
+        await db.delete(journalEntries).where(inArray(journalEntries.id, entryIds))
+      }
+    }
+
     // Reverse dependency order. Patients cascade to their invoices/appointments,
     // but delete explicitly so a partial fixture set still cleans up.
     if (created.submissions.length)

@@ -23,6 +23,12 @@ export const authClient = createAuthClient({
           type: 'string',
           required: false,
         },
+        // F20 / D8 — an administrator set this person's password; they must choose their
+        // own before anything else (see DashboardLayout and the change-password page).
+        mustChangePassword: {
+          type: 'boolean',
+          required: false,
+        },
       },
     }),
   ],

@@ -15,11 +15,14 @@ export const MODULES = {
   BILLS: 'bills',
   COMMISSIONS: 'commissions',
   COMPLIANCE: 'compliance',
-  CONSENT_MANAGEMENT: 'consent_management',
   CREDIT_NOTES: 'credit_notes',
   DASHBOARD: 'dashboard',
   DATA_INJECT: 'data_inject',
   DATA_SYNC: 'sync',
+  // Build, view and list estimates (draft one-time invoices) without any access to
+  // payments. A child of `payments` and `financial_records` in the hierarchy below,
+  // so every role that already holds payments access keeps estimates access.
+  ESTIMATES: 'estimates',
   EXPENSES: 'expenses',
   FINANCIAL_RECORDS: 'financial_records',
   INSURANCE: 'insurance',
@@ -108,6 +111,57 @@ export const ROLE_SCOPES: Readonly<Record<string, readonly InterfaceScope[]>> = 
   staff: ['pwa'],
 }
 
+// ─── Who may give which role, and who signs in with a password ──────────────────
+//
+// One definition for the backend (which enforces it) and the HR screens (which use it to
+// decide what to offer), so the two cannot drift apart.
+
+/**
+ * The roles an HR Administrator may assign — and the only roles whose current holders they
+ * may re-assign (decision D15). Everything else needs an administrator: `admin` and
+ * `hr_admin` because they are the privileged roles, `doctor` because it needs a specialist
+ * record, `external_trainer` because it opens the HR app.
+ *
+ * Without the second half, "set this person to Receptionist" would demote an administrator.
+ */
+export const HR_ASSIGNABLE_ROLES: readonly string[] = ['staff', 'receptionist', 'lab_technician']
+
+/**
+ * May a caller who is NOT a full administrator move someone from `targetCurrentRole` to
+ * `nextRole`? `null`/`undefined` mean "no role". Administrators are not asked: they may
+ * assign any assignable role (the backend still refuses roles no screen may assign).
+ */
+export function canDelegateRoleChange(
+  targetCurrentRole: string | null | undefined,
+  nextRole: string | null | undefined
+): boolean {
+  const ok = (r: string | null | undefined) => r == null || HR_ASSIGNABLE_ROLES.includes(r)
+  return ok(targetCurrentRole) && ok(nextRole)
+}
+
+/**
+ * The roles a generic role picker offers. `doctor` is never among them: it needs a specialist
+ * record, so it is made only by Add specialist.
+ */
+export function assignableRoleIds(callerIsFullAdministrator: boolean): readonly string[] {
+  return callerIsFullAdministrator
+    ? ['admin', 'hr_admin', 'external_trainer', 'lab_technician', 'receptionist', 'staff']
+    : HR_ASSIGNABLE_ROLES
+}
+
+/**
+ * Does this role (plus any one-off scope grants) sign in to the clinic portal or the HR app?
+ * Those sign in with an e-mail and a password. The Team app does not: it is phone number plus
+ * an SMS code, so a Team-only person never types a password.
+ */
+export function roleSignsInWithPassword(
+  roleId: string | null | undefined,
+  extraScopes: readonly string[] = []
+): boolean {
+  const scopes: readonly string[] = [...((roleId && ROLE_SCOPES[roleId]) || []), ...extraScopes]
+  return scopes.some((scope) => scope === 'portal' || scope === 'hr')
+}
+
 // Module hierarchy — granting access to a parent implies the listed children.
 // Mirrored by backend/src/rbac/engine/HierarchyResolver.ts.
 export const MODULE_HIERARCHY: Record<string, { children: string[] }> = {
@@ -144,8 +198,12 @@ export const MODULE_HIERARCHY: Record<string, { children: string[] }> = {
       MODULES.PAYMENTS,
       MODULES.EXPENSES,
       MODULES.TAX_CALCULATIONS,
+      // Expansion is one level deep (a child of a child is not implied), so
+      // estimates is listed here as well as under `payments`.
+      MODULES.ESTIMATES,
     ],
   },
+  [MODULES.PAYMENTS]: { children: [MODULES.ESTIMATES] },
 }
 
 export function isParentModule(module: string): boolean {
@@ -164,10 +222,16 @@ export function isChildModule(module: string): boolean {
 }
 
 export function getParentModule(module: string): string | null {
+  return getParentModules(module)[0] ?? null
+}
+
+/** Every module whose grant implies this one. A module can have more than one parent. */
+export function getParentModules(module: string): string[] {
+  const parents: string[] = []
   for (const [parent, cfg] of Object.entries(MODULE_HIERARCHY)) {
-    if (cfg.children.includes(module)) return parent
+    if (cfg.children.includes(module)) parents.push(parent)
   }
-  return null
+  return parents
 }
 
 // Permission shape persisted in the DB.
@@ -201,7 +265,9 @@ export function can(
   if (user.role === ROLES.ADMIN) return true
   const perms = user.permissions ?? []
   if (perms.some((p) => p.module === module && p.action === action)) return true
-  const parent = getParentModule(module)
-  if (parent && perms.some((p) => p.module === parent && p.action === action)) return true
+  // Any parent's grant of the same action implies it (a module can have several).
+  for (const parent of getParentModules(module)) {
+    if (perms.some((p) => p.module === parent && p.action === action)) return true
+  }
   return false
 }

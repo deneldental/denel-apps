@@ -15,7 +15,9 @@ import { and, eq } from 'drizzle-orm'
 import { describe, expect, it } from 'vitest'
 import type { DB } from '../../src/db'
 import {
+  applicationScopes,
   doctors,
+  invoices,
   journalEntries,
   patientWallets,
   services,
@@ -83,6 +85,9 @@ async function makeService(
     adaGroup: string
     taxStatus?: string
     discountEligible?: boolean
+    /** G01: the application type the service bills against, and its further-unit price. */
+    scopeId?: string | null
+    additionalUnitPrice?: number | null
   }
 ): Promise<string> {
   const [tt] = await tx
@@ -98,11 +103,27 @@ async function makeService(
       treatmentTypeId: tt.id,
       taxStatus: opts.taxStatus ?? 'exempt',
       discountEligible: opts.discountEligible ?? true,
+      scopeId: opts.scopeId ?? null,
+      additionalUnitPrice: opts.additionalUnitPrice ?? null,
       status: 'active',
       createdById: opts.userId,
     })
     .returning()
   return svc.id
+}
+
+/** G01: a type billed per unit; `stepped` is its first-unit / additional-unit toggle. */
+async function makeMultiScope(tx: DB, stepped: boolean): Promise<string> {
+  const [row] = await tx
+    .insert(applicationScopes)
+    .values({
+      name: `it_walkin_${randomUUID().slice(0, 8)}`,
+      displayName: 'IT walk-in type',
+      quantityMode: 'multi',
+      additionalUnitPriceEnabled: stepped,
+    })
+    .returning({ id: applicationScopes.id })
+  return row.id
 }
 
 const n = (v: unknown) => Money.from(v as never).toNumber()
@@ -326,5 +347,125 @@ describe.skipIf(noDb)('admin-v1 walk-in — catalog-priced encounter → GL', ()
         userId
       )
     }, /discount-eligible/)
+  })
+})
+
+// G01 — first-unit / additional-unit tariff, carried through the ledger. A service of a type
+// billed in steps costs its price for the first unit and its additional-unit price for each
+// further one; with the type's toggle off it is billed flat, as it always was.
+describe.skipIf(noDb)('admin-v1 walk-in — first-unit / additional-unit tariff → GL', () => {
+  /** A walk-in of three units of a 100.00 service whose further units cost 60.00 each. */
+  async function walkInThreeUnits(tx: DB, stepped: boolean, payment?: number) {
+    const userId = await anyUserId(tx)
+    const patientId = await makePatient(tx)
+    const specId = await makeSpecialist(tx)
+    const doctorId = await makeDoctor(tx, specId)
+    const scopeId = await makeMultiScope(tx, stepped)
+    const serviceId = await makeService(tx, {
+      userId,
+      amount: 10000,
+      adaGroup: 'Restorative',
+      scopeId,
+      additionalUnitPrice: 6000,
+    })
+    const res = await createWalkIn(
+      tx,
+      {
+        patientId,
+        appointment: { doctorId },
+        lines: [{ serviceId, quantity: 3 }],
+        ...(payment ? { payment: { method: 'cash', amount: payment } } : {}),
+      },
+      userId
+    )
+    return { res, scopeId, userId, patientId, doctorId, serviceId }
+  }
+
+  it('toggle on: bills 100 + 2 × 60 and books exactly that', async () => {
+    await withPostingRollback(async (tx) => {
+      const { res } = await walkInThreeUnits(tx, true, 22000)
+
+      expect(n(res.invoice.total)).toBe(220)
+      expect(res.invoice.status).toBe('paid')
+      const rev = await accountIdByCode(tx, '4120') // Restorative → 4120
+      const ar = await accountIdByCode(tx, '1200')
+      const inv = await liveEntry(tx, 'invoice', res.invoice.id)
+      if (!inv) throw new Error('no invoice entry')
+      expectBalanced(inv.lines)
+      expect(creditOn(inv.lines, rev)).toBe(22000)
+      expect(debitOn(inv.lines, ar)).toBe(22000)
+    })
+  })
+
+  it('toggle off: bills 3 × 100 and books exactly that', async () => {
+    await withPostingRollback(async (tx) => {
+      const { res } = await walkInThreeUnits(tx, false, 30000)
+
+      expect(n(res.invoice.total)).toBe(300)
+      expect(res.invoice.status).toBe('paid')
+      const rev = await accountIdByCode(tx, '4120')
+      const inv = await liveEntry(tx, 'invoice', res.invoice.id)
+      if (!inv) throw new Error('no invoice entry')
+      expectBalanced(inv.lines)
+      expect(creditOn(inv.lines, rev)).toBe(30000)
+    })
+  })
+
+  it('an invoice raised before the toggle was switched on keeps its total and its entry', async () => {
+    await withPostingRollback(async (tx) => {
+      const { res, scopeId, userId, patientId, serviceId } = await walkInThreeUnits(tx, false)
+      expect(n(res.invoice.total)).toBe(300)
+
+      await tx
+        .update(applicationScopes)
+        .set({ additionalUnitPriceEnabled: true })
+        .where(eq(applicationScopes.id, scopeId))
+
+      // The invoice already raised is stored as it was, and its ledger entry with it.
+      const [stored] = await tx.select().from(invoices).where(eq(invoices.id, res.invoice.id))
+      expect(n(stored.total)).toBe(300)
+      const rev = await accountIdByCode(tx, '4120')
+      const inv = await liveEntry(tx, 'invoice', res.invoice.id)
+      if (!inv) throw new Error('no invoice entry')
+      expect(creditOn(inv.lines, rev)).toBe(30000)
+
+      // The next one is priced by the new rule. (Another doctor: the first is booked for now.)
+      const otherDoctorId = await makeDoctor(tx, await makeSpecialist(tx))
+      const next = await createWalkIn(
+        tx,
+        {
+          patientId,
+          appointment: { doctorId: otherDoctorId },
+          lines: [{ serviceId, quantity: 3 }],
+        },
+        userId
+      )
+      expect(n(next.invoice.total)).toBe(220)
+    })
+  })
+
+  it('one unit is billed at the first-unit price alone, with the toggle on', async () => {
+    await withPostingRollback(async (tx) => {
+      const userId = await anyUserId(tx)
+      const patientId = await makePatient(tx)
+      const specId = await makeSpecialist(tx)
+      const doctorId = await makeDoctor(tx, specId)
+      const scopeId = await makeMultiScope(tx, true)
+      const serviceId = await makeService(tx, {
+        userId,
+        amount: 10000,
+        adaGroup: 'Restorative',
+        scopeId,
+        additionalUnitPrice: 6000,
+      })
+
+      const res = await createWalkIn(
+        tx,
+        { patientId, appointment: { doctorId }, lines: [{ serviceId, quantity: 1 }] },
+        userId
+      )
+
+      expect(n(res.invoice.total)).toBe(100)
+    })
   })
 })

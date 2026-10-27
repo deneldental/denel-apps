@@ -138,3 +138,56 @@ describe('every sidebar link in a registered module is guarded', () => {
     expect(read('scheduling')).toContain("permission: 'appointments'")
   })
 })
+
+// ── F07 — ortho consent has its own permission ───────────────────────────────
+//
+// Every `/consents…` path was guarded by `compliance`, so a doctor — who holds
+// `ortho_consent:read` but not `compliance` — was let into `/ortho-consent`, sent
+// on to `/consents/ortho` by the legacy redirect, and then denied there. The
+// consent-document decision (compliance-only) covers documents, consent forms and
+// templates; ortho consent has its own API and permission, so its URLs follow it.
+describe('ortho consent paths follow the ortho_consent permission (F07)', () => {
+  const doctor = ['dashboard', 'patients', 'appointments', 'medical_records', 'ortho_consent']
+
+  it('maps the canonical list and detail pages to ortho_consent', () => {
+    expect(getModuleForPath('/consents/ortho')).toBe('ortho_consent')
+    expect(getModuleForPath('/consents/ortho/abc-123')).toBe('ortho_consent')
+  })
+
+  it('still maps the legacy URLs the same way', () => {
+    expect(getModuleForPath('/ortho-consent')).toBe('ortho_consent')
+    expect(getModuleForPath('/ortho-consent/abc-123')).toBe('ortho_consent')
+  })
+
+  it('keeps every other consent page behind compliance', () => {
+    for (const path of ['/consents', '/consents/pending', '/consents/surgical', '/consents/sign']) {
+      expect(getModuleForPath(path), path).toBe('compliance')
+    }
+  })
+
+  it('lets a doctor stay on both the old and the canonical URL', () => {
+    for (const path of ['/ortho-consent', '/consents/ortho', '/consents/ortho/abc-123']) {
+      expect(isPortalPathAllowed(path, doctor), path).toBe(true)
+    }
+  })
+
+  it('does not let a doctor into the rest of the consent hub', () => {
+    for (const path of ['/consents', '/consents/pending', '/consents/surgical', '/consents/sign']) {
+      expect(isPortalPathAllowed(path, doctor), path).toBe(false)
+    }
+  })
+
+  it('leaves a compliance holder (reception) exactly where they were', () => {
+    const reception = [...doctor, 'compliance', 'messaging']
+    for (const path of [
+      '/consents',
+      '/consents/ortho',
+      '/consents/ortho/abc-123',
+      '/consents/sign',
+    ]) {
+      expect(isPortalPathAllowed(path, reception), path).toBe(true)
+    }
+    // …and a compliance-only holder does not gain the ortho pages.
+    expect(isPortalPathAllowed('/consents/ortho', ['compliance'])).toBe(false)
+  })
+})

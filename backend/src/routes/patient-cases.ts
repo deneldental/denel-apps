@@ -18,7 +18,7 @@ import { logError } from '../lib/logger'
 import { ACTIONS, MODULES, ROLES } from '../lib/modules'
 import { verifyPassword } from '../lib/password'
 import { applyOrthoTag } from '../lib/patient-auto-tag'
-import { ensureCaseForPlan, linkPlanToCase, nextCaseNumber } from '../lib/patient-case-service'
+import { ensureCaseForPlan, insertCase, linkPlanToCase } from '../lib/patient-case-service'
 import { gateByPlan } from '../lib/treatment-gate'
 import type { HonoEnv } from '../lib/types'
 import { checkPermission } from '../rbac/middleware/checkPermission'
@@ -562,10 +562,15 @@ patientCasesApp.get(
 
 // ── POST /api/patient-cases ───────────────────────────────────────────────────
 
+// Opening a case is clinical work, so it needs `medical_records:create` (decision D3,
+// audit F04), which a doctor holds. It used to need `patients:create` (registering a
+// patient), which the doctor does not — so the Cases tab offered a button the server
+// refused. `patients` implies `medical_records`, so everyone who could open a case
+// before still can. Archiving stays with `patients:delete`.
 patientCasesApp.post(
   '/',
   verifySession(),
-  checkPermission(MODULES.PATIENTS as string, ACTIONS.CREATE as string),
+  checkPermission(MODULES.MEDICAL_RECORDS as string, ACTIONS.CREATE as string),
   async (c) => {
     try {
       const user = c.var.user
@@ -575,17 +580,13 @@ patientCasesApp.post(
 
       const db = getDb(env.DATABASE_URL)
       c.set('skipAudit', true)
-      const caseNumber = await nextCaseNumber(db)
-
-      const [created] = await db
-        .insert(patientCases)
-        .values({
-          patientId: body.patientId,
-          caseNumber,
-          status: 'open',
-          createdById: user.id,
-        })
-        .returning()
+      // Takes the next free number, and tries again when someone else opens a case at the same
+      // moment and gets there first (it used to fail the second request with a 500).
+      const created = await insertCase(db, {
+        patientId: body.patientId,
+        status: 'open',
+        createdById: user.id,
+      })
 
       await createAuditLog(db, {
         userId: user.id,

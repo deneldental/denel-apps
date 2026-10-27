@@ -7,6 +7,7 @@ import { createAuditLog } from '../lib/audit'
 import type { PaymentMethod } from '../lib/channel-accounts'
 import { ACTIONS, MODULES } from '../lib/modules'
 import { recordLegacyPayment } from '../lib/payment-service'
+import { PaymentInputError } from '../lib/payment-sources'
 import { sendPushToPatients } from '../lib/push'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import type { HonoEnv } from '../lib/types'
@@ -161,18 +162,28 @@ paymentConfirmationsApp.post('/:id/confirm', async (c) => {
     methodType = m?.type ?? null
   }
 
-  const { payment } = await recordLegacyPayment(
-    db,
-    {
-      patientId: conf.patientId,
-      amount: Number(conf.amount),
-      method: methodForType(methodType),
-      invoiceId: conf.invoiceId,
-      externalReference: conf.reference ?? null,
-      description: `Patient app payment${conf.methodLabel ? ` — ${conf.methodLabel}` : ''}`,
-    },
-    user.id
-  )
+  let recorded: Awaited<ReturnType<typeof recordLegacyPayment>>
+  try {
+    recorded = await recordLegacyPayment(
+      db,
+      {
+        patientId: conf.patientId,
+        amount: Number(conf.amount),
+        method: methodForType(methodType),
+        invoiceId: conf.invoiceId,
+        externalReference: conf.reference ?? null,
+        description: `Patient app payment${conf.methodLabel ? ` — ${conf.methodLabel}` : ''}`,
+      },
+      user.id
+    )
+  } catch (err) {
+    // A refusal the cashier can act on (the method was switched off in Settings): say so, and
+    // leave the request pending. Anything else is a fault and stays one.
+    if (err instanceof PaymentInputError) return c.json({ error: err.message }, 400)
+    throw err
+  }
+  // One method, so one row.
+  const payment = recorded.payments[0].payment
 
   await db
     .update(paymentConfirmations)

@@ -2,6 +2,7 @@ import { lazy } from 'react'
 import { Navigate, Route, Routes } from 'react-router-dom'
 // Eager — auth pages are public entry points that must resolve before any
 // protected tree (and its guards), with no Suspense boundary of their own.
+import ChangePasswordPage from '@/features/auth/pages/change-password'
 import ForgotPasswordPage from '@/features/auth/pages/forgot-password'
 import LoginPage from '@/features/auth/pages/login'
 import { RequireAuth } from '@/lib/auth'
@@ -55,6 +56,16 @@ export function AppRouter() {
       <Route path="/login" element={<Navigate to="/auth/login" replace />} />
       <Route path="/auth/login" element={<LoginPage />} />
       <Route path="/auth/forgot-password" element={<ForgotPasswordPage />} />
+      {/* Needs the session, not HR access: RequireAuth sends a person whose password an
+          administrator set here, and lets this one path through. */}
+      <Route
+        path="/auth/change-password"
+        element={
+          <RequireAuth>
+            <ChangePasswordPage />
+          </RequireAuth>
+        }
+      />
 
       {/* Protected routes — wrapped in the HR layout shell */}
       <Route

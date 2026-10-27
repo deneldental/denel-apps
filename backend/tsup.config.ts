@@ -28,6 +28,11 @@ export default defineConfig({
   // only data that matters is PRODUCTION's. Unbundled it could run against dev
   // only, which proves nothing. It is READ ONLY:
   //   docker compose run --rm backend node dist/scripts/audit-staff-phones.js
+  //
+  // `backfill-payment-plan-tags` is bundled so the plan-tag backfill (G07) can be dry-run against
+  // PRODUCTION, which ships `dist/` only. It writes nothing unless `--apply` is passed:
+  //   docker compose run --rm backend node dist/scripts/backfill-payment-plan-tags.js
+  //   docker compose run --rm backend node dist/scripts/backfill-payment-plan-tags.js --apply
   entry: [
     'src/node.ts',
     'src/scripts/schema-drift-check.ts',
@@ -37,6 +42,7 @@ export default defineConfig({
     'src/scripts/seed-admin.ts',
     'src/scripts/payment-method-audit.ts',
     'src/scripts/audit-staff-phones.ts',
+    'src/scripts/backfill-payment-plan-tags.ts',
   ],
   format: ['cjs'],
   outDir: 'dist',

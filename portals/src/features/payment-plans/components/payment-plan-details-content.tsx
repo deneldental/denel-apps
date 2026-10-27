@@ -1,8 +1,14 @@
-import type { ColumnDef } from '@tanstack/react-table'
-import { format } from 'date-fns'
-import { Calendar, ChevronLeft, CreditCard, DollarSign } from 'lucide-react'
+import { format, parseISO } from 'date-fns'
+import { Calendar, ChevronLeft, CreditCard, DollarSign, Receipt } from 'lucide-react'
+import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { DataTable } from '@/shared/components/data-table/data-table'
+import { toast } from 'sonner'
+import {
+  type ReceiptDataShape,
+  ReceiptViewDialog,
+} from '@/features/payments/components/receipt-view-dialog'
+import type { PaymentPlanDetail, PaymentPlanHistoryPayment } from '@/lib/actions/payment-plans'
+import { api } from '@/lib/api-client'
 import { Badge } from '@/shared/components/ui/badge'
 import { Button } from '@/shared/components/ui/button'
 import {
@@ -12,82 +18,51 @@ import {
   CardHeader,
   CardTitle,
 } from '@/shared/components/ui/card'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/shared/components/ui/table'
 import { formatCurrency } from '@/shared/utils/currency'
 
-interface Payment {
-  id: string
-  amount: number
-  method: string
-  status: string
-  createdAt: Date
-  balance: number | null
-}
-
-interface PaymentPlan {
-  id: string
-  type: string
-  totalAmount: number
-  amountPerInstallment: number | null
-  paymentFrequency: string | null
-  startDate: Date
-  status: string
-  notes: string | null
-  patient: {
-    id: string
-    name: string
-    phone: string | null
-    email: string | null
-  }
-  payments: Payment[]
-}
-
 interface PaymentPlanDetailsContentProps {
-  plan: PaymentPlan
+  plan: PaymentPlanDetail
+}
+
+/** A payment's own date when it has one (a plain date), otherwise when it was recorded. */
+function paymentDay(p: PaymentPlanHistoryPayment): string {
+  const day = p.paymentDate ? parseISO(p.paymentDate) : new Date(p.createdAt)
+  return Number.isNaN(day.getTime()) ? '—' : format(day, 'MMM d, yyyy')
+}
+
+const PAYMENT_STATUS: Record<PaymentPlanHistoryPayment['status'], string> = {
+  posted: 'Posted',
+  reversed: 'Reversed',
 }
 
 export function PaymentPlanDetailsContent({ plan }: PaymentPlanDetailsContentProps) {
-  const totalPaid = plan.payments.reduce((sum, payment) => sum + payment.amount, 0)
-  const balance = plan.totalAmount - totalPaid
+  const [receipt, setReceipt] = useState<ReceiptDataShape | null>(null)
+  const [receiptOpen, setReceiptOpen] = useState(false)
+  const [loadingId, setLoadingId] = useState<string | null>(null)
 
-  const paymentColumns: ColumnDef<Payment>[] = [
-    {
-      accessorKey: 'createdAt',
-      header: 'Date',
-      cell: ({ row }) => format(new Date(row.original.createdAt), 'MMM d, yyyy'),
-    },
-    {
-      accessorKey: 'amount',
-      header: 'Amount',
-      cell: ({ row }) => formatCurrency(row.original.amount),
-    },
-    {
-      accessorKey: 'method',
-      header: 'Method',
-      cell: ({ row }) => (
-        <Badge variant="outline" className="capitalize">
-          {row.original.method}
-        </Badge>
-      ),
-    },
-    {
-      accessorKey: 'status',
-      header: 'Status',
-      cell: ({ row }) => (
-        <Badge
-          variant={row.original.status === 'completed' ? 'default' : 'secondary'}
-          className="capitalize"
-        >
-          {row.original.status}
-        </Badge>
-      ),
-    },
-    {
-      accessorKey: 'balance',
-      header: 'Balance After',
-      cell: ({ row }) =>
-        row.original.balance !== null ? formatCurrency(row.original.balance) : 'N/A',
-    },
-  ]
+  async function openReceipt(paymentId: string) {
+    setLoadingId(paymentId)
+    const res = await api.get<ReceiptDataShape>(`/api/payments/${paymentId}/receipt`)
+    setLoadingId(null)
+    if (!res.success || !res.data) {
+      toast.error('Failed to load receipt')
+      return
+    }
+    setReceipt(res.data)
+    setReceiptOpen(true)
+  }
+
+  const { totals } = plan
+  const frequency = plan.paymentFrequency ?? plan.installmentPeriod
+  const isFixed = (plan.scheduleType ?? plan.type) === 'fixed'
 
   return (
     <div className="flex flex-col gap-6 p-6">
@@ -105,6 +80,7 @@ export function PaymentPlanDetailsContent({ plan }: PaymentPlanDetailsContentPro
         <div>
           <h1 className="text-3xl font-bold tracking-tight">Payment Plan Details</h1>
           <p className="text-muted-foreground">
+            {plan.planNumber ? `${plan.planNumber} · ` : ''}
             View payment plan information and transaction history
           </p>
         </div>
@@ -124,7 +100,9 @@ export function PaymentPlanDetailsContent({ plan }: PaymentPlanDetailsContentPro
             <DollarSign className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{formatCurrency(plan.totalAmount)}</div>
+            <div className="text-2xl font-bold" data-testid="plan-total">
+              {formatCurrency(totals.total)}
+            </div>
           </CardContent>
         </Card>
 
@@ -134,7 +112,9 @@ export function PaymentPlanDetailsContent({ plan }: PaymentPlanDetailsContentPro
             <CreditCard className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{formatCurrency(totalPaid)}</div>
+            <div className="text-2xl font-bold" data-testid="plan-paid">
+              {formatCurrency(totals.paid)}
+            </div>
           </CardContent>
         </Card>
 
@@ -144,7 +124,9 @@ export function PaymentPlanDetailsContent({ plan }: PaymentPlanDetailsContentPro
             <DollarSign className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{formatCurrency(balance)}</div>
+            <div className="text-2xl font-bold" data-testid="plan-balance">
+              {formatCurrency(totals.balance)}
+            </div>
           </CardContent>
         </Card>
 
@@ -153,13 +135,20 @@ export function PaymentPlanDetailsContent({ plan }: PaymentPlanDetailsContentPro
             <CardTitle className="text-sm font-medium">Status</CardTitle>
             <Calendar className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
-          <CardContent>
+          <CardContent className="flex items-center gap-2">
             <Badge
-              variant={plan.status === 'completed' ? 'default' : 'secondary'}
+              variant={
+                plan.status === 'completed'
+                  ? 'default'
+                  : plan.status === 'overdue'
+                    ? 'destructive'
+                    : 'secondary'
+              }
               className="capitalize"
             >
               {plan.status}
             </Badge>
+            {plan.archived && <Badge variant="outline">Archived</Badge>}
           </CardContent>
         </Card>
       </div>
@@ -180,14 +169,25 @@ export function PaymentPlanDetailsContent({ plan }: PaymentPlanDetailsContentPro
             <div>
               <p className="text-sm font-medium text-muted-foreground">Plan Type</p>
               <Badge variant="outline" className="capitalize">
-                {plan.type}
+                {plan.scheduleType ?? plan.type}
               </Badge>
             </div>
+            {plan.invoice && (
+              <div>
+                <p className="text-sm font-medium text-muted-foreground">Master Invoice</p>
+                <p>
+                  {plan.invoice.invoiceNumber}{' '}
+                  <span className="text-sm capitalize text-muted-foreground">
+                    ({plan.invoice.status.replace(/_/g, ' ')})
+                  </span>
+                </p>
+              </div>
+            )}
             <div>
               <p className="text-sm font-medium text-muted-foreground">Start Date</p>
               <p>{format(new Date(plan.startDate), 'MMMM d, yyyy')}</p>
             </div>
-            {plan.type === 'fixed' && (
+            {isFixed && (
               <>
                 <div>
                   <p className="text-sm font-medium text-muted-foreground">
@@ -199,7 +199,7 @@ export function PaymentPlanDetailsContent({ plan }: PaymentPlanDetailsContentPro
                 </div>
                 <div>
                   <p className="text-sm font-medium text-muted-foreground">Payment Frequency</p>
-                  <p className="capitalize">{plan.paymentFrequency || 'N/A'}</p>
+                  <p className="capitalize">{frequency || 'N/A'}</p>
                 </div>
               </>
             )}
@@ -234,13 +234,82 @@ export function PaymentPlanDetailsContent({ plan }: PaymentPlanDetailsContentPro
         <CardHeader>
           <CardTitle>Payment History</CardTitle>
           <CardDescription>
-            All payments made towards this plan ({plan.payments.length} total)
+            Payments applied to this plan ({plan.payments.length} total). A reversed payment is
+            shown for the record and is not counted in Total Paid.
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <DataTable columns={paymentColumns} data={plan.payments} />
+          {plan.payments.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No payments have been made yet.</p>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Date</TableHead>
+                  <TableHead>Payment</TableHead>
+                  <TableHead>Method</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead className="text-right">Amount</TableHead>
+                  <TableHead className="text-right">Applied to plan</TableHead>
+                  <TableHead className="w-24 text-right">Receipt</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {plan.payments.map((p) => (
+                  <TableRow key={p.id} data-testid={`payment-${p.id}`}>
+                    <TableCell>{paymentDay(p)}</TableCell>
+                    <TableCell className="font-mono text-sm">{p.paymentNumber ?? '—'}</TableCell>
+                    <TableCell>
+                      <Badge variant="outline" className="capitalize">
+                        {p.method.replace(/_/g, ' ')}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant={p.status === 'posted' ? 'default' : 'destructive'}>
+                        {PAYMENT_STATUS[p.status]}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="text-right font-mono">
+                      {formatCurrency(p.amount)}
+                    </TableCell>
+                    <TableCell className="text-right font-mono">
+                      {p.appliedToPlan > 0 ? formatCurrency(p.appliedToPlan) : '—'}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {/* Like the patient ledger, a receipt is offered for money that was received:
+                          a reversed payment was handed back, and its receipt would read as paid. */}
+                      {p.status === 'posted' ? (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          aria-label={`View receipt for ${p.paymentNumber ?? 'payment'}`}
+                          disabled={loadingId === p.id}
+                          onClick={() => void openReceipt(p.id)}
+                        >
+                          <Receipt className="h-4 w-4" />
+                        </Button>
+                      ) : (
+                        '—'
+                      )}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
         </CardContent>
       </Card>
+
+      {receipt && (
+        <ReceiptViewDialog
+          open={receiptOpen}
+          onOpenChange={(o) => {
+            setReceiptOpen(o)
+            if (!o) setReceipt(null)
+          }}
+          receiptData={receipt}
+        />
+      )}
     </div>
   )
 }

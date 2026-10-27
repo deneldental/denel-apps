@@ -41,11 +41,14 @@ type SourceInvoice = {
   /** Already settled against this estimate — a deposit taken at confirm time. */
   paidAmount?: number | string | null
   balance?: number | string | null
+  total?: number | string | null
   lines?: Array<{
     serviceId?: string | null
     description?: string | null
     quantity?: number | string | null
     unitPrice?: number | string | null
+    /** What the line is billed at: surcharge, discount, tax and any step included. */
+    lineTotal?: number | string | null
     specialistId?: string | null
   }>
 }
@@ -137,12 +140,24 @@ export function PaymentPlanSheet({
 
   const lineTotals = useMemo(() => computePlanTotals(lines), [lines])
 
+  /**
+   * What the installments cover. Converting an estimate, the server schedules what the estimate
+   * still owes (its balance, so a deposit already paid is not billed again), whatever its lines
+   * say: the sheet schedules the same figure, or the number of installments it sends would split a
+   * different total from the one the patient is shown. Otherwise, the lines' total.
+   */
+  const sourceInvoice = sourceInvoiceQuery.data
+  const scheduledTotal =
+    billsExistingEstimate && sourceInvoice
+      ? Number(sourceInvoice.balance ?? sourceInvoice.total) || 0
+      : lineTotals.total
+
   const numberOfInstallments = useMemo(() => {
     if (planType !== 'fixed') return 0
     const perCents = inputToCents(amountPerInstallment)
-    if (perCents <= 0 || lineTotals.total <= 0) return 0
-    return Math.ceil(lineTotals.total / perCents)
-  }, [planType, amountPerInstallment, lineTotals.total])
+    if (perCents <= 0 || scheduledTotal <= 0) return 0
+    return Math.ceil(scheduledTotal / perCents)
+  }, [planType, amountPerInstallment, scheduledTotal])
 
   useEffect(() => {
     if (!open) return
@@ -202,6 +217,8 @@ export function PaymentPlanSheet({
       quantity: Number(l.quantity) || 1,
       unitPrice: Number(l.unitPrice) || 0,
       doctorId: l.specialistId ?? null,
+      // Shown at what the estimate bills it, not priced again (see `PlanLine.billedTotal`).
+      ...(l.lineTotal != null ? { billedTotal: Number(l.lineTotal) } : {}),
     }))
     setLines(seeded)
     baselineLinesRef.current = JSON.stringify(seeded)
@@ -256,7 +273,7 @@ export function PaymentPlanSheet({
           toast.error('Set the per-installment amount for a fixed plan.')
           return
         }
-        if (perInstallmentCents > lineTotals.total) {
+        if (perInstallmentCents > scheduledTotal) {
           toast.error('Per-installment amount cannot exceed the plan total.')
           return
         }
@@ -523,10 +540,10 @@ export function PaymentPlanSheet({
                   />
                 </div>
               </div>
-              {lineTotals.total > 0 && (
+              {scheduledTotal > 0 && (
                 <p className="text-xs text-muted-foreground">
                   Plan total:{' '}
-                  <span className="font-semibold">{formatCurrency(lineTotals.total)}</span>
+                  <span className="font-semibold">{formatCurrency(scheduledTotal)}</span>
                 </p>
               )}
             </div>

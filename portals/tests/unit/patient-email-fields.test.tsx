@@ -170,6 +170,29 @@ describe('Edit Patient', () => {
     expect(body.guardianEmail).toBe('efua@example.com')
     expect(body.email).toBeNull()
   })
+
+  // [Medium] Math.abs() used to flip a future DOB's negative time-since-epoch
+  // into a plausible-looking positive age instead of flagging the mistake.
+  it('blanks the age preview instead of showing a wrong number for a future date of birth', async () => {
+    renderWithRouter(<EditPatientSheet patient={makePatient()} open onOpenChange={vi.fn()} />)
+
+    const dobInput = await screen.findByLabelText(/date of birth/i)
+    // The Age preview is a disabled, unlabelled sibling input right after the
+    // Date of Birth field's own container — there's no accessible name to
+    // query it by, so find it relative to the field we know.
+    const ageInput = dobInput.closest('.grid')?.querySelectorAll('input')[1]
+    if (!ageInput) throw new Error('age preview input not found')
+    // Sanity check: a real past DOB does produce a non-empty age preview —
+    // this pins the blanking to the future-date case, not to every render.
+    expect(ageInput).not.toHaveValue('')
+
+    // The `max` attribute stops most future dates from being picked, but a
+    // raw `fireEvent.change` bypasses the native picker entirely — exactly
+    // how a value could still reach state if a browser didn't enforce it.
+    fireEvent.change(dobInput, { target: { value: '2099-01-01' } })
+
+    expect(ageInput).toHaveValue('')
+  })
 })
 
 describe('Edit Patient keeps unsaved edits when the photo link is refreshed', () => {

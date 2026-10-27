@@ -10,6 +10,9 @@ const BASE: Record<string, string | undefined> = {
   BETTER_AUTH_SECRET: 'test-secret-that-is-at-least-32-characters-!!',
   BETTER_AUTH_URL: 'http://localhost:3000',
   TRUSTED_IP_MODE: 'enforce',
+  // A deployed backend needs these too (F13); they are not what this file is about.
+  PORTAL_URL: 'https://portal.deneldental.com',
+  PATIENT_PORTAL_URL: 'https://app.deneldental.com',
   // Pinned so the caller's shell cannot decide the outcome.
   APP_ENV: undefined,
 }

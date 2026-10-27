@@ -314,14 +314,23 @@ function BulkRoleSheet({
 
   // Live roles from the RBAC source of truth — replaces the former __mock__ list.
   // Gated on `open` — no point fetching until the sheet is actually shown.
+  //
+  // 'doctor' is filtered out: it requires a linked `specialists` record (specialty,
+  // licence, commission, withholding tax — and the FK target `appointments.doctorId`
+  // actually reads) that only Portal → Specialists → Add specialist creates. The backend
+  // bulk-role validator rejects it too (defense in depth) — this filter is just so the
+  // picker doesn't offer a role it will refuse. 'external_trainer' used to be filtered
+  // too; nothing couples it to a specialist, so administrators can assign it (D15).
   const { data: roleOptions = [] } = useApiQuery(ACCESS_MGMT_ROLES_KEY, () => getRoles(), {
     select: (rows) =>
       // value MUST be the role id ('admin', 'doctor', …) — that's the slug the
       // backend bulk-role validator checks; `name` is the display label.
-      (rows as Array<{ id: string; name?: string | null }>).map((r) => ({
-        value: r.id,
-        label: r.name || r.id.replace(/_/g, ' '),
-      })),
+      (rows as Array<{ id: string; name?: string | null }>)
+        .filter((r) => r.id !== 'doctor')
+        .map((r) => ({
+          value: r.id,
+          label: r.name || r.id.replace(/_/g, ' '),
+        })),
     enabled: open,
     staleTime: 5 * 60_000,
   })
@@ -383,6 +392,10 @@ function BulkRoleSheet({
                 ))}
               </SelectContent>
             </Select>
+            <p className="text-xs text-muted-foreground">
+              Doctor and External Trainer aren't offered here — set those from Doctors → Add
+              Specialist.
+            </p>
           </div>
 
           <div className="max-h-[400px] overflow-y-auto rounded-md border">

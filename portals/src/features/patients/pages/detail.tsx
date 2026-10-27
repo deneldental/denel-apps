@@ -40,7 +40,7 @@ export default function PatientPage() {
       patient={patientQuery.data}
       isAdmin={isAdmin}
       isDoctor={isClinicalUser}
-      canViewMedicalRecords={isClinicalUser}
+      canViewMedicalRecords={hasPermission('medical_records', 'read')}
       canEdit={canEdit}
     />
   )

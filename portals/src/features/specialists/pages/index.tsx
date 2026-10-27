@@ -8,11 +8,14 @@ import { AddSpecialistSheet } from '@/features/specialists/components/add-specia
 import { listSpecialists } from '@/lib/actions/specialists'
 import { useCan } from '@/lib/permissions-context'
 import { queryKeys } from '@/lib/query-keys'
+import { cn } from '@/lib/utils'
 import { EmptyState } from '@/shared/components/empty-state'
 import { Avatar, AvatarFallback, AvatarImage } from '@/shared/components/ui/avatar'
 import { Badge } from '@/shared/components/ui/badge'
 import { Button } from '@/shared/components/ui/button'
 import { Card, CardContent } from '@/shared/components/ui/card'
+import { Label } from '@/shared/components/ui/label'
+import { Switch } from '@/shared/components/ui/switch'
 import {
   Table,
   TableBody,
@@ -43,10 +46,19 @@ export default function SpecialistsPage() {
   // Same gate the backend enforces on POST /api/specialists.
   const canCreate = useCan(MODULES.SPECIALISTS, ACTIONS.CREATE)
 
+  // Inactive specialists are hidden by default. They have to be reachable
+  // somewhere though: reactivating one happens on its page, and a row nobody can
+  // open is a dead end.
+  const [showInactive, setShowInactive] = useState(false)
+
   const { data: rows = [], isLoading } = useQuery({
-    queryKey: queryKeys.specialists.list(),
+    // Separate key when inactive rows are included — other screens share
+    // `list()` and must keep seeing active specialists only.
+    queryKey: showInactive
+      ? queryKeys.specialists.listWithInactive()
+      : queryKeys.specialists.list(),
     queryFn: async () => {
-      const res = await listSpecialists()
+      const res = await listSpecialists({ includeInactive: showInactive })
       if (res.error) toast.error(res.error)
       return res.data
     },
@@ -71,12 +83,20 @@ export default function SpecialistsPage() {
             )}
           </p>
         </div>
-        {canCreate && (
-          <Button onClick={() => setAddOpen(true)}>
-            <Plus className="mr-1.5 h-4 w-4" />
-            Add specialist
-          </Button>
-        )}
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2">
+            <Switch id="show-inactive" checked={showInactive} onCheckedChange={setShowInactive} />
+            <Label htmlFor="show-inactive" className="text-sm font-normal">
+              Show inactive
+            </Label>
+          </div>
+          {canCreate && (
+            <Button onClick={() => setAddOpen(true)}>
+              <Plus className="mr-1.5 h-4 w-4" />
+              Add specialist
+            </Button>
+          )}
+        </div>
       </header>
 
       <AddSpecialistSheet
@@ -116,8 +136,8 @@ export default function SpecialistsPage() {
                 {rows.map((r) => (
                   <TableRow
                     key={r.id}
-                    className={!r.isActive ? 'opacity-50' : 'cursor-pointer hover:bg-muted/30'}
-                    onClick={() => r.isActive && navigate(`/specialists/${r.id}`)}
+                    className={cn('cursor-pointer hover:bg-muted/30', !r.isActive && 'opacity-60')}
+                    onClick={() => navigate(`/specialists/${r.id}`)}
                   >
                     <TableCell>
                       <div className="flex items-center gap-3">

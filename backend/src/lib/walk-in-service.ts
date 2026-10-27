@@ -35,7 +35,7 @@ import {
   services,
 } from '../db/schema'
 import type { PaymentMethod } from './channel-accounts'
-import { findDoctorBlock } from './doctor-availability'
+import { checkDoctorAvailable } from './doctor-availability'
 import { FINANCE_ACCOUNTS } from './finance-accounts'
 import { computeLine, issueInvoice } from './invoice-service'
 import { generateInvoiceNumber } from './ledger-service'
@@ -129,15 +129,19 @@ export async function createWalkIn(
     const now = new Date()
 
     // A doctor who blocked this window isn't in the chair, so they can't take
-    // the walk-in either. Same rule the scheduled-booking paths enforce.
-    const block = await findDoctorBlock(tx as DB, input.appointment.doctorId, now)
-    if (block) {
-      throw new Error(
-        block.reason
-          ? `Doctor is unavailable right now (${block.reason})`
-          : 'Doctor is unavailable right now'
-      )
-    }
+    // the walk-in either — and if they're already mid-visit with someone
+    // else right now (or the chair is), the walk-in can't go there either.
+    // Same rule the scheduled-booking paths enforce (project-docs/
+    // patient-records-and-scheduling-audit.md, finding C1) — this used to
+    // call findDoctorBlock directly, which only checked declared block-time.
+    const blocked = await checkDoctorAvailable(
+      tx as DB,
+      input.appointment.doctorId,
+      now,
+      undefined,
+      { chairId: input.appointment.chairId }
+    )
+    if (blocked) throw new Error(blocked.error)
 
     // 1. The encounter — a same-day, already-checked-in appointment.
     const [appointment] = await tx
@@ -234,6 +238,7 @@ export async function createWalkIn(
       const computed = computeLine({
         quantity,
         unitPrice,
+        additionalUnitPrice: resolved?.additionalUnitPrice ?? null,
         discountType: discount?.type ?? 'none',
         discountValue: discount?.value ?? 0,
         taxRate,

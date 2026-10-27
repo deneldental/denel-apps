@@ -111,16 +111,25 @@ describe('GET /api/analytics', () => {
     assertSafeErrorBody(body)
   })
 
-  it('proceeds to DB call when authenticated (no ANALYTICS:read permission gate on root)', async () => {
-    // The root analytics endpoint checks only authentication — not a specific permission.
-    // Authenticated users reach the DB query; since getDb returns {}, they get 500.
+  it('returns 403 to a signed-in user without analytics:read (F23: it used to need only a session)', async () => {
     mockGetCurrentUser.mockResolvedValue(doctorUser)
     mockCheckPermission.mockResolvedValue(false)
     const res = await makeApp().request('/api/analytics')
+    expect(res.status).toBe(403)
+    expect(mockCheckPermission).toHaveBeenCalledWith(
+      expect.anything(),
+      doctorUser.id,
+      'analytics',
+      'read'
+    )
+  })
+
+  it('proceeds to the DB call with analytics:read', async () => {
+    // Since getDb returns {}, a permitted user reaches the query and gets 500.
+    mockGetCurrentUser.mockResolvedValue(doctorUser)
+    mockCheckPermission.mockResolvedValue(true)
+    const res = await makeApp().request('/api/analytics')
     expect([200, 500]).toContain(res.status)
-    // Must never be 401 (user is authenticated) or 403 (no permission check on root)
-    expect(res.status).not.toBe(401)
-    expect(res.status).not.toBe(403)
   })
 
   it('returns 400 for a year param that is not a number', async () => {

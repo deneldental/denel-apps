@@ -19,6 +19,7 @@ import { getDb } from '../db'
 import { requestKinds, requestSubtypes, staffRequests } from '../db/schema'
 import { createAuditLog } from '../lib/audit'
 import { ACTIONS, MODULES } from '../lib/modules'
+import { isUniqueViolation } from '../lib/pg-errors'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import type { HonoEnv } from '../lib/types'
 
@@ -98,7 +99,7 @@ requestTypesApp.post('/kinds', async (c) => {
     })
     return c.json({ success: true, data: row })
   } catch (err) {
-    if (err && typeof err === 'object' && 'code' in err && err.code === '23505') {
+    if (isUniqueViolation(err)) {
       return c.json({ error: 'A request with that name already exists' }, 409)
     }
     return c.json({ error: 'Failed to create request kind' }, 500)
@@ -238,7 +239,7 @@ requestTypesApp.post('/', async (c) => {
     })
     return c.json({ success: true, data: row })
   } catch (err) {
-    if (err && typeof err === 'object' && 'code' in err && err.code === '23505') {
+    if (isUniqueViolation(err)) {
       return c.json({ error: 'A type with that name already exists' }, 409)
     }
     return c.json({ error: 'Failed to create type' }, 500)

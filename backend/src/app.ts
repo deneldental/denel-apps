@@ -17,6 +17,7 @@ import type { HonoEnv } from './lib/types'
 import { blockTeamAppFromStaffAdmin } from './rbac/middleware/blockTeamAppFromStaffAdmin'
 import { detectInterface, resolveAppScope } from './rbac/middleware/detectInterface'
 import { enforceInterfaceScope } from './rbac/middleware/enforceInterfaceScope'
+import { enforcePasswordChange } from './rbac/middleware/enforcePasswordChange'
 import { accessManagementApp } from './routes/access-management'
 import { accountsApp } from './routes/accounts'
 import { activitiesApp } from './routes/activities'
@@ -55,6 +56,7 @@ import { doctorsApp } from './routes/doctors'
 import { documentTagsApp } from './routes/document-tags'
 import { documentsApp } from './routes/documents'
 import { emailApp } from './routes/email'
+import { estimatesApp } from './routes/estimates'
 import { expensesApp } from './routes/expenses'
 import { financeHealthApp } from './routes/finance-health'
 import { financialAnalyticsApp } from './routes/financial-analytics'
@@ -208,6 +210,10 @@ app.use('/api/*', blockTeamAppFromStaffAdmin())
 // from a known app interface (portal/pwa/hr) comes from a user holding that scope.
 // Rollout via SCOPE_ENFORCEMENT (off|dryrun|hr|all); defaults to all.
 app.use('/api/*', enforceInterfaceScope())
+
+// A person whose password an admin set must choose their own before anything else
+// (F20 / D8). Needs the session, so it runs after the scope guard has resolved it.
+app.use('/api/*', enforcePasswordChange())
 
 // X-Request-ID — attach a trace ID to every request and echo it in the response
 app.use('/api/*', async (c, next) => {
@@ -565,6 +571,7 @@ app.route('/api/google-contacts', googleContactsApp)
 app.route('/api/compliance', complianceApp)
 app.route('/api/roles', rolesApp)
 app.route('/api/invoices', invoicesApp)
+app.route('/api/estimates', estimatesApp)
 app.route('/api/walk-in', walkInApp)
 app.route('/api/worklist', worklistApp)
 app.route('/api/credit-notes', creditNotesApp)

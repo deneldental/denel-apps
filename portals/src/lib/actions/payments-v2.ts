@@ -97,10 +97,15 @@ export async function createDraftPayment(input: DraftPaymentInput) {
   return api.post<Payment>('/api/payments/draft', input, { timeout: PAYMENT_WRITE_TIMEOUT_MS })
 }
 
-export async function postDraftPayment(id: string) {
+/**
+ * Post a draft payment. `sendSms` asks the server to text the patient a payment confirmation (G08):
+ * it names what has been posted, the whole group for a split, so ask for it with the LAST payment
+ * of a group. The server texts an event at most once; a failed text comes back as `smsError`.
+ */
+export async function postDraftPayment(id: string, opts: { sendSms?: boolean } = {}) {
   return api.post<{ payment: Payment; journalEntry: { id: string; entryNumber: string } }>(
     `/api/payments/${id}/post`,
-    {},
+    opts.sendSms ? { sendSms: true } : {},
     { timeout: PAYMENT_WRITE_TIMEOUT_MS }
   )
 }

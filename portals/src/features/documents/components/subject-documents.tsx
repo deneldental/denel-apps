@@ -156,7 +156,7 @@ export function SubjectDocuments({
         <input
           ref={fileRef}
           type="file"
-          accept="application/pdf,image/*"
+          accept="application/pdf,image/jpeg,image/png,image/webp"
           className="block text-sm"
         />
         <Button onClick={upload} disabled={busy} size="sm">

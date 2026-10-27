@@ -23,6 +23,7 @@ import {
   can,
   getChildModules,
   getParentModule,
+  getParentModules,
   isChildModule,
   isParentModule,
   MODULE_HIERARCHY,
@@ -220,6 +221,43 @@ describe('can() — user with multiple explicit permissions', () => {
   })
 })
 
+// ── A module with two parents: estimates ──────────────────────────────────────
+//
+// `estimates` is implied by `payments` (everyone who could use them before keeps
+// the access) and by `financial_records`. can() once looked at the first parent
+// only, so a payments-only user was refused while the server allowed them.
+
+describe('can() — estimates, a module with two parents', () => {
+  const asUser = (module: string, action: string): UserWithRole => ({
+    id: `u-${module}-${action}`,
+    role: ROLES.RECEPTIONIST,
+    permissions: [{ module, action }],
+  })
+
+  it('payments:read alone implies estimates:read (the second parent)', () => {
+    expect(can(asUser(MODULES.PAYMENTS, ACTIONS.READ), MODULES.ESTIMATES, ACTIONS.READ)).toBe(true)
+  })
+
+  it('financial_records:read alone implies estimates:read (the first parent)', () => {
+    expect(
+      can(asUser(MODULES.FINANCIAL_RECORDS, ACTIONS.READ), MODULES.ESTIMATES, ACTIONS.READ)
+    ).toBe(true)
+  })
+
+  it('implies the same action only: payments:read does not grant estimates:create', () => {
+    expect(can(asUser(MODULES.PAYMENTS, ACTIONS.READ), MODULES.ESTIMATES, ACTIONS.CREATE)).toBe(
+      false
+    )
+  })
+
+  it('does not flow the other way: estimates:read grants no payments access', () => {
+    expect(can(asUser(MODULES.ESTIMATES, ACTIONS.READ), MODULES.PAYMENTS, ACTIONS.READ)).toBe(false)
+    expect(
+      can(asUser(MODULES.ESTIMATES, ACTIONS.READ), MODULES.FINANCIAL_RECORDS, ACTIONS.READ)
+    ).toBe(false)
+  })
+})
+
 // ── Helper function tests ──────────────────────────────────────────────────────
 
 describe('isParentModule()', () => {
@@ -231,8 +269,9 @@ describe('isParentModule()', () => {
 
   it('returns false for a leaf/child module', () => {
     expect(isParentModule(MODULES.MEDICAL_RECORDS)).toBe(false)
-    expect(isParentModule(MODULES.PAYMENTS)).toBe(false)
+    expect(isParentModule(MODULES.EXPENSES)).toBe(false)
     expect(isParentModule(MODULES.XRAYS)).toBe(false)
+    expect(isParentModule(MODULES.ESTIMATES)).toBe(false)
   })
 
   it('returns false for an unknown module', () => {
@@ -259,7 +298,13 @@ describe('getChildModules()', () => {
 
   it('returns [] for a leaf module', () => {
     expect(getChildModules(MODULES.MEDICAL_RECORDS)).toEqual([])
-    expect(getChildModules(MODULES.PAYMENTS)).toEqual([])
+    expect(getChildModules(MODULES.EXPENSES)).toEqual([])
+    expect(getChildModules(MODULES.ESTIMATES)).toEqual([])
+  })
+
+  it('payments implies estimates, and so does financial_records', () => {
+    expect(getChildModules(MODULES.PAYMENTS)).toEqual([MODULES.ESTIMATES])
+    expect(getChildModules(MODULES.FINANCIAL_RECORDS)).toContain(MODULES.ESTIMATES)
   })
 
   it('returns [] for an unknown module', () => {
@@ -275,10 +320,32 @@ describe('isChildModule()', () => {
     }
   })
 
-  it('returns false for parent modules', () => {
+  it('returns false for every parent module except payments', () => {
+    // The hierarchy is flat except for one deliberate step: financial_records →
+    // payments → estimates. Anything else becoming both a parent and a child is a
+    // design change that must be made on purpose, so it is named here.
+    const bothParentAndChild: string[] = [MODULES.PAYMENTS]
     for (const parent of Object.keys(MODULE_HIERARCHY)) {
-      // A parent module is not itself a child (flat hierarchy — no grandparents)
-      expect(isChildModule(parent), `${parent} should not be a child module`).toBe(false)
+      expect(
+        isChildModule(parent),
+        `${parent} should ${bothParentAndChild.includes(parent) ? '' : 'not '}be a child module`
+      ).toBe(bothParentAndChild.includes(parent))
+    }
+  })
+
+  it('expansion is one level, so every grandchild is also listed under the grandparent', () => {
+    // financial_records → payments → estimates: expansion does not follow a child's
+    // own children, so without the direct listing a financial_records grant would
+    // not reach estimates.
+    for (const [parent, cfg] of Object.entries(MODULE_HIERARCHY)) {
+      for (const child of cfg.children) {
+        for (const grandchild of getChildModules(child)) {
+          expect(
+            getChildModules(parent),
+            `${parent} implies ${child} implies ${grandchild}, so ${parent} must list ${grandchild}`
+          ).toContain(grandchild)
+        }
+      }
     }
   })
 
@@ -304,6 +371,15 @@ describe('getParentModule()', () => {
     expect(getParentModule(MODULES.PATIENTS)).toBeNull()
     expect(getParentModule(MODULES.ANALYTICS)).toBeNull()
     expect(getParentModule(MODULES.APPOINTMENTS)).toBeNull()
+  })
+
+  it('getParentModules returns every parent: estimates has two', () => {
+    expect(getParentModules(MODULES.ESTIMATES).sort()).toEqual(
+      [MODULES.FINANCIAL_RECORDS, MODULES.PAYMENTS].sort()
+    )
+    expect(getParentModules(MODULES.MEDICAL_RECORDS)).toEqual([MODULES.PATIENTS])
+    expect(getParentModules(MODULES.PATIENTS)).toEqual([])
+    expect(getParentModules('nonexistent')).toEqual([])
   })
 
   it('returns null for an unknown module', () => {

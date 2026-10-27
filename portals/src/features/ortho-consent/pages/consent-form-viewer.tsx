@@ -53,7 +53,7 @@ export function ConsentFormViewer({
   const previewUrl = useStableFileUrl(consentForm.consentFormUrl)
 
   const handleBack = () => {
-    navigate('/ortho-consent')
+    navigate('/consents/ortho')
   }
 
   const handleUpload = () => {

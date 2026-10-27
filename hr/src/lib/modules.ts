@@ -5,9 +5,12 @@
 export {
   ACTIONS,
   type Action,
+  assignableRoleIds,
   can,
+  canDelegateRoleChange,
   getChildModules,
   getParentModule,
+  HR_ASSIGNABLE_ROLES,
   type InterfaceScope,
   isChildModule,
   isParentModule,
@@ -18,5 +21,6 @@ export {
   ROLE_SCOPES,
   ROLES,
   type Role,
+  roleSignsInWithPassword,
   type UserWithRole,
 } from '@denel/rbac'

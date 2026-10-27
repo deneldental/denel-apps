@@ -22,11 +22,23 @@
  *       `.route()` mount and are the single biggest source of false positives if
  *       you only look at mounts.
  *     - Hono regex params (`/attendance/:staffId{[0-9a-fA-F-]{36}}`).
- *  2. Extracts frontend call sites from `hr/src`, `portals/src`, `team/src`:
- *     `.get/.post/.put/.patch/.delete(...)` plus `fetch(...)` (reading `method:`
- *     from the options object, defaulting to GET).
+ *  2. Extracts frontend call sites from `portals`, `hr`, `team`, `patient` and
+ *     `reports`: `.get/.post/.put/.patch/.delete(...)` plus `fetch(...)` (reading
+ *     `method:` from the options object, defaulting to GET). The last two used
+ *     to be skipped, so a broken call there could never fail the build (F14).
  *  3. Normalises both sides to comparable segment lists (see NORMALISATION below)
  *     and reports unmatched paths + method mismatches.
+ *
+ * STRICT MATCHING (the default, F14)
+ * ----------------------------------
+ * A `${…}` hole in a call is ONE path segment whose value the tool cannot see. It
+ * matches a route PARAMETER (`/:id`, `/*`), never a literal segment. The first
+ * version let a hole match anything, so `/api/payment-plans/${id}` looked
+ * satisfied by the literal route `/api/payment-plans/overdue` while the page
+ * that called it got a 404 (the F05 plan page). A call that really does build a
+ * resource name at run time (`/api/staff/${id}/${resource}`) cannot be proved
+ * either way: record it in the allowlist, with the reason. `--lenient` restores
+ * the old behaviour for comparison; CI never uses it.
  *
  * KNOWN LIMITATION — runtime shadowing is invisible to a static diff
  * -----------------------------------------------------------------
@@ -51,6 +63,9 @@
  *   node scripts/api-contract-audit.mjs --list-routes
  *   node scripts/api-contract-audit.mjs --list-calls
  *   node scripts/api-contract-audit.mjs --no-allowlist   # ignore the allowlist
+ *   node scripts/api-contract-audit.mjs --lenient        # old matching: a hole matches anything
+ *   node scripts/api-contract-audit.mjs --root=<dir> --allowlist=<file>   # audit another tree
+ *                                                        # (scripts/api-contract-audit.test.mjs)
  *
  * Known-deferred findings live in `scripts/api-contract-allowlist.json`; every
  * entry must carry a `reason`.
@@ -60,18 +75,40 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+const args = process.argv.slice(2)
+const flag = (name) => args.includes(name)
+/** `--name=value` → `value`, or null. */
+const option = (name) => {
+  const hit = args.find((a) => a.startsWith(`${name}=`))
+  return hit ? hit.slice(name.length + 1) : null
+}
+
 const HERE = dirname(fileURLToPath(import.meta.url))
-const ROOT = resolve(HERE, '..')
+const ROOT = option('--root') ? resolve(option('--root')) : resolve(HERE, '..')
 
 const BACKEND_SRC = join(ROOT, 'backend', 'src')
 const BACKEND_ENTRY = join(BACKEND_SRC, 'app.ts')
-const ALLOWLIST_PATH = join(HERE, 'api-contract-allowlist.json')
+const ALLOWLIST_PATH = option('--allowlist')
+  ? resolve(option('--allowlist'))
+  : join(HERE, 'api-contract-allowlist.json')
 
-/** Frontend apps to scan. `name` is what shows up in the report. */
+/** A `${…}` hole matches a literal route segment only in --lenient mode (F14). */
+const LENIENT = flag('--lenient')
+
+/**
+ * Frontend apps to scan. `name` is what shows up in the report. An app may list
+ * several folders: the reports app keeps its code in `src`, `components`, `hooks`
+ * and `lib` side by side.
+ */
 const FRONTEND_APPS = [
   { name: 'portal', dir: join(ROOT, 'portals', 'src') },
   { name: 'hr', dir: join(ROOT, 'hr', 'src') },
   { name: 'team', dir: join(ROOT, 'team', 'src') },
+  { name: 'patient', dir: join(ROOT, 'patient', 'src') },
+  { name: 'reports', dir: join(ROOT, 'reports', 'src') },
+  { name: 'reports', dir: join(ROOT, 'reports', 'components') },
+  { name: 'reports', dir: join(ROOT, 'reports', 'hooks') },
+  { name: 'reports', dir: join(ROOT, 'reports', 'lib') },
 ]
 
 const HTTP_METHODS = ['get', 'post', 'put', 'patch', 'delete']
@@ -79,9 +116,6 @@ const DECL_METHODS = [...HTTP_METHODS, 'all', 'options', 'head']
 
 /** Placeholder standing in for a `${...}` template hole. */
 const HOLE = ''
-
-const args = process.argv.slice(2)
-const flag = (name) => args.includes(name)
 
 // ───────────────────────────────────────────────────────────────────────────
 // Source scanning helpers
@@ -341,6 +375,16 @@ function lineOf(src, index) {
   return line
 }
 
+const SKIPPED_DIRS = new Set([
+  'node_modules',
+  'dist',
+  '.turbo',
+  '.next',
+  'coverage',
+  'playwright-report',
+  'test-results',
+])
+
 function walkFiles(dir, out = []) {
   let entries
   try {
@@ -351,7 +395,7 @@ function walkFiles(dir, out = []) {
   for (const e of entries) {
     const full = join(dir, e.name)
     if (e.isDirectory()) {
-      if (e.name === 'node_modules' || e.name === 'dist' || e.name === '.turbo') continue
+      if (SKIPPED_DIRS.has(e.name)) continue
       walkFiles(full, out)
     } else if (/\.(ts|tsx|js|jsx|mjs)$/.test(e.name)) {
       out.push(full)
@@ -815,6 +859,9 @@ function paramConstraint(seg) {
  * `/api/reports/period-summary` route behind `/api/reports/:id{uuid}`, and
  * misreported `POST /api/staff/attendance/overrides` as merely a verb mismatch
  * against `GET /api/staff/attendance/:staffId{uuid}`.
+ *
+ * Strict matching (F14): a hole in the call matches a route PARAMETER only. See
+ * the STRICT MATCHING note in the header; `--lenient` turns this off.
  */
 function segMatches(r, c) {
   const constraint = paramConstraint(r)
@@ -827,7 +874,12 @@ function segMatches(r, c) {
       return true // unparseable constraint — stay permissive rather than lie
     }
   }
-  if (isWild(r) || isWild(c)) return true
+  // A route parameter (`:id`) or wildcard takes any segment, literal or hole.
+  if (isWild(r)) return true
+  // A hole in the call is one segment of unknown value. Against a LITERAL route
+  // segment it cannot be proved to match, so strict mode (the default) says no.
+  if (c === '*') return LENIENT
+  if (isWild(c)) return true
   return r === c
 }
 
@@ -956,6 +1008,9 @@ function main() {
   console.log('─'.repeat(72))
   console.log(`Backend routes:      ${routes.length}`)
   console.log(`Frontend call sites: ${callSites.length}`)
+  console.log(
+    `Matching:            ${LENIENT ? 'LENIENT (a hole matches anything — diagnostic only)' : 'strict (a hole matches a route parameter only)'}`
+  )
   console.log(
     `Findings:            ${all.length}  (${blocking.length} blocking, ${deferred.length} allowlisted)`
   )

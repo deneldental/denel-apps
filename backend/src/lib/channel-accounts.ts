@@ -80,6 +80,34 @@ export async function resolveChannelAccountId(db: DB, method: PaymentMethod): Pr
 }
 
 /**
+ * The methods among `methods` that nothing in the system knows.
+ *
+ * `resolveChannelAccountId` never refuses a method: an unknown slug posts to Cash, while the
+ * payment row keeps the slug as typed, so a typo would be recorded as a cash receipt under a name
+ * nobody can find. Callers that take the method from a request use this first.
+ *
+ * A method is known when an administrator has it ACTIVE in the `payment_methods` lookup
+ * (Settings → Finance & Billing → Payment Methods), which is also the only list the portal offers.
+ * With no lookup row at all it is known if it is one of the canonical slugs above, which keep
+ * resolving with no row needed. A method an administrator has switched off is retired: it is not
+ * known, even if it is a canonical slug.
+ */
+export async function unknownPaymentMethods(db: DB, methods: string[]): Promise<string[]> {
+  const distinct = [...new Set(methods)]
+  if (distinct.length === 0) return []
+  const rows = await db
+    .select({ name: paymentMethods.name, isActive: paymentMethods.isActive })
+    .from(paymentMethods)
+    .where(inArray(paymentMethods.name, distinct))
+  const isActiveByName = new Map(rows.map((r) => [r.name, r.isActive]))
+  return distinct.filter((method) => {
+    const isActive = isActiveByName.get(method)
+    if (isActive !== undefined) return !isActive
+    return !Object.hasOwn(METHOD_TO_CODE, method)
+  })
+}
+
+/**
  * Convenience accessor for finding a control account by code (1200 AR,
  * 2200 Patient Deposits, etc.).
  */

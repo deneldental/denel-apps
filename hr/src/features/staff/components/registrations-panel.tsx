@@ -14,6 +14,7 @@ import {
   DialogTitle,
   Input,
   Label,
+  PasswordInput,
   Select,
   SelectContent,
   SelectItem,
@@ -25,7 +26,8 @@ import {
 import { CheckCircle2, Clock, Copy, FileText, Link2, Loader2, Trash2, UserPlus } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { TEAM_ROLE_OPTIONS } from '@/features/staff/__mock__/team-members'
+import { roleOptionsFor } from '@/features/staff/__mock__/team-members'
+import { approvalAccess, MIN_FIRST_PASSWORD } from '@/features/staff/role-access'
 import {
   type ApproveAdminFields,
   approveInvite,
@@ -40,6 +42,7 @@ import {
 import { onboardedSignIns } from '@/lib/roles'
 import { StatusBadge, type StatusTone } from '@/shared/components/status-badge'
 import { useConfirm } from '@/shared/hooks/use-confirm'
+import { useCanAssignAnyRole } from '@/shared/hooks/use-role-authority'
 
 // Team app origin — the register form lives there. In prod this is injected;
 // locally it defaults to the Team dev server.
@@ -54,13 +57,13 @@ const DEPT_LABELS: Record<string, string> = {
   both: 'Both',
 }
 
-// Reuse the single canonical role list the Add-Staff wizard uses (admin, doctor,
-// receptionist, lab_technician, external_trainer, staff) so the two flows never
-// drift. The role drives RBAC permissions → which Team-app tabs the staff sees.
-const ROLE_OPTIONS = [
-  { value: 'none', label: 'Assign later (Access Management)' },
-  ...TEAM_ROLE_OPTIONS,
-]
+// The roles offered here come from the shared assignable-role list (see
+// TEAM_ROLE_OPTIONS' doc comment) so this and Access Management never drift, narrowed to what
+// the reviewer may actually give (D15): administrators get all of them, an HR administrator
+// only Staff, Receptionist and Lab Technician. 'doctor' is never offered: a self-registered
+// doctor should be approved with 'none' here and then set up from Portal → Specialists, which
+// creates the linked specialist record this panel does not.
+const NO_ROLE_OPTION = { value: 'none', label: 'Assign later (Access Management)' }
 
 function prettify(v: unknown): string {
   if (v === undefined || v === null || v === '') return '—'
@@ -368,6 +371,9 @@ function ReviewDialog({
   const [deviceUserId, setDeviceUserId] = useState('')
   const [salaryBand, setSalaryBand] = useState('')
   const [role, setRole] = useState('none')
+  const [initialPassword, setInitialPassword] = useState('')
+  const canAssignAnyRole = useCanAssignAnyRole()
+  const roleOptions = [NO_ROLE_OPTION, ...roleOptionsFor(canAssignAnyRole)]
   const [flags, setFlags] = useState({
     tracksAttendance: true,
     hasPayslip: true,
@@ -392,6 +398,7 @@ function ReviewDialog({
     setDeviceUserId('')
     setSalaryBand('')
     setRole('none')
+    setInitialPassword('')
     setFlags({
       tracksAttendance: true,
       hasPayslip: true,
@@ -405,6 +412,16 @@ function ReviewDialog({
 
   const d = detail?.submittedData ?? {}
 
+  // Portal and HR sign in with an e-mail and a password; the Team app is phone + SMS code. A role
+  // that signs in with a password needs the registrant's e-mail and a first password from you
+  // (D16) — otherwise they would hold a role they cannot use until an admin reset their password.
+  const registrantEmail = typeof d.email === 'string' ? d.email.trim() : ''
+  const { needsPassword, passwordTooShort, canApprove, passwordToSend } = approvalAccess({
+    role,
+    registrantEmail,
+    initialPassword,
+  })
+
   async function handleApprove() {
     if (!id) return
     setBusy(true)
@@ -413,6 +430,7 @@ function ReviewDialog({
       deviceUserId: deviceUserId.trim() || undefined,
       salaryBand: salaryBand.trim() || undefined,
       role: role === 'none' ? undefined : role,
+      initialPassword: passwordToSend,
       // No `scopes`: the Team app is the default, and every other app
       // follows the role. Per-person exceptions live in Access → Edit access.
       ...flags,
@@ -557,7 +575,7 @@ function ReviewDialog({
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      {ROLE_OPTIONS.map((r) => (
+                      {roleOptions.map((r) => (
                         <SelectItem key={r.value} value={r.value}>
                           {r.label}
                         </SelectItem>
@@ -569,6 +587,35 @@ function ReviewDialog({
                     Team-app tabs until you set a role in Access Management.
                   </p>
                 </div>
+                {needsPassword && (
+                  <div className="space-y-1.5 sm:col-span-2">
+                    <Label htmlFor="rv-first-password">First password</Label>
+                    <PasswordInput
+                      id="rv-first-password"
+                      autoComplete="new-password"
+                      value={initialPassword}
+                      onChange={(e) => setInitialPassword(e.target.value)}
+                      maxLength={128}
+                    />
+                    {!registrantEmail ? (
+                      <p className="text-[11px] text-destructive">
+                        This person gave no e-mail address, and the portal and HR app sign in with
+                        one. Choose a Team-app-only role or ask them to register again.
+                      </p>
+                    ) : (
+                      <p className="text-[11px] text-muted-foreground">
+                        They sign in with {registrantEmail} and this password, at least{' '}
+                        {MIN_FIRST_PASSWORD} characters, and are asked to choose their own at first
+                        sign-in. Share it privately.
+                      </p>
+                    )}
+                    {initialPassword.length > 0 && passwordTooShort && (
+                      <p className="text-[11px] text-destructive">
+                        At least {MIN_FIRST_PASSWORD} characters.
+                      </p>
+                    )}
+                  </div>
+                )}
                 <div className="space-y-1.5">
                   <Label htmlFor="rv-band">Salary band</Label>
                   <Input
@@ -634,7 +681,7 @@ function ReviewDialog({
                 <Button variant="outline" onClick={() => setRejecting(true)} disabled={busy}>
                   Reject
                 </Button>
-                <Button onClick={handleApprove} disabled={busy}>
+                <Button onClick={handleApprove} disabled={busy || !canApprove}>
                   {busy ? (
                     <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                   ) : (

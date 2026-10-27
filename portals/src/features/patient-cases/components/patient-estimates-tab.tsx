@@ -1,5 +1,5 @@
 import { format } from 'date-fns'
-import { Loader2, Plus } from 'lucide-react'
+import { AlertTriangle, Loader2, Plus } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { CreateEstimateSheet } from '@/features/activity/components/create-estimate-sheet'
@@ -14,52 +14,70 @@ interface Props {
   canEdit?: boolean
 }
 
+/** One row of `GET /api/estimates/patient/:id` — the clinical list, no payment figures. */
+type EstimateRow = {
+  id: string
+  invoiceNumber: string
+  description: string | null
+  status: string
+  total: number | null
+  createdAt: string | null
+}
+
 export function PatientEstimatesTab({ patientId, canEdit = false }: Props) {
-  const { isAdmin, hasPermission } = usePermissions()
-  const canManage =
-    isAdmin || hasPermission('clinical', 'manage') || hasPermission('patients', 'manage')
-  const [estimates, setEstimates] = useState<any[]>([])
+  const { hasPermission } = usePermissions()
+  // The estimate permissions, not clinical:manage / patients:manage, which have
+  // nothing to do with estimates and left a doctor with neither button.
+  const canCreate = hasPermission('estimates', 'create')
+  const canSend = canEdit && hasPermission('estimates', 'update')
+
+  const [estimates, setEstimates] = useState<EstimateRow[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [showCreate, setShowCreate] = useState(false)
   const [patientName, setPatientName] = useState<string>('Patient')
 
-  // Generating Invoice state
-  const [generatingId, setGeneratingId] = useState<string | null>(null)
+  // Sending-to-reception state
+  const [sendingId, setSendingId] = useState<string | null>(null)
 
   const loadEstimates = useCallback(async () => {
     setLoading(true)
+    setLoadError(null)
+    try {
+      // The name only labels the builder; failing to fetch it is not worth an error.
+      const pRes = await api.get<{ name?: string }>(`/api/patients/${patientId}`)
+      if (pRes.success && pRes.data?.name) setPatientName(pRes.data.name)
 
-    // Fetch patient name
-    const pRes = await api.get<{ success: boolean; data: any }>(`/api/patients/${patientId}`)
-    if (pRes.success && pRes.data && (pRes.data as any).name) {
-      setPatientName((pRes.data as any).name)
+      const res = await api.get<EstimateRow[]>(`/api/estimates/patient/${patientId}`)
+      if (res.success && Array.isArray(res.data)) {
+        setEstimates(res.data)
+      } else {
+        // A refused or failed list is not "no estimates": say so, don't show an empty tab.
+        setEstimates([])
+        setLoadError(res.error || 'Please try again.')
+      }
+    } catch (err) {
+      setEstimates([])
+      setLoadError(err instanceof Error && err.message ? err.message : 'Please try again.')
+    } finally {
+      setLoading(false)
     }
-
-    const res = await api.get<{ success: boolean; data: any[] }>(
-      `/api/invoices/patient/${patientId}`
-    )
-    if (res.success && res.data) {
-      // Filter for one-time invoices (estimates), regardless of status
-      setEstimates((res.data as unknown as any[]).filter((inv: any) => inv.type === 'one_time'))
-    }
-    setLoading(false)
   }, [patientId])
 
   useEffect(() => {
     loadEstimates()
   }, [loadEstimates])
 
-  const handleGenerateInvoice = async (invoiceId: string) => {
-    setGeneratingId(invoiceId)
-    // We will call a new endpoint to push this estimate to the receptionist activity page
+  const handleSendToReception = async (invoiceId: string) => {
+    setSendingId(invoiceId)
     const res = await api.post(`/api/invoices/${invoiceId}/send-to-reception`, {})
-    setGeneratingId(null)
+    setSendingId(null)
 
     if (res.success) {
-      toast.success('Invoice generated and sent to reception activity page.')
+      toast.success('Sent to reception. They can confirm it from the Activity page.')
       loadEstimates()
     } else {
-      toast.error(res.error || 'Failed to generate invoice.')
+      toast.error(res.error || 'Failed to send to reception.')
     }
   }
 
@@ -67,7 +85,7 @@ export function PatientEstimatesTab({ patientId, canEdit = false }: Props) {
     <div className="space-y-4 pt-4">
       <div className="flex items-center justify-between">
         <h3 className="text-lg font-semibold">Estimates & Plans</h3>
-        {canManage && (
+        {canCreate && (
           <Button onClick={() => setShowCreate(true)} size="sm">
             <Plus className="mr-2 h-4 w-4" />
             Create Estimate / Plan
@@ -78,6 +96,18 @@ export function PatientEstimatesTab({ patientId, canEdit = false }: Props) {
       {loading ? (
         <div className="py-8 flex justify-center">
           <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+        </div>
+      ) : loadError ? (
+        <div
+          role="alert"
+          className="flex flex-col items-center gap-3 rounded-lg border border-dashed border-destructive/40 p-8 text-center"
+        >
+          <AlertTriangle className="h-5 w-5 text-destructive" />
+          <p className="text-sm font-medium">Could not load estimates.</p>
+          <p className="text-xs text-muted-foreground">{loadError}</p>
+          <Button variant="outline" size="sm" onClick={() => loadEstimates()}>
+            Retry
+          </Button>
         </div>
       ) : estimates.length === 0 ? (
         <div className="rounded-lg border border-dashed p-8 text-center text-muted-foreground">
@@ -116,7 +146,9 @@ export function PatientEstimatesTab({ patientId, canEdit = false }: Props) {
                           'bg-amber-100 text-amber-700 border-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:border-amber-800',
                         est.status === 'paid' &&
                           'bg-emerald-100 text-emerald-700 border-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-400 dark:border-emerald-800',
-                        (est.status === 'voided' || est.status === 'cancelled') &&
+                        (est.status === 'void' ||
+                          est.status === 'voided' ||
+                          est.status === 'cancelled') &&
                           'bg-rose-100 text-rose-700 border-rose-200 dark:bg-rose-900/30 dark:text-rose-400 dark:border-rose-800',
                         (est.status === 'sent' || est.status === 'issued') &&
                           'bg-blue-100 text-blue-700 border-blue-200 dark:bg-blue-900/30 dark:text-blue-400 dark:border-blue-800'
@@ -129,17 +161,17 @@ export function PatientEstimatesTab({ patientId, canEdit = false }: Props) {
                     {formatCurrency(est.total ?? 0)}
                   </td>
                   <td className="px-4 py-3 text-right">
-                    {est.status === 'draft' && canManage && canEdit && (
+                    {est.status === 'draft' && canSend && (
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => handleGenerateInvoice(est.id)}
-                        disabled={generatingId === est.id}
+                        onClick={() => handleSendToReception(est.id)}
+                        disabled={sendingId === est.id}
                       >
-                        {generatingId === est.id ? (
+                        {sendingId === est.id ? (
                           <Loader2 className="h-3 w-3 animate-spin" />
                         ) : (
-                          'Generate Invoice'
+                          'Send to reception'
                         )}
                       </Button>
                     )}

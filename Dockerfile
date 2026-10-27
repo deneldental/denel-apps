@@ -3,7 +3,7 @@
 # `pnpm deploy` bundles a self-contained production directory at /deploy that
 # has only backend's production node_modules (no workspace resolution issues in
 # the runner stage, no devDependencies).
-FROM node:20-slim AS builder
+FROM node:24-slim AS builder
 WORKDIR /repo
 
 RUN npm install -g pnpm@9
@@ -44,7 +44,7 @@ RUN cp -r /repo/backend/dist /deploy/dist && \
 
 
 # ── Stage 2: Production runtime ─────────────────────────────────────────────────
-FROM node:20-slim AS runner
+FROM node:24-slim AS runner
 WORKDIR /app
 
 # System Chromium for puppeteer (PDF / screenshot routes).

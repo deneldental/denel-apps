@@ -82,6 +82,7 @@ export function PhotosTab({ patientId, canEdit = true }: PhotosTabProps) {
     setUploading(true)
     try {
       const uploadRes = await uploadFile(selectedFile, {
+        storageCategory: 'patient_records',
         folder: 'patients',
         subfolder: `${patientId}/photos`,
         profile: 'image',

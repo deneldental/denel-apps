@@ -1,8 +1,9 @@
-import { eq } from 'drizzle-orm'
+import { eq, inArray } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { z } from 'zod'
 import { getDb } from '../db'
 import { doctors, doctorUnavailability, specialists } from '../db/schema'
+import { doctorRowSpecialty, specialtyLabels } from '../lib/doctor-specialty'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
@@ -26,6 +27,9 @@ doctorsApp.get('/', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
 
+  if (!(await checkPermission(c, user.id, APPOINTMENTS_MODULE as string, ACTIONS.READ as string)))
+    return c.json({ error: 'Unauthorized' }, 403)
+
   const db = getDb(process.env.DATABASE_URL!)
 
   try {
@@ -45,21 +49,36 @@ doctorsApp.get('/', async (c) => {
     // Batch-provision any doctors rows still missing (was an N+1 loop).
     const missing = allSpecialists.filter((s) => !bySpecialistId.has(s.id))
     if (missing.length > 0) {
-      const inserted = await db
+      // This is a GET that writes, and the first people to open the calendar after a
+      // specialist is added all reach it together: each saw the row missing, each inserted
+      // it, and every request but the winner hit the unique index on specialistId and
+      // answered 500 (F46). ON CONFLICT DO NOTHING makes the provisioning idempotent, and
+      // the rows are read back rather than taken from RETURNING, which omits the ones
+      // another request created first.
+      // The row shows the specialist's own specialty, not a placeholder (D17 / F47).
+      const labels = await specialtyLabels(
+        db,
+        missing.map((s) => s.specialty)
+      )
+      await db
         .insert(doctors)
         .values(
           missing.map((s) => ({
             specialistId: s.id,
-            specialty: s.specialistType === 'internal' ? 'General' : 'Specialist',
+            specialty: doctorRowSpecialty(s, labels),
             contactNumber: s.contactPhone ?? null,
           }))
         )
-        .returning()
-      for (const newDoctor of inserted) {
-        bySpecialistId.set(newDoctor.specialistId!, {
-          ...newDoctor,
-          user: null,
-        } as (typeof existingDoctors)[number])
+        .onConflictDoNothing()
+      const provisioned = await db.query.doctors.findMany({
+        where: inArray(
+          doctors.specialistId,
+          missing.map((s) => s.id)
+        ),
+        with: { user: true },
+      })
+      for (const d of provisioned) {
+        if (d.specialistId) bySpecialistId.set(d.specialistId, d)
       }
     }
 
@@ -162,6 +181,9 @@ doctorsApp.get('/me', async (c) => {
 doctorsApp.get('/unavailability', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+
+  if (!(await checkPermission(c, user.id, APPOINTMENTS_MODULE as string, ACTIONS.READ as string)))
+    return c.json({ error: 'Unauthorized' }, 403)
 
   const doctorId = c.req.query('doctorId')
   const db = getDb(process.env.DATABASE_URL!)

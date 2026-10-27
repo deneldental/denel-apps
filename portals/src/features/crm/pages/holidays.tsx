@@ -40,11 +40,12 @@ type ReminderTemplate = {
   isActive: boolean
 }
 
+/** A row of GET /api/sms/messages: the sms_messages columns plus the joined patient name. */
 type SmsMessage = {
   id: string
-  recipientPhone: string
-  recipientName?: string
-  message: string
+  recipient: string
+  content: string
+  patient: { id: string; name: string } | null
   status: string
   sentAt: string | null
   createdAt: string
@@ -290,13 +291,13 @@ export default function HolidaysPage() {
                   history.map((msg) => (
                     <TableRow key={msg.id}>
                       <TableCell className="text-sm">
-                        <div>{msg.recipientName || '—'}</div>
+                        <div>{msg.patient?.name || '—'}</div>
                         <div className="text-xs text-muted-foreground tabular-nums">
-                          {msg.recipientPhone}
+                          {msg.recipient}
                         </div>
                       </TableCell>
                       <TableCell className="max-w-xs">
-                        <p className="text-sm line-clamp-2">{msg.message}</p>
+                        <p className="text-sm line-clamp-2">{msg.content}</p>
                       </TableCell>
                       <TableCell>
                         <Badge

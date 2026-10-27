@@ -9,7 +9,7 @@ import {
 import { and, asc, desc, eq, gt, gte, isNull, lt, lte, or, sql } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { z } from 'zod'
-import { getDb } from '../db'
+import { type DB, getDb } from '../db'
 import {
   account,
   attendanceEvents,
@@ -35,12 +35,16 @@ import { buildEmployeeDataSheetHtml } from '../lib/employee-data-sheet'
 import { DEFAULT_EMPLOYMENT_TYPE, resolveEmploymentType } from '../lib/employment-type'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
+import { normalizeEmail } from '../lib/normalize-email'
 import { hashPassword } from '../lib/password'
+import { requirePasswordChange } from '../lib/password-change'
 import { checkPasswordPolicy } from '../lib/password-policy'
 import { renderHtmlToPdf } from '../lib/pdf-render'
+import { isUniqueViolation, uniqueViolationOf } from '../lib/pg-errors'
 import { sendPushToUsers } from '../lib/push'
-import { checkPermission, getCurrentUser } from '../lib/rbac'
+import { checkPermission, getCurrentUser, isAdminUser } from '../lib/rbac'
 import { sendSMS } from '../lib/sms'
+import { nextStaffId } from '../lib/staff-id'
 import { syncPersonalChildRecords } from '../lib/staff-personal-sync'
 import { revokeAllStaffDevices } from '../lib/staff-trusted-device'
 import type { HonoEnv } from '../lib/types'
@@ -55,15 +59,6 @@ const MODULE = MODULES.STAFF
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/** Auto-generate the next Staff ID in format FDM-S0001 — uses MAX to be safe after deletions */
-async function generateStaffId(db: any): Promise<string> {
-  const [result] = await db
-    .select({ maxNum: sql<number>`max(cast(regexp_replace("staffId", '[^0-9]', '', 'g') as int))` })
-    .from(staff)
-  const next = (result?.maxNum ?? 0) + 1
-  return `FDM-S${String(next).padStart(4, '0')}`
-}
 
 const MAX_PROFILE_IMAGE_BYTES = 2 * 1024 * 1024 // 2 MB
 function validateProfileImagePayload(value: unknown): string | null {
@@ -442,8 +437,11 @@ app.post('/', async (c) => {
       return c.json({ error: 'name, email, and defaultPassword are required' }, 400)
     }
 
+    // The address in the one form it is stored and compared in. Better Auth looks the
+    // login up by the lower-cased address, so a mixed-case one could never sign in (F21).
+    const email = typeof body.email === 'string' ? normalizeEmail(body.email) : ''
     const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-    if (!EMAIL_RE.test(body.email)) {
+    if (!EMAIL_RE.test(email)) {
       return c.json({ error: 'Invalid email address' }, 400)
     }
     if (typeof body.defaultPassword !== 'string' || body.defaultPassword.length < 10) {
@@ -531,8 +529,9 @@ app.post('/', async (c) => {
       if (personal[key]) personal[key] = new Date(personal[key])
     }
 
+    // Compared lower-cased: "Henry@…" and "henry@…" are one person.
     const existing = await db.query.user.findFirst({
-      where: eq(user.email, body.email),
+      where: eq(sql`lower(${user.email})`, email),
       columns: { id: true },
     })
     if (existing) {
@@ -574,61 +573,6 @@ app.post('/', async (c) => {
       }
     }
 
-    // Auto-generate Staff ID
-    const staffId = await generateStaffId(db)
-
-    const now = new Date()
-    const userId = crypto.randomUUID()
-
-    // Create the auth user (Better Auth user table) WITHOUT a role.
-    // Role + roleId are assigned later via Access Management; until then the
-    // user has no permissions and effectively cannot access any module.
-    //
-    // `username` is the staffId (lowercased; Better Auth's username plugin
-    // requires lowercase storage with case preserved in displayUsername) so
-    // staff can sign in via authClient.signIn.username on the PWA.
-    // `twoFactorEnabled=true` forces SMS-OTP on every new device; trusted
-    // devices skip OTP via Better Auth's 30-day trust cookie.
-    await db.insert(user).values({
-      id: userId,
-      name: body.name,
-      email: body.email,
-      phone: body.phone || null,
-      emailVerified: true, // admin-created accounts are pre-verified
-      role: null,
-      roleId: null,
-      banned: false,
-      username: staffId.toLowerCase(),
-      displayUsername: staffId,
-      twoFactorEnabled: true,
-      createdAt: now,
-      updatedAt: now,
-    })
-
-    // Create credential account (Better Auth stores passwords in the account table)
-    const hashedPw = await hashPassword(body.defaultPassword)
-    await db.insert(account).values({
-      id: crypto.randomUUID(),
-      accountId: userId,
-      providerId: 'credential',
-      userId: userId,
-      password: hashedPw,
-      createdAt: now,
-      updatedAt: now,
-    })
-
-    // Seed the Better Auth twoFactor row. The plugin schema requires `secret`
-    // + `backupCodes` NOT NULL even when only SMS-OTP is used. We never read
-    // these (TOTP and backup codes are disabled), but the row must exist for
-    // every user with twoFactorEnabled=true.
-    await db.insert(twoFactor).values({
-      id: crypto.randomUUID(),
-      userId,
-      secret: crypto.randomUUID(), // placeholder — never consumed
-      backupCodes: '[]',
-      verified: true,
-    })
-
     // ── Position + capability defaults derived from staffType (Phase 5C) ───
     // The wizard sends explicit values when the HR manager overrides; absent
     // values fall back to the matrix from project-docs (internal staff →
@@ -655,10 +599,78 @@ app.post('/', async (c) => {
     const requiresLicense = flag(body.requiresLicense, isClinicalPractitioner)
     const isBreakfastLead = flag(body.isBreakfastLead, false)
 
-    try {
+    // Hashed before the transaction opens: it takes tens of milliseconds, and the connection (and
+    // the staff-ID lock) should not be held for them.
+    const hashedPw = await hashPassword(body.defaultPassword)
+
+    const now = new Date()
+    const userId = crypto.randomUUID()
+
+    // The person is created in ONE transaction: the login, its credential and second-factor row, the
+    // staff record, the doctor record, the Team-app grant and the bundle all exist, or none of them
+    // does. This was a series of separate statements with a hand-written undo (delete the credential,
+    // delete the login). `staff.userId` and `specialists.userId` are ON DELETE SET NULL, so a failure
+    // after the staff insert left the staff record and the doctor record behind with no login — and
+    // the next attempt was refused for the phone number the failed one still held — while a failure
+    // before the undo's `try` left a login behind that blocked its own e-mail and, through its
+    // username, every creation after it.
+    const { newStaff, staffId } = await db.transaction(async (tx) => {
+      const staffId = await nextStaffId(tx)
+
+      // Create the auth user (Better Auth user table) WITHOUT a role.
+      // Role + roleId are assigned later via Access Management; until then the
+      // user has no permissions and effectively cannot access any module.
+      //
+      // `username` is the staffId (lowercased; Better Auth's username plugin
+      // requires lowercase storage with case preserved in displayUsername) so
+      // staff can sign in via authClient.signIn.username on the PWA.
+      // `twoFactorEnabled=true` forces SMS-OTP on every new device; trusted
+      // devices skip OTP via Better Auth's 30-day trust cookie.
+      await tx.insert(user).values({
+        id: userId,
+        name: body.name,
+        email,
+        phone: body.phone || null,
+        emailVerified: true, // admin-created accounts are pre-verified
+        role: null,
+        roleId: null,
+        banned: false,
+        username: staffId.toLowerCase(),
+        displayUsername: staffId,
+        twoFactorEnabled: true,
+        // Same switch as staff.isFirstLogin below (the wizard's "require password change on
+        // first login"), but on the user, which the portal and HR app actually read (F20).
+        mustChangePassword: body.forcePasswordChange !== false,
+        createdAt: now,
+        updatedAt: now,
+      })
+
+      // Create credential account (Better Auth stores passwords in the account table)
+      await tx.insert(account).values({
+        id: crypto.randomUUID(),
+        accountId: userId,
+        providerId: 'credential',
+        userId: userId,
+        password: hashedPw,
+        createdAt: now,
+        updatedAt: now,
+      })
+
+      // Seed the Better Auth twoFactor row. The plugin schema requires `secret`
+      // + `backupCodes` NOT NULL even when only SMS-OTP is used. We never read
+      // these (TOTP and backup codes are disabled), but the row must exist for
+      // every user with twoFactorEnabled=true.
+      await tx.insert(twoFactor).values({
+        id: crypto.randomUUID(),
+        userId,
+        secret: crypto.randomUUID(), // placeholder — never consumed
+        backupCodes: '[]',
+        verified: true,
+      })
+
       // Create staff record linked to the auth user. Role is owned by Access
       // Management and lives on the user table — staff has no role column.
-      const [newStaff] = await db
+      const [newStaff] = await tx
         .insert(staff)
         .values({
           // Personal data (biographical, government IDs, addresses, emergency
@@ -670,8 +682,8 @@ app.post('/', async (c) => {
           staffId,
           userId,
           fullName: body.name,
-          username: body.email.split('@')[0], // Extract a safe username from the email for legacy fields
-          email: body.email,
+          username: email.split('@')[0], // Extract a safe username from the email for legacy fields
+          email,
           phone: body.phone || null,
           position: body.position || null,
           employmentType: employment.name,
@@ -704,7 +716,7 @@ app.post('/', async (c) => {
       // Mirror the flat personal data into the child tables (migration 0177).
       // Both are written while the flat columns still exist, so a new staffer
       // can't end up with an emergency contact in one place and not the other.
-      await syncPersonalChildRecords(db, newStaff.id, {
+      await syncPersonalChildRecords(tx as unknown as DB, newStaff.id, {
         emergencyContactName: body.emergencyContactName,
         emergencyContactRelationship: body.emergencyContactRelationship,
         emergencyContactPhone: body.emergencyContactPhone,
@@ -719,7 +731,7 @@ app.post('/', async (c) => {
       // Backfill: if this device ID already had punches (arrived before the
       // staff record existed), claim those orphaned events now so they score.
       if (typeof body.deviceUserId === 'string' && body.deviceUserId.trim()) {
-        await db
+        await tx
           .update(attendanceEvents)
           .set({ staffId: newStaff.id })
           .where(
@@ -742,11 +754,11 @@ app.post('/', async (c) => {
           payoutMethod?: string
           tin?: string
         }
-        const [createdSpecialist] = await db
+        const [createdSpecialist] = await tx
           .insert(specialists)
           .values({
             name: body.name,
-            contactEmail: body.email,
+            contactEmail: email,
             contactPhone: body.phone || null,
             tin: specialistPayload.tin || null,
             specialistType: isExternalDerived ? 'external' : 'internal',
@@ -760,7 +772,7 @@ app.post('/', async (c) => {
             staffId: newStaff.id,
           })
           .returning()
-        await db
+        await tx
           .update(staff)
           .set({ specialistId: createdSpecialist.id })
           .where(eq(staff.id, newStaff.id))
@@ -772,7 +784,7 @@ app.post('/', async (c) => {
       // `portal: granted false`, and because user_scopes overrides the role,
       // that default outlived any later role change — a staff member promoted
       // to receptionist still bounced off every portal page.
-      await db.insert(userScopes).values({
+      await tx.insert(userScopes).values({
         userId,
         interfaceScope: 'pwa',
         granted: true,
@@ -786,7 +798,7 @@ app.post('/', async (c) => {
       // role. `grantSource = 'auto_position_tag'` distinguishes this from
       // manual grants so the inverse flip can revoke selectively.
       if (resolvedPositionTag === 'staff') {
-        await db
+        await tx
           .insert(userBundles)
           .values({
             userId,
@@ -797,45 +809,43 @@ app.post('/', async (c) => {
           .onConflictDoNothing()
       }
 
-      c.set('skipAudit', true)
-      await createAuditLog(db, {
-        userId: authUser.id,
-        action: 'create',
-        module: 'staff',
-        entityId: newStaff.id,
-        entityName: newStaff.fullName,
-        changes: { staffId, email: body.email },
-      })
+      return { newStaff, staffId }
+    })
 
-      return c.json({
-        success: true,
-        data: {
-          ...newStaff,
-          generatedStaffId: staffId,
-          message: `Staff account created. Staff ID: ${staffId}, Login Email: ${body.email}`,
-        },
-      })
-    } catch (insertError) {
-      // No native transaction support for this operation, perform manual rollback
-      await db.delete(account).where(eq(account.userId, userId))
-      await db.delete(user).where(eq(user.id, userId))
-      throw insertError
-    }
+    c.set('skipAudit', true)
+    await createAuditLog(db, {
+      userId: authUser.id,
+      action: 'create',
+      module: 'staff',
+      entityId: newStaff.id,
+      entityName: newStaff.fullName,
+      changes: { staffId, email },
+    })
+
+    return c.json({
+      success: true,
+      data: {
+        ...newStaff,
+        generatedStaffId: staffId,
+        message: `Staff account created. Staff ID: ${staffId}, Login Email: ${email}`,
+      },
+    })
   } catch (error: unknown) {
     logError(error, { context: '[staff] Create error' })
     // Surface the right unique-constraint message instead of always saying "email".
-    type PgErr = { code?: string; constraint?: string; detail?: string; cause?: PgErr }
-    const pgError = error as PgErr
-    const cause = pgError.cause ?? pgError
-    if (cause?.code === '23505') {
-      const constraint = cause.constraint || ''
+    const duplicate = uniqueViolationOf(error)
+    if (duplicate) {
+      const constraint = duplicate.constraint || ''
       if (constraint.includes('deviceUserId')) {
         return c.json({ error: 'Device User ID is already assigned to another staff.' }, 409)
       }
       if (constraint.includes('email')) {
         return c.json({ error: 'Email already exists in the system' }, 409)
       }
-      return c.json({ error: cause.detail || 'Duplicate value violates a unique constraint.' }, 409)
+      return c.json(
+        { error: duplicate.detail || 'Duplicate value violates a unique constraint.' },
+        409
+      )
     }
     return c.json({ error: 'Failed to create staff member' }, 500)
   }
@@ -1797,6 +1807,18 @@ app.post('/:id{[0-9a-fA-F-]{36}}/reset-password', async (c) => {
       return c.json({ error: 'Staff has no auth account yet — use setup-credentials instead' }, 409)
     }
 
+    // This route needs only the HR permission, so an HR administrator could set a new
+    // password for an ADMINISTRATOR's login and then sign in as them. Only an
+    // administrator can reset an administrator's password.
+    const [targetLogin] = await db
+      .select({ roleId: user.roleId })
+      .from(user)
+      .where(eq(user.id, staffRecord.userId))
+      .limit(1)
+    if (isAdminUser(targetLogin) && !isAdminUser(authUser)) {
+      return c.json({ error: "Only an administrator can reset an administrator's password." }, 403)
+    }
+
     const hashedPw = await hashPassword(newPassword)
     const [existingCred] = await db
       .select({ id: account.id })
@@ -1832,6 +1854,7 @@ app.post('/:id{[0-9a-fA-F-]{36}}/reset-password', async (c) => {
       .update(staff)
       .set({ isFirstLogin: true, updatedAt: now })
       .where(eq(staff.id, staffRecordId))
+    await requirePasswordChange(db, staffRecord.userId)
 
     c.set('skipAudit', true)
     await createAuditLog(db, {
@@ -1877,11 +1900,15 @@ app.post('/:id{[0-9a-fA-F-]{36}}/setup-credentials', async (c) => {
       return c.json({ error: 'Staff member has no email — cannot create auth account' }, 400)
     }
 
-    // Check for existing user with the same email
+    // The staff record may hold the address in any spelling; the login is looked up and
+    // stored in the one form Better Auth uses (F21).
+    const loginEmail = normalizeEmail(staffRecord.email)
+
+    // Check for existing user with the same email, in any spelling
     const [existingUser] = await db
       .select({ id: user.id })
       .from(user)
-      .where(eq(user.email, staffRecord.email))
+      .where(eq(sql`lower(${user.email})`, loginEmail))
       .limit(1)
 
     if (existingUser) {
@@ -1918,35 +1945,43 @@ app.post('/:id{[0-9a-fA-F-]{36}}/setup-credentials', async (c) => {
 
     const now = new Date()
     const newUserId = crypto.randomUUID()
-
-    await db.insert(user).values({
-      id: newUserId,
-      name: staffRecord.fullName,
-      email: staffRecord.email,
-      phone: staffRecord.phone || null,
-      emailVerified: true,
-      role: 'user',
-      roleId: null,
-      banned: false,
-      createdAt: now,
-      updatedAt: now,
-    })
-
+    // Hashed before the transaction opens, so the connection is not held for it.
     const hashedPw = await hashPassword(defaultPassword)
-    await db.insert(account).values({
-      id: crypto.randomUUID(),
-      accountId: newUserId,
-      providerId: 'credential',
-      userId: newUserId,
-      password: hashedPw,
-      createdAt: now,
-      updatedAt: now,
-    })
 
-    await db
-      .update(staff)
-      .set({ userId: newUserId, isFirstLogin: true, updatedAt: now })
-      .where(eq(staff.id, staffRecordId))
+    // The login, its credential and the link to the staff record are written together or not at
+    // all. They were three separate statements: a failure between the first two left a login with no
+    // password, and the next attempt then "linked" the staff record to that login (the branch
+    // above) — a person with a login nobody could sign in to.
+    await db.transaction(async (tx) => {
+      await tx.insert(user).values({
+        id: newUserId,
+        name: staffRecord.fullName,
+        email: loginEmail,
+        phone: staffRecord.phone || null,
+        emailVerified: true,
+        role: 'user',
+        roleId: null,
+        banned: false,
+        mustChangePassword: true,
+        createdAt: now,
+        updatedAt: now,
+      })
+
+      await tx.insert(account).values({
+        id: crypto.randomUUID(),
+        accountId: newUserId,
+        providerId: 'credential',
+        userId: newUserId,
+        password: hashedPw,
+        createdAt: now,
+        updatedAt: now,
+      })
+
+      await tx
+        .update(staff)
+        .set({ userId: newUserId, isFirstLogin: true, updatedAt: now })
+        .where(eq(staff.id, staffRecordId))
+    })
 
     c.set('skipAudit', true)
     await createAuditLog(db, {
@@ -1955,7 +1990,7 @@ app.post('/:id{[0-9a-fA-F-]{36}}/setup-credentials', async (c) => {
       module: 'staff',
       entityId: staffRecordId,
       entityName: staffRecord.fullName,
-      changes: { method: 'admin_set_password', email: staffRecord.email, isFirstLogin: true },
+      changes: { method: 'admin_set_password', email: loginEmail, isFirstLogin: true },
     })
 
     return c.json({
@@ -1967,8 +2002,7 @@ app.post('/:id{[0-9a-fA-F-]{36}}/setup-credentials', async (c) => {
     })
   } catch (error: unknown) {
     logError(error, { context: '[staff] setup-credentials error' })
-    const pgErr = error as { message?: string; code?: string }
-    if (pgErr.message?.includes('unique') || pgErr.code === '23505') {
+    if (isUniqueViolation(error)) {
       return c.json({ error: 'Email already exists in the system' }, 409)
     }
     return c.json({ error: 'Failed to create credentials' }, 500)
@@ -2009,9 +2043,4 @@ app.get('/:id/data-sheet', async (c) => {
   }
 })
 
-export {
-  app as staffCoreApp,
-  generateStaffId,
-  MAX_PROFILE_IMAGE_BYTES,
-  validateProfileImagePayload,
-}
+export { app as staffCoreApp, MAX_PROFILE_IMAGE_BYTES, validateProfileImagePayload }

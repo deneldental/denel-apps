@@ -11,6 +11,11 @@ import {
   DialogTitle,
 } from '@/shared/components/ui/dialog'
 import { formatAmount } from '@/shared/utils/currency'
+import {
+  hasInvoiceTotals,
+  methodStatusSuffix,
+  reversalBanner,
+} from '@/shared/utils/receipt-display'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -31,6 +36,8 @@ interface ReceiptMethod {
   amount: number
   reference: string | null
   paymentNumber: string | null
+  /** 'reversed' once this method's payment has been reversed. */
+  status?: string
 }
 
 export interface ReceiptDataShape {
@@ -56,6 +63,13 @@ export interface ReceiptDataShape {
   paymentNumber?: string | null
   paymentNumbers?: string[]
   invoiceNumbers?: string[]
+  /**
+   * 'reversed' when every payment on the receipt has been reversed, 'partly_reversed' when only
+   * some methods of a split have been, otherwise 'posted'. `amountPaid` counts the payments still
+   * in force; `reversedAmount` is what was reversed.
+   */
+  status?: 'posted' | 'reversed' | 'partly_reversed'
+  reversedAmount?: number
 }
 
 interface ReceiptViewDialogProps {
@@ -209,6 +223,7 @@ const ReceiptSlip = forwardRef<HTMLDivElement, SlipProps>(function ReceiptSlip(
           },
         ]
   const isSplit = methods.length > 1
+  const banner = reversalBanner(receiptData.status)
 
   return (
     <div
@@ -265,6 +280,20 @@ const ReceiptSlip = forwardRef<HTMLDivElement, SlipProps>(function ReceiptSlip(
         >
           Payment Receipt
         </div>
+        {banner && (
+          <div
+            style={{
+              fontSize: '14px',
+              fontWeight: 'bold',
+              marginTop: '8px',
+              border: '2px solid #000',
+              padding: '3px 0',
+              letterSpacing: '2px',
+            }}
+          >
+            {banner}
+          </div>
+        )}
       </div>
 
       {/* ── Body — name, service ───────────────────────────────────── */}
@@ -341,7 +370,8 @@ const ReceiptSlip = forwardRef<HTMLDivElement, SlipProps>(function ReceiptSlip(
           margin: '20px 0',
         }}
       >
-        {receiptData.allocations && receiptData.allocations.length > 0 && (
+        {/* Only a receipt of a real invoice has invoice totals; an itemised one-time payment does not. */}
+        {hasInvoiceTotals(receiptData.allocations) && (
           <div style={{ marginBottom: '10px' }}>
             {(() => {
               const subtotal = receiptData.allocations!.reduce(
@@ -363,6 +393,9 @@ const ReceiptSlip = forwardRef<HTMLDivElement, SlipProps>(function ReceiptSlip(
           </div>
         )}
         <BigRow label="PAID:" value={ghs(receiptData.amountPaid)} />
+        {receiptData.reversedAmount ? (
+          <Row label="Reversed:" value={ghs(receiptData.reversedAmount)} />
+        ) : null}
         {/* Payment methods section placed directly below "PAID" row, breakdown [100 + 50] removed */}
         <div style={{ margin: '6px 0 8px 0' }}>
           {isSplit ? (
@@ -383,6 +416,7 @@ const ReceiptSlip = forwardRef<HTMLDivElement, SlipProps>(function ReceiptSlip(
                 >
                   <span>
                     {methodLabel(m.method)}
+                    {methodStatusSuffix(m.status)}
                     {m.reference ? ` (${m.reference})` : ''}:
                   </span>
                   <span style={{ fontWeight: 'bold' }}>{ghs(m.amount)}</span>
@@ -392,7 +426,7 @@ const ReceiptSlip = forwardRef<HTMLDivElement, SlipProps>(function ReceiptSlip(
           ) : (
             <Row
               label="Method:"
-              value={`${methodLabel(methods[0]?.method || receiptData.paymentType)}${methods[0]?.reference ? ` (${methods[0].reference})` : ''}`}
+              value={`${methodLabel(methods[0]?.method || receiptData.paymentType)}${methodStatusSuffix(methods[0]?.status)}${methods[0]?.reference ? ` (${methods[0].reference})` : ''}`}
             />
           )}
         </div>

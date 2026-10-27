@@ -38,9 +38,16 @@ export async function recalculatePlanBalances(db: any, planId: string) {
       .where(eq(payments.id, payment.id))
   }
 
-  // 4. Update the plan status based on the final balance
+  // 4. Update the plan status based on the final balance. Only "paid in full" can be told from the
+  // payments alone. A plan someone put on hold (paused), wrote off (outstanding), or that the
+  // schedule found overdue keeps that state while money is still owed: those are set by a person or
+  // by `refreshPlanStatus`, and this used to flatten them to 'activated' whenever any payment of the
+  // plan was edited or deleted. Payments taken from the patient's ledger carry the plan tag too
+  // (G07), so far more edits reach this than before.
   const finalBalance = Math.max(0, currentBalance)
-  const newStatus = finalBalance <= 0 ? 'completed' : 'activated' // Or potentially check for 'overdue' if logic exists elsewhere
+  const holdsState =
+    plan.status === 'paused' || plan.status === 'outstanding' || plan.status === 'overdue'
+  const newStatus = finalBalance <= 0 ? 'completed' : holdsState ? plan.status : 'activated'
 
   await db
     .update(paymentPlans)

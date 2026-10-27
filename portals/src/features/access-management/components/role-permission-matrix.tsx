@@ -42,6 +42,7 @@ const MODULE_GROUPS: { label: string; modules: string[] }[] = [
     label: 'Finance',
     modules: [
       'payments',
+      'estimates',
       'payment_plans',
       'expenses',
       'financial_records',
@@ -115,6 +116,7 @@ const MODULE_LABELS: Record<string, string> = {
   labs: 'Labs',
   appointments: 'Appointments',
   payments: 'Payments',
+  estimates: 'Estimates',
   payment_plans: 'Payment Plans',
   expenses: 'Expenses',
   financial_records: 'Financial Records',

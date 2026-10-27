@@ -19,6 +19,7 @@ import {
   can,
   getChildModules,
   getParentModule,
+  getParentModules,
   isChildModule,
   isParentModule,
   MODULE_HIERARCHY,
@@ -410,9 +411,15 @@ describe('isParentModule()', () => {
 
   it('returns false for child-only modules', () => {
     expect(isParentModule(MODULES.MEDICAL_RECORDS)).toBe(false)
-    expect(isParentModule(MODULES.PAYMENTS)).toBe(false)
+    expect(isParentModule(MODULES.EXPENSES)).toBe(false)
     expect(isParentModule(MODULES.XRAYS)).toBe(false)
     expect(isParentModule(MODULES.USERS)).toBe(false)
+    expect(isParentModule(MODULES.ESTIMATES)).toBe(false)
+  })
+
+  it('treats payments as both a parent (of estimates) and a child (of financial_records)', () => {
+    expect(isParentModule(MODULES.PAYMENTS)).toBe(true)
+    expect(isChildModule(MODULES.PAYMENTS)).toBe(true)
   })
 
   it('returns false for leaf modules that are neither parent nor child', () => {
@@ -440,7 +447,13 @@ describe('getChildModules()', () => {
   it('returns empty array for non-parent modules', () => {
     expect(getChildModules(MODULES.ANALYTICS)).toEqual([])
     expect(getChildModules(MODULES.XRAYS)).toEqual([])
+    expect(getChildModules(MODULES.ESTIMATES)).toEqual([])
     expect(getChildModules('nonexistent_module')).toEqual([])
+  })
+
+  it('returns estimates for PAYMENTS and for FINANCIAL_RECORDS', () => {
+    expect(getChildModules(MODULES.PAYMENTS)).toEqual([MODULES.ESTIMATES])
+    expect(getChildModules(MODULES.FINANCIAL_RECORDS)).toContain(MODULES.ESTIMATES)
   })
 })
 
@@ -485,11 +498,70 @@ describe('getParentModule()', () => {
     expect(getParentModule(MODULES.INTEGRATIONS)).toBe(MODULES.SETTINGS)
   })
 
+  it('returns a parent for estimates, which has two (payments and financial_records)', () => {
+    expect(getParentModule(MODULES.ESTIMATES)).not.toBeNull()
+    expect(getParentModules(MODULES.ESTIMATES).sort()).toEqual(
+      [MODULES.FINANCIAL_RECORDS, MODULES.PAYMENTS].sort()
+    )
+  })
+
   it('returns null for top-level modules and standalone modules', () => {
     expect(getParentModule(MODULES.PATIENTS)).toBeNull()
     expect(getParentModule(MODULES.ANALYTICS)).toBeNull()
     expect(getParentModule(MODULES.APPOINTMENTS)).toBeNull()
     expect(getParentModule('no_such_module')).toBeNull()
+  })
+})
+
+// ── A module with two parents: estimates ──────────────────────────────────────
+//
+// `estimates` is implied by `payments` (everyone who could use them before keeps
+// the access) and by `financial_records`. can() once looked at the first parent
+// only, so a payments-only user was refused here while the server allowed them.
+
+describe('can() — estimates, a module with two parents', () => {
+  const asUser = (module: string, action: string): UserWithRole => ({
+    id: `u-${module}-${action}`,
+    role: ROLES.RECEPTIONIST,
+    permissions: [{ module, action }],
+  })
+
+  it('payments:read alone implies estimates:read (the second parent)', () => {
+    expect(can(asUser(MODULES.PAYMENTS, ACTIONS.READ), MODULES.ESTIMATES, ACTIONS.READ)).toBe(true)
+  })
+
+  it('financial_records:read alone implies estimates:read (the first parent)', () => {
+    expect(
+      can(asUser(MODULES.FINANCIAL_RECORDS, ACTIONS.READ), MODULES.ESTIMATES, ACTIONS.READ)
+    ).toBe(true)
+  })
+
+  it('implies the same action only: payments:read does not grant estimates:create', () => {
+    expect(can(asUser(MODULES.PAYMENTS, ACTIONS.READ), MODULES.ESTIMATES, ACTIONS.CREATE)).toBe(
+      false
+    )
+  })
+
+  it('does not flow the other way: estimates:read grants no payments access', () => {
+    expect(can(asUser(MODULES.ESTIMATES, ACTIONS.READ), MODULES.PAYMENTS, ACTIONS.READ)).toBe(false)
+    expect(
+      can(asUser(MODULES.ESTIMATES, ACTIONS.READ), MODULES.FINANCIAL_RECORDS, ACTIONS.READ)
+    ).toBe(false)
+  })
+
+  it('expansion is one level, so every grandchild is also listed under the grandparent', () => {
+    // financial_records -> payments -> estimates: without the direct listing a
+    // financial_records grant would not reach estimates.
+    for (const [parent, cfg] of Object.entries(MODULE_HIERARCHY)) {
+      for (const child of cfg.children) {
+        for (const grandchild of getChildModules(child)) {
+          expect(
+            getChildModules(parent),
+            `${parent} implies ${child} implies ${grandchild}, so ${parent} must list ${grandchild}`
+          ).toContain(grandchild)
+        }
+      }
+    }
   })
 })
 

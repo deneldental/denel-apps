@@ -9,6 +9,7 @@ import { createAuditLog, recordDiffAudit } from '../lib/audit'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
+import { denyUnless } from '../lib/route-access'
 import type { HonoEnv } from '../lib/types'
 
 // Client-settable fields for PATCH /api/recare/:id
@@ -298,6 +299,14 @@ recareApp.delete('/:id', async (c) => {
 recareApp.post('/auto-from-record', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, {
+    apps: ['portal'],
+    anyOf: [
+      [MODULES.RECARE, ACTIONS.CREATE],
+      [MODULES.MEDICAL_RECORDS, ACTIONS.CREATE],
+    ],
+  })
+  if (denied) return denied
 
   const db = getDb(process.env.DATABASE_URL!)
   const { patientId, treatmentTypeId } = await c.req.json()

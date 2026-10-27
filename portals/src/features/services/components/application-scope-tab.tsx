@@ -170,6 +170,11 @@ export function ApplicationScopeTab({ isAdmin }: { isAdmin: boolean }) {
                       <Badge variant="outline" className="text-[10px]">
                         {s.quantityMode === 'multi' ? 'Multi (qty)' : 'Single'}
                       </Badge>
+                      {s.additionalUnitPriceEnabled && (
+                        <Badge variant="secondary" className="text-[10px]">
+                          Stepped
+                        </Badge>
+                      )}
                       {s.variantType !== 'none' && (
                         <Badge variant="secondary" className="text-[10px]">
                           {s.variantType === 'tooth_class' ? 'By class' : 'Variants'}
@@ -263,6 +268,9 @@ function ScopeFormSheet({
   const [maxQuantity, setMaxQuantity] = useState(
     scope?.maxQuantity != null ? String(scope.maxQuantity) : ''
   )
+  const [additionalUnitPriceEnabled, setAdditionalUnitPriceEnabled] = useState(
+    scope?.additionalUnitPriceEnabled ?? false
+  )
 
   const saveMutation = useApiMutation(
     (payload: {
@@ -270,6 +278,7 @@ function ScopeFormSheet({
       quantityMode: 'single' | 'multi'
       variantType: 'none' | 'plain' | 'tooth_class'
       maxQuantity: number | null
+      additionalUnitPriceEnabled: boolean
     }) =>
       scope
         ? updateApplicationScope(scope.id, payload)
@@ -288,6 +297,8 @@ function ScopeFormSheet({
       quantityMode,
       variantType,
       maxQuantity: quantityMode === 'multi' && maxQuantity.trim() ? Number(maxQuantity) : null,
+      // A type billed once has no further units to price differently.
+      additionalUnitPriceEnabled: quantityMode === 'multi' && additionalUnitPriceEnabled,
     }
     try {
       await saveMutation.mutateAsync(payload)
@@ -376,6 +387,27 @@ function ScopeFormSheet({
                 value={maxQuantity}
                 onChange={(e) => setMaxQuantity(e.target.value)}
                 placeholder="e.g. 32"
+                disabled={!isAdmin}
+              />
+            </div>
+          )}
+          {quantityMode === 'multi' && (
+            <div className="flex items-start justify-between gap-3 rounded-md border px-3 py-2.5">
+              <div className="space-y-0.5">
+                <Label htmlFor="scope-additional-unit-price">
+                  Price additional units differently
+                </Label>
+                <p className="text-xs text-muted-foreground">
+                  A service of this type is billed its price for the first unit, and its own
+                  "additional unit price" (set on the service's Price matrix step) for each unit
+                  after that. Services with no additional unit price are billed the full price for
+                  every unit.
+                </p>
+              </div>
+              <Switch
+                id="scope-additional-unit-price"
+                checked={additionalUnitPriceEnabled}
+                onCheckedChange={setAdditionalUnitPriceEnabled}
                 disabled={!isAdmin}
               />
             </div>

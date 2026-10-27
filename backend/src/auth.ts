@@ -1,6 +1,6 @@
 import { betterAuth } from 'better-auth'
 import { drizzleAdapter } from 'better-auth/adapters/drizzle'
-import { createAuthMiddleware } from 'better-auth/api'
+import { APIError, createAuthMiddleware, getSessionFromCtx } from 'better-auth/api'
 import { admin, username } from 'better-auth/plugins'
 import type { Context } from 'hono'
 import { isDevEnvironment } from './config/env'
@@ -12,6 +12,7 @@ import { recordAuthEvent } from './lib/auth-events'
 import { serverSession } from './lib/auth-plugins/server-session'
 import { logError, logger } from './lib/logger'
 import { hashPassword, verifyPassword } from './lib/password'
+import { clearPasswordChange, requirePasswordChange } from './lib/password-change'
 import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH } from './lib/password-policy'
 import { COOKIE_DOMAIN, sharesSiteWithBackend } from './lib/same-site'
 import type { HonoEnv } from './lib/types'
@@ -54,6 +55,23 @@ function endpointFailed(ctx: { context: { returned?: unknown } }): boolean {
 }
 
 /**
+ * The only `user` columns a signed-in user may change about themselves through
+ * Better Auth's built-in `POST /api/auth/update-user`.
+ *
+ * That endpoint writes every field the schema marks as client input — which
+ * includes our `roleId` (RBAC), `phone`, and the username plugin's
+ * `username` / `displayUsername` (the staff-ID sign-in handle). With `roleId`
+ * writable, any session could send `{"roleId":"admin"}` and become an admin:
+ * `PermissionEngine` trusts the stored value. Verified end to end in
+ * tests/integration/auth-update-user.test.ts (F15 in
+ * project-docs/DENEL_FRAMADA_AUDIT_2026-10-25.md).
+ *
+ * Roles, phones and staff IDs change through the Access Management, Users and
+ * HR routes, which check `users:*` / `staff:*`. No client calls `update-user`.
+ */
+const SELF_EDITABLE_USER_FIELDS: ReadonlySet<string> = new Set(['name', 'image'])
+
+/**
  * Builds the Better Auth kernel.
  *
  * Kept as its own function on purpose: TypeScript infers the concrete
@@ -73,16 +91,32 @@ function buildAuth({ db, cookiePrefix, isHttps, isSameSiteWithFrontend }: AuthBu
       // Expose custom user table columns in the session response so the
       // frontend receives roleId (our custom RBAC FK) alongside the
       // better-auth 'role' field from the admin() plugin.
+      //
+      // `input: false` keeps them READABLE (still returned in the session) but
+      // refuses them as client input. Without it `POST /api/auth/update-user`
+      // let any session rewrite its own roleId — see SELF_EDITABLE_USER_FIELDS.
       additionalFields: {
         roleId: {
           type: 'string',
           required: false,
           fieldName: 'roleId',
+          input: false,
         },
         phone: {
           type: 'string',
           required: false,
           fieldName: 'phone',
+          input: false,
+        },
+        // F20 / D8 — readable in the session so the portal and HR app can send a
+        // flagged user to the change-password screen; `input: false` so no client can
+        // clear it with update-user (only changing the password does).
+        mustChangePassword: {
+          type: 'boolean',
+          required: false,
+          defaultValue: false,
+          fieldName: 'mustChangePassword',
+          input: false,
         },
       },
     },
@@ -157,6 +191,19 @@ function buildAuth({ db, cookiePrefix, isHttps, isSameSiteWithFrontend }: AuthBu
       },
       onPasswordReset: async ({ user }, _request) => {
         logger.info({ userId: user.id }, 'Password reset completed')
+
+        // Choosing a new password through the e-mailed link is the person replacing
+        // whatever an admin set (F20), so it ends the must-change state. Cleared BEFORE
+        // the revoke below, which also drops the session cache. Best-effort for the
+        // same reason as the revoke: the password is already written.
+        try {
+          await clearPasswordChange(db, user.id)
+        } catch (err) {
+          logError(err, {
+            context: '[auth] clearing must-change after reset failed',
+            userId: user.id,
+          })
+        }
 
         // A password change and a session revocation are not separable — the
         // whole point of a reset is that whoever held the old credential is
@@ -284,7 +331,66 @@ function buildAuth({ db, cookiePrefix, isHttps, isSameSiteWithFrontend }: AuthBu
     //
     // IT RUNS WHETHER OR NOT THE ENDPOINT SUCCEEDED — see `endpointFailed`.
     hooks: {
+      // Second layer for `update-user`: an allowlist, not a denylist. `input:
+      // false` above covers the fields we know about; this refuses anything else
+      // a plugin or a future column adds, including the username plugin's own
+      // fields, which cannot be locked from this config. The whole request is
+      // rejected — a forbidden key must not ride along with `name`.
+      before: createAuthMiddleware(async (ctx) => {
+        // F20 — a forced password change that accepts the same password is no change:
+        // the admin who set it would still know it. Better Auth does not check.
+        if (ctx.path === '/change-password') {
+          const pair = (ctx.body ?? {}) as { currentPassword?: unknown; newPassword?: unknown }
+          if (typeof pair.newPassword === 'string' && pair.newPassword === pair.currentPassword) {
+            throw new APIError('BAD_REQUEST', {
+              message: 'Choose a password different from your current one.',
+            })
+          }
+          return
+        }
+        if (ctx.path !== '/update-user') return
+        const body = (ctx.body ?? {}) as Record<string, unknown>
+        const refused = Object.keys(body).filter((key) => !SELF_EDITABLE_USER_FIELDS.has(key))
+        if (refused.length === 0) return
+        logger.warn({ fields: refused }, '[auth] update-user refused: non-editable fields sent')
+        throw new APIError('BAD_REQUEST', {
+          message: 'Only name and image can be changed on your own profile.',
+        })
+      }),
       after: createAuthMiddleware(async (ctx) => {
+        // F20 / D8 — keep `user.mustChangePassword` in step with who chose the password.
+        // Written BEFORE the session cache is dropped just below, so the next request
+        // re-reads the new value rather than re-caching the old one.
+        //
+        // The person changed their own password: the admin-known one is gone. The id
+        // comes from the response, because with revokeOtherSessions the session that
+        // made the call no longer exists to be looked up.
+        if (ctx.path === '/change-password' && !endpointFailed(ctx)) {
+          const userId = (ctx.context.returned as { user?: { id?: unknown } } | undefined)?.user?.id
+          if (typeof userId === 'string' && userId) {
+            try {
+              await clearPasswordChange(db, userId)
+            } catch (err) {
+              logError(err, { context: '[auth] clearing must-change failed', userId })
+            }
+          }
+        }
+
+        // An admin set someone else's password through Better Auth's own admin
+        // endpoint, bypassing the routes that flag it. Flag it here, unless they set
+        // their own.
+        if (ctx.path === '/admin/set-user-password' && !endpointFailed(ctx)) {
+          const targetId = (ctx.body as { userId?: unknown } | undefined)?.userId
+          const actor = await getSessionFromCtx(ctx).catch(() => null)
+          if (typeof targetId === 'string' && targetId && targetId !== actor?.user?.id) {
+            try {
+              await requirePasswordChange(db, targetId)
+            } catch (err) {
+              logError(err, { context: '[auth] flagging must-change failed', userId: targetId })
+            }
+          }
+        }
+
         // Deliberately unconditional: dropping cached sessions can only ever
         // deny access, never grant it, so flushing after a failed call is
         // wasted work rather than a hazard.

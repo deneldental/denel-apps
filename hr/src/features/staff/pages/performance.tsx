@@ -1,12 +1,4 @@
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-  Input,
-  Label,
-} from '@denel/ui'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label } from '@denel/ui'
 import type { ColumnDef } from '@tanstack/react-table'
 import { CalendarCheck, GraduationCap, Sparkles } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'

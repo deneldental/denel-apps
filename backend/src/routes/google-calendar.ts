@@ -57,16 +57,17 @@ import {
   shareCalendarWith,
 } from '../lib/google-service-account'
 import { logError } from '../lib/logger'
-import { ROLES } from '../lib/modules'
+import { ACTIONS, MODULES, ROLES } from '../lib/modules'
+import { portalLink } from '../lib/public-urls'
 import { getCurrentUser } from '../lib/rbac'
+import { denyUnless } from '../lib/route-access'
 import type { HonoEnv } from '../lib/types'
 
 const googleCalendarApp = new Hono<HonoEnv>()
 
-/** Where to send the user after callback. Uses PORTAL_URL or falls back. */
+/** Where to send the user after callback: the integrations page of the clinic portal. */
 function getPortalReturnUrl(): string {
-  const base = env.PORTAL_URL ?? 'http://localhost:5173'
-  return `${base.replace(/\/$/, '')}/integrations/google-calendar`
+  return portalLink('/integrations/google-calendar')
 }
 
 // ── GET /status ─────────────────────────────────────────────────────────────
@@ -74,6 +75,8 @@ function getPortalReturnUrl(): string {
 googleCalendarApp.get('/status', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, { apps: ['portal'] })
+  if (denied) return denied
 
   const dbForCfg = getDb(env.DATABASE_URL)
   const config = await resolveOAuthConfig(dbForCfg)
@@ -114,6 +117,11 @@ googleCalendarApp.get('/status', async (c) => {
 googleCalendarApp.get('/appointment-sync/:appointmentId', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, {
+    apps: ['portal'],
+    anyOf: [[MODULES.APPOINTMENTS, ACTIONS.READ]],
+  })
+  if (denied) return denied
 
   const appointmentId = c.req.param('appointmentId')
   const db = getDb(env.DATABASE_URL)
@@ -353,6 +361,11 @@ googleCalendarApp.get('/per-doctor-status', async (c) => {
 googleCalendarApp.post('/appointment-sync/:appointmentId/resync', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, {
+    apps: ['portal'],
+    anyOf: [[MODULES.APPOINTMENTS, ACTIONS.UPDATE]],
+  })
+  if (denied) return denied
 
   const appointmentId = c.req.param('appointmentId')
   const db = getDb(env.DATABASE_URL)

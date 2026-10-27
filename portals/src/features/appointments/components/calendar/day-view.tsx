@@ -32,6 +32,19 @@ interface DayViewProps {
   appointmentTypesLookup: Map<string, { colour?: string }>
 }
 
+const PX_PER_HOUR = 96 // h-24 = 6rem = 96px, matches the hour-row height below.
+const MIN_EVENT_HEIGHT_PX = 24 // Keeps very short visits readable/clickable.
+const DEFAULT_DURATION_MINUTES = 30
+
+// [Medium] Every appointment card used to render at a fixed 88px regardless
+// of length — a 15-min and a 2-hour visit looked identical. durationMinutes
+// was already available (used correctly elsewhere for a text end-time
+// label); the calendar grid just never read it.
+function eventHeightPx(durationMinutes: unknown): number {
+  const minutes = Number(durationMinutes) || DEFAULT_DURATION_MINUTES
+  return Math.max(MIN_EVENT_HEIGHT_PX, (minutes / 60) * PX_PER_HOUR)
+}
+
 export function DayView({
   date,
   events,
@@ -151,7 +164,7 @@ export function DayView({
                   )}
                   style={{
                     top: `${topOffset + minOffset}px`,
-                    height: '88px',
+                    height: `${eventHeightPx(event.appointment?.durationMinutes)}px`,
                     backgroundColor: colour.background,
                     color: colour.text,
                   }}

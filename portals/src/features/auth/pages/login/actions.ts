@@ -55,6 +55,12 @@ export async function login(
       }
     }
 
+    // An administrator set this password, so the person replaces it before anything
+    // else (F20 / D8). The backend refuses every other call until they do.
+    if (result.data?.user?.mustChangePassword) {
+      return { redirectPath: '/auth/change-password' }
+    }
+
     return { redirectPath: '/dashboard' }
   } catch (error) {
     console.error('Login error:', error)

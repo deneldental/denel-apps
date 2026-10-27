@@ -61,6 +61,7 @@ import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
 import { postPayrollRunToGL } from '../lib/payroll-gl-service'
 import { handleGetPayrollRunPdf, handleGetSinglePayslipPdf } from '../lib/pdf-handlers'
+import { isUniqueViolation } from '../lib/pg-errors'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import type { HonoEnv } from '../lib/types'
 import {
@@ -1705,8 +1706,7 @@ payrollApp.post('/tax-brackets', async (c) => {
     // PR-25 — 0063 added UNIQUE (bracketYear, taxType, lowerBoundMonthly).
     // Catch the violation so duplicate inserts return a clean 409 instead
     // of leaking the Postgres error text through the 500 path.
-    const pgErr = err as { code?: string; message?: string }
-    if (typeof pgErr.message === 'string' && /unique|duplicate/i.test(pgErr.message)) {
+    if (isUniqueViolation(err)) {
       return c.json(
         {
           error: `A ${taxType} bracket starting at ${lower} already exists for ${year}.`,
@@ -1775,8 +1775,7 @@ payrollApp.patch('/tax-brackets/:id', async (c) => {
     })
     return c.json({ success: true, data: row })
   } catch (err: unknown) {
-    const pgErr = err as { code?: string; message?: string }
-    if (typeof pgErr.message === 'string' && /unique|duplicate/i.test(pgErr.message)) {
+    if (isUniqueViolation(err)) {
       return c.json(
         {
           error: `That update would clash with an existing bracket for the same year + type + lower bound.`,

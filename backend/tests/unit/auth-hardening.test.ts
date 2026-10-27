@@ -186,7 +186,11 @@ describe('session cookie same-site detection (single deneldental.com domain)', (
 
   it('is cross-site when the backend is a Render staging URL', () => {
     expect(
-      sharesSiteWithBackend('https://portal.deneldental.com', 'https://denel-api.onrender.com', true)
+      sharesSiteWithBackend(
+        'https://portal.deneldental.com',
+        'https://denel-api.onrender.com',
+        true
+      )
     ).toBe(false)
   })
 

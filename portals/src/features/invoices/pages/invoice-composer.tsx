@@ -48,6 +48,7 @@ import {
 } from '@/shared/components/ui/table'
 import { VoidDocumentDialog } from '@/shared/components/void-document-dialog'
 import { formatCurrency, parseCurrency } from '@/shared/utils/currency'
+import { additionalUnitPriceOf } from '@/shared/utils/invoice-line-display'
 
 type LineForm = {
   description: string
@@ -363,6 +364,12 @@ export default function InvoiceComposerPage() {
                   <TableCell className="text-right">{l.quantity}</TableCell>
                   <TableCell className="text-right font-mono">
                     {formatCurrency(l.unitPrice)}
+                    {/* A first-unit / additional-unit line (G01) stores the first unit's price. */}
+                    {additionalUnitPriceOf(l) != null && (
+                      <div className="text-[10px] text-muted-foreground">
+                        then {formatCurrency(additionalUnitPriceOf(l) ?? 0)} each
+                      </div>
+                    )}
                   </TableCell>
                   <TableCell className="text-right font-mono">
                     {l.discountAmount > 0 ? formatCurrency(l.discountAmount) : '—'}

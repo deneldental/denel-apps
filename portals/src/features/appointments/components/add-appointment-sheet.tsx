@@ -288,6 +288,11 @@ export function AddAppointmentSheet({
                   ))}
                 </SelectContent>
               </Select>
+              {doctors.length === 0 && (
+                <p className="text-xs text-amber-600 dark:text-amber-400">
+                  No doctors set up yet — add one in Doctors → Add Specialist.
+                </p>
+              )}
               {selectedDoctorId &&
                 (() => {
                   const doc = doctors.find((d) => d.id === selectedDoctorId)
@@ -362,6 +367,11 @@ export function AddAppointmentSheet({
                   ))}
                 </SelectContent>
               </Select>
+              {appointmentTypes.length === 0 && (
+                <p className="text-xs text-amber-600 dark:text-amber-400">
+                  No appointment types set up yet — add them in Settings → Appointment Types.
+                </p>
+              )}
             </div>
 
             {/* Notes */}

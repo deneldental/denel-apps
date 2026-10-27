@@ -65,6 +65,9 @@ export const SYSTEM_ROLES: RoleDefinition[] = [
     bundleIds: [
       'bundle_dashboard',
       'bundle_clinical_doctor',
+      // Quote treatments: build, view and list estimates. Deliberately not
+      // bundle_payments_only — a doctor never needs payment history or refunds.
+      'bundle_estimates_manage',
       'bundle_services_propose',
       'bundle_labs_read',
       'bundle_items_read',
@@ -91,6 +94,9 @@ export const SYSTEM_ROLES: RoleDefinition[] = [
       // still lands as 'pending' for an admin to approve, per bundle_services_create.
       'bundle_services_create',
       'bundle_payments_only',
+      // Explicit, though payments:* already implies it through the hierarchy: the
+      // role's estimates access should not depend on a payments grant staying put.
+      'bundle_estimates_manage',
       // Front desk owns day-to-day stock: they add, correct, and remove items.
       // Every create/edit/delete is written to the audit log and rolled onto
       // that day's report by the 'inventory-changes' digest provider.

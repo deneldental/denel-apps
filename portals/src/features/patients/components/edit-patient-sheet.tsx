@@ -97,7 +97,8 @@ export function EditPatientSheet({
   const [occupation, setOccupation] = useState(patient.occupation || '')
   const [nationality, setNationality] = useState(patient.nationality || 'Ghana')
   const [tagCatalog, setTagCatalog] = useState<PatientTag[]>([])
-  const { companies: insuranceCompanies } = useInsuranceCompanies(open)
+  const { companies: insuranceCompanies, isLoading: insuranceCompaniesLoading } =
+    useInsuranceCompanies(open)
   // Read initial insurance from the patient record, it might be in `patient`?
   // We need to type cast or assume patient has `insuranceProvider` and `insurancePolicyNumber`
   // The Patient type from columns should probably have it.
@@ -226,13 +227,16 @@ export function EditPatientSheet({
     { invalidates: [queryKeys.patients.all] }
   )
 
+  // [Medium] Math.abs() used to flip a future DOB's negative time-since-epoch
+  // into a plausible-looking positive age instead of flagging the mistake. A
+  // future date now returns null (blank preview) instead of a wrong number.
   const calculateAge = (dobString: string) => {
     if (!dobString) return null
     const dobDate = parseLocalDate(dobString)
     const now = new Date()
     const diff = now.getTime() - dobDate.getTime()
-    const ageDate = new Date(diff)
-    return Math.abs(ageDate.getUTCFullYear() - 1970)
+    const ageYears = new Date(diff).getUTCFullYear() - 1970
+    return ageYears < 0 ? null : ageYears
   }
 
   async function handleSubmit() {
@@ -438,6 +442,7 @@ export function EditPatientSheet({
               <Input
                 id="edit-dob"
                 type="date"
+                max={localDateISO()}
                 value={dob}
                 onChange={(e) => setDob(e.target.value)}
               />
@@ -480,7 +485,11 @@ export function EditPatientSheet({
                     <Label>
                       Insurance Provider <span className="text-destructive">*</span>
                     </Label>
-                    <Select value={insuranceProvider} onValueChange={setInsuranceProvider}>
+                    <Select
+                      value={insuranceProvider}
+                      onValueChange={setInsuranceProvider}
+                      disabled={!insuranceCompaniesLoading && insuranceCompanies.length === 0}
+                    >
                       <SelectTrigger>
                         <SelectValue placeholder="Select provider" />
                       </SelectTrigger>
@@ -492,6 +501,13 @@ export function EditPatientSheet({
                         ))}
                       </SelectContent>
                     </Select>
+                    {/* [Medium] The dropdown used to just open empty with no
+                        explanation while marked required. */}
+                    {!insuranceCompaniesLoading && insuranceCompanies.length === 0 && (
+                      <p className="text-xs text-muted-foreground">
+                        No insurance providers configured yet — add one in Settings → Insurance.
+                      </p>
+                    )}
                   </div>
                   <div className="space-y-1.5">
                     <Label>

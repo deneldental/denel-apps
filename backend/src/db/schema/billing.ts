@@ -9,6 +9,7 @@ import {
   pgTable,
   text,
   timestamp,
+  uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core'
 
@@ -488,6 +489,35 @@ export const paymentConfirmations = pgTable('payment_confirmations', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 })
+
+// ── Payment-confirmation texts (0235, G08) ───────────────────────────────────
+// One row per payment event texted (a payment, or a group split across methods). The unique dedupe
+// key is claimed before the text is sent (`onConflictDoNothing`), so an event is texted at most
+// once however often it is posted or confirmed. See lib/payment-confirmation-sms.ts.
+export const paymentSmsSends = pgTable(
+  'payment_sms_sends',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    /** "payment:<id>" or "group:<paymentGroupId>". */
+    dedupeKey: text('dedupeKey').notNull(),
+    /** The payment whose posting sent it (the last of a group). */
+    paymentId: uuid('paymentId').references(() => payments.id, { onDelete: 'set null' }),
+    patientId: uuid('patientId')
+      .notNull()
+      .references(() => patients.id, { onDelete: 'cascade' }),
+    /** Cents: the committed total the text names. */
+    amount: integer('amount').notNull(),
+    /** 'sending' (claimed) | 'sent' | 'failed' */
+    status: text('status').default('sending').notNull(),
+    /** Why it failed, when it did. */
+    error: text('error'),
+    createdAt: timestamp('createdAt').defaultNow().notNull(),
+    sentAt: timestamp('sentAt'),
+  },
+  (t) => ({
+    dedupeKeyUniq: uniqueIndex('payment_sms_sends_dedupe_key_uniq').on(t.dedupeKey),
+  })
+)
 
 // ── Relations ─────────────────────────────────────────────────────────────────
 

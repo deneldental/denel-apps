@@ -23,6 +23,7 @@ import { resolveInsurerPrice } from '../lib/insurance-pricing-service'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
+import { type AccessRule, denyUnless } from '../lib/route-access'
 import { getServiceMatrix, nextServiceCode, resolveServicePrice } from '../lib/service-pricing'
 import { SALES_TAX_TYPES } from '../lib/service-tax'
 import type { HonoEnv } from '../lib/types'
@@ -31,10 +32,27 @@ export const servicesApp = new Hono<HonoEnv>()
 
 const MODULE = MODULES.SERVICES
 
+// The price lookups feed the estimate and checkout pickers, so they follow whoever works on those
+// screens as well as the catalogue's own grant (a doctor quoting an estimate holds no `services`
+// write rights). They are clinic-portal reads: the Team and HR apps have no use for them.
+const PRICE_READ: AccessRule = {
+  apps: ['portal'],
+  anyOf: [
+    [MODULES.SERVICES, ACTIONS.READ],
+    [MODULES.ESTIMATES, ACTIONS.READ],
+    [MODULES.PAYMENTS, ACTIONS.READ],
+    [MODULES.INSURANCE, ACTIONS.READ],
+    [MODULES.LABS, ACTIONS.READ],
+    [MODULES.XRAYS, ACTIONS.READ],
+  ],
+}
+
 // ── GET /api/services/lookup — price lookup for payment flow ─────────────────
 servicesApp.get('/lookup', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, PRICE_READ)
+  if (denied) return denied
 
   const db = getDb(process.env.DATABASE_URL!)
   const { serviceId, treatmentTypeId, xrayTypeId, labServiceId, insuranceCompanyId } = c.req.query()
@@ -395,13 +413,15 @@ servicesApp.get('/pending', async (c) => {
 })
 
 // ── Pricing matrix lookups (0167) ─────────────────────────────────────────────
-// Auth-only (like /lookup) so the estimate + checkout pickers can always resolve
-// scopes/classes/prices regardless of the caller's services-module grants.
+// Readable by anyone who works on an estimate or a checkout (see PRICE_READ) — not only by holders
+// of the services-module grant — so the pickers can always resolve scopes/classes/prices.
 
 // GET /api/services/scopes — application types/scopes (?all=1 = incl. inactive)
 servicesApp.get('/scopes', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, PRICE_READ)
+  if (denied) return denied
   const db = getDb(process.env.DATABASE_URL!)
   const includeInactive = c.req.query('all') === '1'
   // `?all=1` means "include INACTIVE". Retired rows need their own opt-in, so a
@@ -448,6 +468,9 @@ servicesApp.post('/scopes', async (c) => {
         displayName,
         quantityMode,
         maxQuantity,
+        // A type billed once has no further units to price differently.
+        additionalUnitPriceEnabled:
+          quantityMode === 'multi' && body.additionalUnitPriceEnabled === true,
         variantType,
         sortOrder: Number(body.sortOrder) || 0,
       })
@@ -471,6 +494,25 @@ servicesApp.patch('/scopes/:id', async (c) => {
   if (typeof body.displayName === 'string') patch.displayName = body.displayName.trim()
   if (body.quantityMode === 'single' || body.quantityMode === 'multi')
     patch.quantityMode = body.quantityMode
+  // The step-pricing switch only means something for a type billed per unit: refuse to turn it on
+  // for one that is (or is being made) billed once, and turn it off when a stepped type becomes one.
+  if (typeof body.additionalUnitPriceEnabled === 'boolean' || patch.quantityMode === 'single') {
+    const [current] = await db
+      .select({ quantityMode: applicationScopes.quantityMode })
+      .from(applicationScopes)
+      .where(eq(applicationScopes.id, id))
+    if (!current) return c.json({ error: 'Application type not found' }, 404)
+    const billedPerUnit = (patch.quantityMode ?? current.quantityMode) === 'multi'
+    if (body.additionalUnitPriceEnabled === true && !billedPerUnit) {
+      return c.json(
+        { error: 'Only a type billed per unit can price additional units differently' },
+        400
+      )
+    }
+    // On only when asked for (a type billed once was refused above); off when the edit makes the
+    // type billed once without mentioning the switch.
+    patch.additionalUnitPriceEnabled = body.additionalUnitPriceEnabled === true
+  }
   if (['none', 'plain', 'tooth_class'].includes(body.variantType))
     patch.variantType = body.variantType
   if ('maxQuantity' in body)
@@ -495,6 +537,8 @@ servicesApp.patch('/scopes/:id', async (c) => {
 servicesApp.get('/tooth-classes', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, PRICE_READ)
+  if (denied) return denied
   const db = getDb(process.env.DATABASE_URL!)
   const includeInactive = c.req.query('all') === '1'
   const includeDeleted = c.req.query('includeDeleted') === '1'
@@ -556,6 +600,8 @@ servicesApp.patch('/tooth-classes/:id', async (c) => {
 servicesApp.post('/resolve-price', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, PRICE_READ)
+  if (denied) return denied
   const db = getDb(process.env.DATABASE_URL!)
   const body = await c.req.json().catch(() => ({}))
   if (!body.serviceId) return c.json({ error: 'serviceId is required' }, 400)
@@ -579,6 +625,8 @@ servicesApp.post('/resolve-price', async (c) => {
 servicesApp.get('/taxes', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, PRICE_READ)
+  if (denied) return denied
   const db = getDb(process.env.DATABASE_URL!)
   const rows = await db
     .select({
@@ -754,6 +802,8 @@ servicesApp.put('/:id/doctors', async (c) => {
 servicesApp.get('/:id/prices', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, PRICE_READ)
+  if (denied) return denied
   const db = getDb(process.env.DATABASE_URL!)
   const id = c.req.param('id')
   try {
@@ -883,6 +933,7 @@ servicesApp.post('/', async (c) => {
     scopeId,
     priceMin,
     priceMax,
+    additionalUnitPrice,
     taxIds,
     variantsEnabled,
     priceRangeEnabled,
@@ -891,6 +942,15 @@ servicesApp.post('/', async (c) => {
 
   if (!category || !name || amount == null) {
     return c.json({ error: 'category, name, and amount are required' }, 400)
+  }
+  if (
+    additionalUnitPrice != null &&
+    !(Number.isInteger(additionalUnitPrice) && additionalUnitPrice >= 0)
+  ) {
+    return c.json(
+      { error: 'The additional-unit price must be a whole number of pesewas, 0 or more' },
+      400
+    )
   }
 
   const isAdmin = user.roleId === 'admin'
@@ -923,6 +983,7 @@ servicesApp.post('/', async (c) => {
         scopeId: scopeId ?? null,
         priceMin: priceMin ?? null,
         priceMax: priceMax ?? null,
+        additionalUnitPrice: additionalUnitPrice ?? null,
         taxIds: Array.isArray(taxIds) ? taxIds : [],
         variantsEnabled: variantsEnabled ?? false,
         priceRangeEnabled: priceRangeEnabled ?? false,
@@ -988,6 +1049,8 @@ const updateServiceSchema = z
     costPrice: z.number().finite().nullish(),
     priceMin: z.number().finite().nullish(),
     priceMax: z.number().finite().nullish(),
+    // First-unit / additional-unit tariff (0234): whole pesewas, 0 allowed, null clears it.
+    additionalUnitPrice: z.number().int().min(0).nullish(),
     variantsEnabled: z.boolean().optional(),
     priceRangeEnabled: z.boolean().optional(),
     // Approval state, NOT "sellable right now" (that's `isActive`). Admin-only
@@ -1037,6 +1100,7 @@ const CHANGE_REQUEST_FIELDS = [
   'costPrice',
   'priceMin',
   'priceMax',
+  'additionalUnitPrice',
   'variantsEnabled',
   'priceRangeEnabled',
 ] as const satisfies readonly Exclude<keyof ServiceUpdate, 'status'>[]

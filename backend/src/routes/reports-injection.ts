@@ -8,6 +8,7 @@ import { ACTIONS, MODULES, ROLES } from '../lib/modules'
 import { partitionByTags } from '../lib/patient-tags-query'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import { type PiiScopeMode, resolvePiiScope, scopePayloadPii } from '../lib/reports-injection-pii'
+import { denyUnless } from '../lib/route-access'
 import type { HonoEnv } from '../lib/types'
 
 const reportsInjectionApp = new Hono<HonoEnv>()
@@ -95,6 +96,14 @@ export async function buildSectionPayload(
 reportsInjectionApp.get('/', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, {
+    apps: ['portal'],
+    anyOf: [
+      [MODULES.DATA_INJECT, ACTIONS.READ],
+      [MODULES.REPORTS, ACTIONS.READ],
+    ],
+  })
+  if (denied) return denied
 
   const db = getDb(process.env.DATABASE_URL!)
   const rows = await db

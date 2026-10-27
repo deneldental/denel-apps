@@ -45,6 +45,12 @@ export interface PlanLine {
   doctorId: string | null
   /** null = use the doctor's default at billing time (or 0 for internal). */
   commissionRate: number | null
+  /**
+   * What the line was billed at on the estimate it came from (its `lineTotal`), when it came from
+   * one. Such a line is not priced again here: unit price × quantity would drop its surcharge, its
+   * discount, its tax and a first-unit / additional-unit step, and disagree with the invoice.
+   */
+  billedTotal?: number
 }
 
 export interface PlanLineTotals {
@@ -93,6 +99,9 @@ function computeLineTotal(line: PlanLine): {
   discount: number
   total: number
 } {
+  if (line.billedTotal != null) {
+    return { subtotal: line.billedTotal, discount: 0, total: line.billedTotal }
+  }
   const subtotal = line.quantity * line.unitPrice
   let discount = 0
   if (line.discountType === 'percent') discount = Math.round((subtotal * line.discountValue) / 100)

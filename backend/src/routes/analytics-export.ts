@@ -3,6 +3,7 @@ import puppeteer, { type Browser, type CookieData } from 'puppeteer'
 import { logAnalyticsAccess } from '../lib/analytics-audit'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
+import { portalUrl } from '../lib/public-urls'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import type { HonoEnv } from '../lib/types'
 
@@ -32,8 +33,12 @@ analyticsExportApp.get('/export-pdf', async (c) => {
     return c.json({ error: 'Unauthorized' }, 403)
   }
 
-  const portalUrl = process.env.PORTAL_URL || 'http://localhost:5173'
-  if (!portalUrl) {
+  // The print view is a page of the clinic portal. A deployed backend always has PORTAL_URL (it
+  // refuses to start without it); the check stays so a misconfigured one answers plainly.
+  let portalBase: string
+  try {
+    portalBase = portalUrl()
+  } catch {
     return c.json(
       { error: 'PDF export not configured — PORTAL_URL is not set on the backend.' },
       500
@@ -45,7 +50,7 @@ analyticsExportApp.get('/export-pdf', async (c) => {
     return c.json({ error: 'Missing session cookie — cannot render print view.' }, 400)
   }
 
-  const url = new URL('/analytics/print', portalUrl)
+  const url = new URL('/analytics/print', portalBase)
   // Carry the period control params through to the print page so it can
   // restore the same window the user picked.
   for (const key of ['granularity', 'from', 'to', 'label', 'year', 'month', 'quarter']) {
@@ -75,7 +80,7 @@ analyticsExportApp.get('/export-pdf', async (c) => {
     // API calls succeed. Bind each cookie to both origins — the API origin so
     // the cross-fetch carries the session, and the portal origin so the SPA
     // can read csrf from document.cookie before sending it as a header.
-    const cookies = parseCookieHeader(incomingCookie, [portalUrl, process.env.BETTER_AUTH_URL])
+    const cookies = parseCookieHeader(incomingCookie, [portalBase, process.env.BETTER_AUTH_URL])
     if (cookies.length > 0) {
       await browser.setCookie(...cookies)
     }

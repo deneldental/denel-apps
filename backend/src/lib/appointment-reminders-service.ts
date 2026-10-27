@@ -1,3 +1,4 @@
+import { CLINIC_TIME_ZONE } from '@denel/utils'
 import { and, eq, isNull } from 'drizzle-orm'
 import { appointmentTypeReminders, patients, scheduledReminders } from '../db/schema'
 import { resolveAppointmentTypeId } from './appointment-type-matching'
@@ -56,8 +57,8 @@ export async function handleOnBookingReminders(db: any, appointment: any, userId
           if (!policy.template) continue
 
           const smsTemplate = policy.template.messageTemplate
-          const formattedDate = apptDate.toLocaleDateString()
-          const formattedTime = apptDate.toLocaleTimeString()
+          const formattedDate = apptDate.toLocaleDateString('en-GH', { timeZone: CLINIC_TIME_ZONE })
+          const formattedTime = apptDate.toLocaleTimeString('en-GH', { timeZone: CLINIC_TIME_ZONE })
 
           const message = smsTemplate
             .replace(/{Patientname}/gi, patient.name || 'Patient')

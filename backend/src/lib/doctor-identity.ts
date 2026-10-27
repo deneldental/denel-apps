@@ -58,6 +58,32 @@ export async function resolveDoctorForUser(db: DB, userId: string): Promise<Reso
   return { id: viaSpecialist.id, specialty: viaSpecialist.specialty ?? null, via: 'specialist' }
 }
 
+/**
+ * The reverse question: which login account is behind this doctor row? Either
+ * linkage shape (see above), or null when the row has no account.
+ *
+ * Used to answer "whose estimates are these?" when an admin views one doctor's
+ * day-sheet — estimates record the creating *user*, not the doctor row.
+ */
+export async function resolveLoginUserIdForDoctor(
+  db: DB,
+  doctorId: string
+): Promise<string | null> {
+  const doctor = await db.query.doctors.findFirst({
+    where: eq(doctors.id, doctorId),
+    columns: { userId: true, specialistId: true },
+  })
+  if (!doctor) return null
+  if (doctor.userId) return doctor.userId
+  if (!doctor.specialistId) return null
+
+  const specialist = await db.query.specialists.findFirst({
+    where: eq(specialists.id, doctor.specialistId),
+    columns: { userId: true },
+  })
+  return specialist?.userId ?? null
+}
+
 /** Convenience wrapper for callers that only need the id. */
 export async function resolveDoctorIdForUser(db: DB, userId: string): Promise<string | null> {
   return (await resolveDoctorForUser(db, userId))?.id ?? null

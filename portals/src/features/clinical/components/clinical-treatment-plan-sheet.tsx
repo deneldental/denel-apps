@@ -6,6 +6,7 @@ import { toast } from 'sonner'
 import { CreateEstimateSheet } from '@/features/activity/components/create-estimate-sheet'
 import { useToothNotation } from '@/features/clinical/use-clinical-preferences'
 import { api } from '@/lib/api-client'
+import { useCan } from '@/lib/permissions-context'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/shared/components/ui/badge'
 import { Button } from '@/shared/components/ui/button'
@@ -159,6 +160,8 @@ export function ClinicalTreatmentPlanSheet({
   const [updatingPlanStatus, setUpdatingPlanStatus] = useState(false)
   const [updatingItemId, setUpdatingItemId] = useState<string | null>(null)
   const [showSupplemental, setShowSupplemental] = useState(false)
+  // F38: a supplemental estimate needs the same permission the server checks.
+  const canCreateEstimate = useCan('estimates', 'create')
   const [selectedStatus, setSelectedStatus] = useState<string>('created')
   const [saving, setSaving] = useState(false)
 
@@ -445,17 +448,19 @@ export function ClinicalTreatmentPlanSheet({
                 </div>
               )}
 
-              <div className="pt-2">
-                <Button
-                  variant="outline"
-                  className="w-full border-dashed"
-                  disabled={isAnyMutating}
-                  onClick={() => setShowSupplemental(true)}
-                >
-                  <Plus className="h-4 w-4 mr-2" />
-                  Create Supplemental Estimate
-                </Button>
-              </div>
+              {canCreateEstimate && (
+                <div className="pt-2">
+                  <Button
+                    variant="outline"
+                    className="w-full border-dashed"
+                    disabled={isAnyMutating}
+                    onClick={() => setShowSupplemental(true)}
+                  >
+                    <Plus className="h-4 w-4 mr-2" />
+                    Create Supplemental Estimate
+                  </Button>
+                </div>
+              )}
 
               {showSupplemental && (
                 <CreateEstimateSheet

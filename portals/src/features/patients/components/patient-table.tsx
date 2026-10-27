@@ -10,22 +10,23 @@ import {
   useReactTable,
   type VisibilityState,
 } from '@tanstack/react-table'
-import { Eye, MoreHorizontal, Pencil, Search, Trash2 } from 'lucide-react'
+import { Archive, ArchiveRestore, Eye, MoreHorizontal, Pencil, Search, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
+import { ArchiveConfirmationDialog } from '@/features/patients/components/archive-confirmation-dialog'
 import { EditPatientSheet } from '@/features/patients/components/edit-patient-sheet'
 import { TagPills, tagVariantClass } from '@/features/patients/components/tag-pills'
 import type { PatientTag } from '@/lib/actions/patient-tags'
 import type { PatientTagCount } from '@/lib/actions/patients'
-import { deletePatient } from '@/lib/actions/patients'
+import { archivePatient, permanentlyDeletePatient, unarchivePatient } from '@/lib/actions/patients'
 import { useCan } from '@/lib/permissions-context'
 import { cn } from '@/lib/utils'
 import { DataTableColumnHeader } from '@/shared/components/data-table/data-table-column-header'
 import { DataTablePagination } from '@/shared/components/data-table/data-table-pagination'
+import { AdminPasswordDialog } from '@/shared/components/ui/admin-password-dialog'
 import { Badge } from '@/shared/components/ui/badge'
 import { Button } from '@/shared/components/ui/button'
-import { DeleteConfirmationDialog } from '@/shared/components/ui/delete-confirmation-dialog'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -72,13 +73,28 @@ export type PatientRow = {
 
 // ─── Actions cell ─────────────────────────────────────────────────────────────
 
-function PatientActions({ patient, onReload }: { patient: PatientRow; onReload?: () => void }) {
+function PatientActions({
+  patient,
+  onReload,
+  view,
+  isAdmin,
+}: {
+  patient: PatientRow
+  onReload?: () => void
+  view: 'active' | 'archived'
+  isAdmin: boolean
+}) {
   const navigate = useNavigate()
-  // Deleting a patient record is withheld from the front desk (see
-  // bundle_clinical_full). Gate on the permission rather than the role id so the
-  // menu always matches what the API will actually allow.
+  // Archiving/restoring a patient record is withheld from the front desk (see
+  // bundle_clinical_full). Gate on the permission rather than the role id so
+  // the menu always matches what the API will actually allow.
   const canDelete = useCan('patients', 'delete')
-  const [showDelete, setShowDelete] = useState(false)
+  // H5 — Edit had no permission check at all (only Delete/Archive did),
+  // unlike the equivalent button on the Patient Detail page, which correctly
+  // checks patients:update.
+  const canUpdate = useCan('patients', 'update')
+  const [showArchive, setShowArchive] = useState(false)
+  const [showPermanentDelete, setShowPermanentDelete] = useState(false)
   const [showEdit, setShowEdit] = useState(false)
   // D9 — a 25-row page used to mount 25 full <EditPatientSheet>es (and fire 25
   // insurance-company fetches) just to draw the table. Latch on first open so
@@ -87,14 +103,32 @@ function PatientActions({ patient, onReload }: { patient: PatientRow; onReload?:
   // lets the dirty-guard hold the sheet open when it needs to.
   const [editMounted, setEditMounted] = useState(false)
 
-  const handleDelete = async () => {
-    const result = await deletePatient(patient.id)
+  const handleArchive = async () => {
+    const result = await archivePatient(patient.id)
     if (result.success) {
-      toast.success('Patient deleted')
+      toast.success('Patient archived')
       if (onReload) onReload()
     } else {
-      toast.error(result.error || 'Failed to delete patient')
+      toast.error(result.error || 'Failed to archive patient')
+      throw new Error(result.error || 'Failed to archive patient')
     }
+  }
+
+  const handleRestore = async () => {
+    const result = await unarchivePatient(patient.id)
+    if (result.success) {
+      toast.success('Patient restored')
+      if (onReload) onReload()
+    } else {
+      toast.error(result.error || 'Failed to restore patient')
+    }
+  }
+
+  const handlePermanentDelete = async (password: string) => {
+    const result = await permanentlyDeletePatient(patient.id, password)
+    if (!result.success) throw new Error(result.error || 'Failed to delete patient')
+    toast.success('Patient permanently deleted')
+    if (onReload) onReload()
   }
 
   return (
@@ -116,29 +150,57 @@ function PatientActions({ patient, onReload }: { patient: PatientRow; onReload?:
             <Eye className="mr-2 h-4 w-4" />
             View
           </DropdownMenuItem>
-          <DropdownMenuItem
-            onClick={(e) => {
-              e.stopPropagation()
-              setEditMounted(true)
-              setShowEdit(true)
-            }}
-          >
-            <Pencil className="mr-2 h-4 w-4" />
-            Edit
-          </DropdownMenuItem>
-          {canDelete && (
+          {view === 'active' && canUpdate && (
+            <DropdownMenuItem
+              onClick={(e) => {
+                e.stopPropagation()
+                setEditMounted(true)
+                setShowEdit(true)
+              }}
+            >
+              <Pencil className="mr-2 h-4 w-4" />
+              Edit
+            </DropdownMenuItem>
+          )}
+          {canDelete && view === 'active' && (
             <>
               <DropdownMenuSeparator />
               <DropdownMenuItem
                 onClick={(e) => {
                   e.stopPropagation()
-                  setShowDelete(true)
+                  setShowArchive(true)
                 }}
                 className="text-destructive"
               >
-                <Trash2 className="mr-2 h-4 w-4" />
-                Delete
+                <Archive className="mr-2 h-4 w-4" />
+                Archive
               </DropdownMenuItem>
+            </>
+          )}
+          {canDelete && view === 'archived' && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={(e) => {
+                  e.stopPropagation()
+                  handleRestore()
+                }}
+              >
+                <ArchiveRestore className="mr-2 h-4 w-4" />
+                Restore
+              </DropdownMenuItem>
+              {isAdmin && (
+                <DropdownMenuItem
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setShowPermanentDelete(true)
+                  }}
+                  className="text-destructive"
+                >
+                  <Trash2 className="mr-2 h-4 w-4" />
+                  Permanently delete
+                </DropdownMenuItem>
+              )}
             </>
           )}
         </DropdownMenuContent>
@@ -152,12 +214,20 @@ function PatientActions({ patient, onReload }: { patient: PatientRow; onReload?:
           onCreated={onReload}
         />
       )}
-      <DeleteConfirmationDialog
-        open={showDelete}
-        onOpenChange={setShowDelete}
-        onConfirm={handleDelete}
-        title="Delete Patient"
-        description="Are you sure you want to delete this patient? This action cannot be undone."
+      <ArchiveConfirmationDialog
+        open={showArchive}
+        onOpenChange={setShowArchive}
+        onConfirm={handleArchive}
+        title="Archive Patient"
+        description="The patient moves to the Archived tab and stops appearing in the active list, pickers and reports. All history is kept."
+        itemName={patient.name}
+      />
+      <AdminPasswordDialog
+        open={showPermanentDelete}
+        onOpenChange={setShowPermanentDelete}
+        onConfirm={handlePermanentDelete}
+        title="Permanently Delete Patient"
+        description="This wipes the patient record and every appointment, invoice, payment and medical record tied to it. This cannot be undone."
         itemName={patient.name}
       />
     </>
@@ -166,7 +236,11 @@ function PatientActions({ patient, onReload }: { patient: PatientRow; onReload?:
 
 // ─── Column definitions ───────────────────────────────────────────────────────
 
-function buildColumns(onReload?: () => void): ColumnDef<PatientRow>[] {
+function buildColumns(
+  onReload: (() => void) | undefined,
+  view: 'active' | 'archived',
+  isAdmin: boolean
+): ColumnDef<PatientRow>[] {
   const cols: ColumnDef<PatientRow>[] = [
     {
       accessorKey: 'patientId',
@@ -247,7 +321,9 @@ function buildColumns(onReload?: () => void): ColumnDef<PatientRow>[] {
 
   cols.push({
     id: 'actions',
-    cell: ({ row }) => <PatientActions patient={row.original} onReload={onReload} />,
+    cell: ({ row }) => (
+      <PatientActions patient={row.original} onReload={onReload} view={view} isAdmin={isAdmin} />
+    ),
   })
 
   return cols
@@ -275,6 +351,11 @@ interface PatientTableProps {
   tagIds?: string[]
   onTagIdsChange?: (ids: string[]) => void
   tagCounts?: PatientTagCount[]
+  // C5 — 'active' shows Edit/Archive; 'archived' shows Restore/Permanently
+  // delete. Defaults to 'active' so every other caller of this table is
+  // unaffected.
+  view?: 'active' | 'archived'
+  isAdmin?: boolean
 }
 
 export function PatientTable({
@@ -294,6 +375,8 @@ export function PatientTable({
   tagIds,
   onTagIdsChange,
   tagCounts,
+  view = 'active',
+  isAdmin = false,
 }: PatientTableProps) {
   const navigate = useNavigate()
   const [internalFilter, setInternalFilter] = useState('')
@@ -316,7 +399,7 @@ export function PatientTable({
     )
   }
 
-  const columns = buildColumns(onReload)
+  const columns = buildColumns(onReload, view, isAdmin)
   const isControlledFilter = onGlobalFilterChange !== undefined
   const filterValue = isControlledFilter ? (globalFilterProp ?? '') : internalFilter
 
@@ -366,7 +449,11 @@ export function PatientTable({
         },
   })
 
-  const emptyMessage = loading ? 'Loading patients…' : 'No patients found.'
+  const emptyMessage = loading
+    ? 'Loading patients…'
+    : view === 'archived'
+      ? 'No archived patients.'
+      : 'No patients found.'
 
   return (
     <div className="space-y-4">

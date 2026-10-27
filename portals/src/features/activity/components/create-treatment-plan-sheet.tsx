@@ -1,4 +1,4 @@
-import { Loader2, Plus, Trash2 } from 'lucide-react'
+import { AlertTriangle, Loader2, Plus, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { useToothNotation } from '@/features/clinical/use-clinical-preferences'
@@ -15,16 +15,31 @@ import {
   SelectValue,
 } from '@/shared/components/ui/select'
 import { useSubmitGuard } from '@/shared/hooks/use-submit-guard'
+import { centsToInput, inputToCents } from '@/shared/utils/currency'
 import { ghs } from './shared'
 
 type DraftItem = {
   uid: string
   serviceId?: string | null
+  /**
+   * The estimate line this procedure was seeded from. Its price is the quoted
+   * `estimatedCost` (cents) and cannot be edited: the server prices it from the
+   * estimate (decision D12). Null for a procedure added by hand.
+   */
+  sourceLineId: string | null
   procedureName: string
   toothNumber: number | null
   phase: number
+  /** Integer CENTS — the quoted line total for a seeded procedure. */
   estimatedCost: number
+  /** What the user typed in the Cost (GHS) field, in cedis, for a hand-added procedure. */
+  costInput: string
   notes: string
+}
+
+/** The procedure's cost in cents: the quote for a seeded line, the typed cedis otherwise. */
+function itemCents(it: DraftItem): number {
+  return it.sourceLineId ? it.estimatedCost : inputToCents(it.costInput)
 }
 
 type EstimateLine = {
@@ -59,10 +74,12 @@ function emptyItem(): DraftItem {
   return {
     uid: crypto.randomUUID(),
     serviceId: null,
+    sourceLineId: null,
     procedureName: '',
     toothNumber: null,
     phase: 1,
     estimatedCost: 0,
+    costInput: '',
     notes: '',
   }
 }
@@ -80,6 +97,10 @@ export function CreateTreatmentPlanSheet({
   const [items, setItems] = useState<DraftItem[]>([])
   const { toothLabel } = useToothNotation()
   const [loading, setLoading] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  // Set only once the estimate has loaded: a plan built by hand after a failed load
+  // must not claim to come from it.
+  const [seededFrom, setSeededFrom] = useState<string | null>(null)
   const { isSubmitting, submit } = useSubmitGuard()
 
   useEffect(() => {
@@ -87,39 +108,57 @@ export function CreateTreatmentPlanSheet({
     setTitle('')
     setNotes('')
     setItems([])
+    setLoadError(null)
+    setSeededFrom(null)
 
     if (!estimateInvoiceId) {
       setLoading(false)
       return
     }
 
+    // Seed from the clinical estimate endpoint (a doctor may call it; the invoice
+    // endpoint needs payment access and used to fail here with no explanation).
+    // A response that arrives after the sheet closed or switched estimate is stale.
+    let current = true
     setLoading(true)
     api
       .get<{ invoiceNumber?: string | null; lines?: EstimateLine[] }>(
-        `/api/invoices/${estimateInvoiceId}`
+        `/api/estimates/${estimateInvoiceId}`
       )
       .then((res) => {
+        if (!current) return
         setLoading(false)
-        if (!res.success || !res.data) return
+        if (!res.success || !res.data) {
+          setLoadError(res.error || 'Please try again.')
+          return
+        }
         const inv = res.data
         const seeded = (inv.lines || []).map((l) => ({
           uid: crypto.randomUUID(),
           serviceId: l.serviceId ?? null,
+          sourceLineId: l.id ?? null,
           procedureName: l.description || l.serviceName || '',
           toothNumber: l.toothNumber ?? null,
           phase: l.phase ?? 1,
           estimatedCost: Number(l.lineTotal) || 0,
+          costInput: centsToInput(l.lineTotal),
           notes: l.notes ?? '',
         }))
         setItems(seeded)
+        setSeededFrom(estimateInvoiceId)
         setTitle(inv.invoiceNumber ? `Plan from ${inv.invoiceNumber}` : 'Treatment plan')
       })
+      .catch((err: unknown) => {
+        if (!current) return
+        setLoading(false)
+        setLoadError(err instanceof Error && err.message ? err.message : 'Please try again.')
+      })
+    return () => {
+      current = false
+    }
   }, [open, estimateInvoiceId])
 
-  const total = useMemo(
-    () => items.reduce((s, i) => s + (Number(i.estimatedCost) || 0), 0),
-    [items]
-  )
+  const total = useMemo(() => items.reduce((s, i) => s + itemCents(i), 0), [items])
 
   function addItem() {
     setItems((prev) => [...prev, emptyItem()])
@@ -152,12 +191,17 @@ export function CreateTreatmentPlanSheet({
         patientId,
         title: title.trim(),
         notes: notes.trim() || null,
+        // D12: the server prices each seeded procedure from this estimate's line.
+        ...(seededFrom ? { sourceInvoiceId: seededFrom } : {}),
         items: items.map((it) => ({
           serviceId: it.serviceId,
+          sourceLineId: it.sourceLineId,
           procedureName: it.procedureName.trim(),
           toothNumber: it.toothNumber,
           phase: it.phase,
-          estimatedCost: Number(it.estimatedCost) || 0,
+          // Integer cents. A typed cost is in cedis (F37: it used to be posted as typed,
+          // so "120" became GH₵1.20).
+          estimatedCost: itemCents(it),
           notes: it.notes.trim() || null,
         })),
       }
@@ -192,6 +236,20 @@ export function CreateTreatmentPlanSheet({
           </div>
         ) : (
           <>
+            {loadError && (
+              <div
+                role="alert"
+                className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm"
+              >
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+                <div>
+                  <p className="font-medium">Could not load the estimate.</p>
+                  <p className="text-xs text-muted-foreground">
+                    {loadError} You can still add the procedures by hand.
+                  </p>
+                </div>
+              </div>
+            )}
             <div className="space-y-1.5">
               <Label htmlFor="plan-title">Title</Label>
               <Input
@@ -283,16 +341,32 @@ export function CreateTreatmentPlanSheet({
                           </Select>
                         </div>
                         <div className="col-span-4 md:col-span-2">
-                          <Label className="text-xs">Cost (GHS)</Label>
-                          <Input
-                            type="number"
-                            min={0}
-                            step="0.01"
-                            value={it.estimatedCost}
-                            onChange={(e) =>
-                              updateItem(it.uid, { estimatedCost: parseFloat(e.target.value) || 0 })
-                            }
-                          />
+                          <Label htmlFor={`plan-cost-${it.uid}`} className="text-xs">
+                            Cost (GHS)
+                          </Label>
+                          {it.sourceLineId ? (
+                            <>
+                              <Input
+                                id={`plan-cost-${it.uid}`}
+                                type="number"
+                                value={centsToInput(it.estimatedCost)}
+                                disabled
+                                readOnly
+                              />
+                              <p className="mt-1 text-[10px] text-muted-foreground">
+                                Quoted on the estimate
+                              </p>
+                            </>
+                          ) : (
+                            <Input
+                              id={`plan-cost-${it.uid}`}
+                              type="number"
+                              min={0}
+                              step="0.01"
+                              value={it.costInput}
+                              onChange={(e) => updateItem(it.uid, { costInput: e.target.value })}
+                            />
+                          )}
                         </div>
                         <div className="col-span-12 md:col-span-1 flex items-end">
                           <Button

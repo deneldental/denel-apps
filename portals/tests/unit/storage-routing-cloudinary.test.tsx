@@ -48,10 +48,15 @@ describe('Storage routing and Cloudinary', () => {
   it('does not let a category be routed to Cloudinary, even when configured', async () => {
     const user = userEvent.setup()
     renderWithRouter(<StorageRoutingCard />)
-    await waitFor(() => expect(screen.getAllByRole('combobox')[0]).toBeEnabled())
+    // The first render in a shared test process pays for importing the card and its
+    // Radix parts, which can exceed the 1s default under load (this test failed
+    // every full run while passing alone). Wait for the load, not for a guess.
+    await waitFor(() => expect(screen.getAllByRole('combobox')[0]).toBeEnabled(), {
+      timeout: 15_000,
+    })
 
     await user.click(screen.getAllByRole('combobox')[0])
-    const option = await screen.findByRole('option', { name: /cloudinary/i })
+    const option = await screen.findByRole('option', { name: /cloudinary/i }, { timeout: 5_000 })
 
     expect(option).toHaveAttribute('data-disabled')
     expect(option.textContent).toMatch(/can't store private files/i)

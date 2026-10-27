@@ -41,7 +41,7 @@ vi.mock('../../src/lib/integrations', () => ({
   getHubtelConfig: vi.fn(async () => state.card),
 }))
 
-import { getCurrentUser } from '../../src/lib/rbac'
+import { checkPermission, getCurrentUser } from '../../src/lib/rbac'
 import { smsApp } from '../../src/routes/sms'
 
 const CARD: HubtelCard = { clientId: 'card-id', clientSecret: 'card-secret', senderId: 'Denel' }
@@ -96,6 +96,9 @@ beforeEach(() => {
     role: 'admin',
     roleId: 'admin',
   } as never)
+  // This file is about WHICH Hubtel account is asked, not who may ask (that is
+  // routes/sms-log-access.test.ts), so the caller holds messaging:read.
+  vi.mocked(checkPermission).mockResolvedValue(true)
   setEnvKeys(undefined, undefined)
 })
 

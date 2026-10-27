@@ -4,6 +4,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { deleteUnavailability } from '@/lib/actions/doctor-availability'
+import { useCan } from '@/lib/permissions-context'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -51,6 +52,9 @@ export function UnavailabilityDetailDialog({
   onReload,
 }: UnavailabilityDetailDialogProps) {
   const navigate = useNavigate()
+  // H5 — this button had no permission check at all; the backend requires
+  // appointments:delete (`DELETE /api/doctors/unavailability/:id`).
+  const canDelete = useCan('appointments', 'delete')
   const [isDeleting, setIsDeleting] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
 
@@ -142,14 +146,16 @@ export function UnavailabilityDetailDialog({
             <Button variant="outline" onClick={() => onOpenChange(false)}>
               Close
             </Button>
-            <Button
-              variant="destructive"
-              onClick={() => setShowDeleteConfirm(true)}
-              disabled={isDeleting}
-            >
-              <Trash2 className="mr-2 h-4 w-4" />
-              Remove Block
-            </Button>
+            {canDelete && (
+              <Button
+                variant="destructive"
+                onClick={() => setShowDeleteConfirm(true)}
+                disabled={isDeleting}
+              >
+                <Trash2 className="mr-2 h-4 w-4" />
+                Remove Block
+              </Button>
+            )}
           </div>
         </DialogContent>
       </Dialog>

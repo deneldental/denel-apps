@@ -20,11 +20,12 @@
  * authenticated `/:id` routes).
  */
 
+import { HR_ASSIGNABLE_ROLES, roleSignsInWithPassword } from '@denel/rbac'
 import { deriveBirthDayMonth, registrationSubmitSchema } from '@denel/types'
-import { and, desc, eq, isNull, sql } from 'drizzle-orm'
+import { and, desc, eq, isNull, ne, sql } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { env, isDevEnvironment } from '../config/env'
-import { getDb } from '../db'
+import { type DB, getDb } from '../db'
 import {
   account,
   attendanceEvents,
@@ -43,9 +44,14 @@ import { getBranding } from '../lib/branding'
 import { DEFAULT_EMPLOYMENT_TYPE, resolveEmploymentType } from '../lib/employment-type'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
+import { normalizeEmail } from '../lib/normalize-email'
+import { hashOtp, timingSafeEqualHex } from '../lib/otp-hash'
 import { hashPassword } from '../lib/password'
+import { checkPasswordPolicy } from '../lib/password-policy'
+import { uniqueViolationOf } from '../lib/pg-errors'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import { sendSMS } from '../lib/sms'
+import { nextStaffId } from '../lib/staff-id'
 import { syncPersonalChildRecords } from '../lib/staff-personal-sync'
 import { uploadToCategory } from '../lib/storage-router'
 import type { HonoEnv } from '../lib/types'
@@ -55,15 +61,26 @@ const app = new Hono<HonoEnv>()
 
 const MODULE = MODULES.STAFF as string
 
-// Roles assignable to a staff member — mirrors VALID_STAFF_ROLES in
-// access-management.ts (the canonical role writer). RBAC permissions resolve off
+// Roles assignable to a staff member on approval. RBAC permissions resolve off
 // `user.roleId`, so approval must set that (not just the Better-Auth `role`).
+//
+// Deliberately WIDER than VALID_STAFF_ROLES in access-management.ts, which
+// excludes 'doctor'/'external_trainer' because that endpoint only ever writes
+// user.role/roleId. This endpoint is safe to include them: the approval
+// handler below creates the linked `specialists` row in the SAME request when
+// `isClinicalPractitioner` is set (see "Clinical practitioner → also create
+// the specialists row" further down) — so role and specialist-linkage are set
+// together, not independently, avoiding the desync that endpoint has. The
+// admin-review UI (hr/…/registrations-panel.tsx) does not yet auto-link the
+// two — picking role='doctor' without also flipping the Clinical practitioner
+// switch still produces an unbooked doctor. Flagged, not yet fixed.
 const VALID_STAFF_ROLES = new Set([
   'admin',
   'doctor',
   'receptionist',
   'lab_technician',
   'external_trainer',
+  'hr_admin',
   'staff',
 ])
 
@@ -94,23 +111,12 @@ function generateNumericCode(length: number): string {
   return digits.join('')
 }
 
-async function sha256Hex(raw: string): Promise<string> {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw))
-  return Array.from(new Uint8Array(buf))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-}
-
-/** Next Staff ID in format FDM-S0001 (uses MAX so it's safe after deletions). */
-async function generateStaffId(db: ReturnType<typeof getDb>): Promise<string> {
-  const [result] = await db
-    .select({
-      maxNum: sql<number>`max(cast(regexp_replace("staffId", '[^0-9]', '', 'g') as int))`,
-    })
-    .from(staff)
-  const next = (result?.maxNum ?? 0) + 1
-  return `FDM-S${String(next).padStart(4, '0')}`
-}
+/**
+ * Thrown inside the approval transaction when the registration is no longer waiting for review:
+ * someone approved or rejected it between the moment this request read it and the moment it took
+ * the row lock.
+ */
+class RegistrationNotOpen extends Error {}
 
 // Lazy so we never read the env proxy at module-eval time — the route module is
 // imported before validateBackendEnv() runs, and the proxy throws until then.
@@ -390,7 +396,8 @@ app.post('/public/:token/send-otp', async (c) => {
     }
 
     const code = generateNumericCode(6)
-    const otpHash = await sha256Hex(code)
+    // Keyed (F30): a bare SHA-256 of a six-digit code is recovered by trying all of them.
+    const otpHash = await hashOtp(code, 'staff_registration')
     const otpExpiresAt = new Date(Date.now() + OTP_TTL_MS)
 
     await db
@@ -404,6 +411,7 @@ app.post('/public/:token/send-otp', async (c) => {
       {
         phone,
         message: `${brandShort}: your staff registration code is ${code}. Valid for 10 minutes.`,
+        sensitive: true,
       },
     ])
 
@@ -449,8 +457,8 @@ app.post('/public/:token/verify-otp', async (c) => {
     if (inv.otpAttempts >= OTP_MAX_ATTEMPTS)
       return c.json({ error: 'Too many wrong attempts. Request a new code.' }, 429)
 
-    const candidate = await sha256Hex(code)
-    if (candidate !== inv.otpHash) {
+    const candidate = await hashOtp(code, 'staff_registration')
+    if (!timingSafeEqualHex(candidate, inv.otpHash)) {
       await db
         .update(staffRegistrationInvites)
         .set({ otpAttempts: inv.otpAttempts + 1, updatedAt: new Date() })
@@ -617,7 +625,7 @@ app.post('/invites/:id/reject', async (c) => {
     if (inv.status === 'approved')
       return c.json({ error: 'Already approved — cannot reject.' }, 409)
 
-    await db
+    const rejected = await db
       .update(staffRegistrationInvites)
       .set({
         status: 'rejected',
@@ -626,7 +634,13 @@ app.post('/invites/:id/reject', async (c) => {
         reviewedAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(staffRegistrationInvites.id, id))
+      // The status was read above, so an approval can land before this write; it wins, because by
+      // then the account exists. The condition is checked again once the approval has committed.
+      .where(
+        and(eq(staffRegistrationInvites.id, id), ne(staffRegistrationInvites.status, 'approved'))
+      )
+      .returning({ id: staffRegistrationInvites.id })
+    if (rejected.length === 0) return c.json({ error: 'Already approved — cannot reject.' }, 409)
 
     return c.json({ success: true })
   } catch (error) {
@@ -647,7 +661,6 @@ app.post('/invites/:id/approve', async (c) => {
 
   const db = getDb(process.env.DATABASE_URL!)
   const id = c.req.param('id')
-  let createdUserId: string | null = null
 
   try {
     const admin = (await c.req.json().catch(() => ({}))) as {
@@ -668,11 +681,51 @@ app.post('/invites/:id/approve', async (c) => {
       salaryBand?: string
       role?: string
       scopes?: string[]
+      /**
+       * The person's first password. Required when the role (or an explicit scope grant) signs
+       * in to the portal or the HR app, which use e-mail + password; ignored otherwise, because
+       * the Team app is phone + SMS code (D16).
+       */
+      initialPassword?: string
       specialist?: {
         defaultCommissionRate?: number | string
         withholdingTaxRate?: number | string
         payoutMethod?: string
         tin?: string
+      }
+    }
+
+    // The reviewer picks the role, and this route needs only the HR permission, so an HR
+    // administrator could approve a registration as an ADMINISTRATOR and create the top
+    // account (F51). Role authority is the same as everywhere else (D15): someone who can
+    // assign any role (`access_management:update`, i.e. an administrator) may; anyone else
+    // approves only the everyday roles and grants no portal or HR access as an exception.
+    const hasFullRoleAuthority = await checkPermission(
+      c,
+      authUser.id,
+      MODULES.ACCESS_MANAGEMENT as string,
+      ACTIONS.UPDATE as string
+    )
+    if (!hasFullRoleAuthority) {
+      const asked = typeof admin.role === 'string' && admin.role !== '' ? admin.role : null
+      if (asked !== null && !HR_ASSIGNABLE_ROLES.includes(asked)) {
+        return c.json(
+          {
+            error:
+              'Only an administrator can approve a registration with that role. HR administrators can approve Staff, Receptionist and Lab Technician.',
+            code: 'ROLE_REQUIRES_ADMINISTRATOR',
+          },
+          403
+        )
+      }
+      if (Array.isArray(admin.scopes) && admin.scopes.some((s) => s !== 'pwa')) {
+        return c.json(
+          {
+            error: 'Only an administrator can grant portal or HR access as an exception.',
+            code: 'ROLE_REQUIRES_ADMINISTRATOR',
+          },
+          403
+        )
       }
     }
 
@@ -690,6 +743,52 @@ app.post('/invites/:id/approve', async (c) => {
     const fullName = String(data.fullName ?? '').trim()
     const phone = inv.verifiedPhone ?? String(data.phone ?? '').trim()
     if (!fullName || !phone) return c.json({ error: 'Submission is missing name or phone.' }, 400)
+
+    // The registrant types this address themselves, so it arrives in any spelling.
+    // Stored and compared in the one form Better Auth uses (F21): a password reset
+    // looks the login up by the lower-cased address.
+    const providedEmail = normalizeEmail(String(data.email ?? ''))
+
+    // First password (D16, F49). A registration is built for phone + SMS-code sign-in in
+    // the Team app, so this used to mint a random password nobody knew. A role that signs in
+    // to the portal or the HR app uses e-mail + password, so that person could not get in until
+    // an admin reset it. For those roles approval now needs a real e-mail and a first password,
+    // which the person must replace at first sign-in. Checked before anything is created.
+    const roleForSignIn =
+      typeof admin.role === 'string' && VALID_STAFF_ROLES.has(admin.role) ? admin.role : null
+    const needsPassword = roleSignsInWithPassword(
+      roleForSignIn,
+      Array.isArray(admin.scopes) ? admin.scopes : []
+    )
+    let firstPassword: string | null = null
+    if (needsPassword) {
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(providedEmail)) {
+        return c.json(
+          {
+            error:
+              'This person gave no e-mail address, and the portal and HR app sign in with one. Choose a Team-app-only role, or ask them to register again with an e-mail.',
+            code: 'EMAIL_REQUIRED',
+          },
+          400
+        )
+      }
+      const supplied = typeof admin.initialPassword === 'string' ? admin.initialPassword : ''
+      if (!supplied) {
+        return c.json(
+          {
+            error:
+              'Set a first password for this person: that role signs in with an e-mail and password.',
+            code: 'INITIAL_PASSWORD_REQUIRED',
+          },
+          400
+        )
+      }
+      const policy = checkPasswordPolicy(supplied, providedEmail)
+      if (!policy.ok) {
+        return c.json({ error: policy.error, code: 'INITIAL_PASSWORD_REJECTED' }, 400)
+      }
+      firstPassword = supplied
+    }
 
     // Phone must remain unique across active staff (it's the OTP-login identity).
     const normalized = formatPhoneNumber(phone)
@@ -723,28 +822,22 @@ app.post('/invites/:id/approve', async (c) => {
         )
     }
 
-    const staffId = await generateStaffId(db)
     const now = new Date()
     const userId = crypto.randomUUID()
-    createdUserId = userId
-
-    // Email is optional on the form; Better Auth's user table needs a unique
-    // email, so synthesize a non-routable one when none was given. Login is
-    // phone+OTP so this address is never used to sign in.
-    const providedEmail = String(data.email ?? '').trim()
-    const email = providedEmail || `${staffId.toLowerCase()}@staff.framada.local`
 
     if (providedEmail) {
       const [existing] = await db
         .select({ id: user.id })
         .from(user)
-        .where(eq(user.email, providedEmail))
+        .where(eq(sql`lower(${user.email})`, providedEmail))
       if (existing) return c.json({ error: 'Email already exists in the system.' }, 409)
     }
 
-    // Passwordless: mint a random throwaway password (never used — phone+OTP login).
+    // Team-app-only roles are passwordless (phone + SMS code): mint a random throwaway password
+    // nobody uses. A role that signs in with a password gets the first password the reviewer set
+    // (validated above) instead.
     const throwaway = `${randomToken()}${randomToken()}`
-    const hashedPw = await hashPassword(throwaway)
+    const hashedPw = await hashPassword(firstPassword ?? throwaway)
 
     // RBAC permissions resolve off `user.roleId`, so we must set it (not just the
     // Better-Auth `role`). Mirror the canonical role writer (access-management
@@ -752,40 +845,6 @@ app.post('/invites/:id/approve', async (c) => {
     // → null (staff gets only bundle_pwa_standard until HR assigns a role).
     const chosenRole =
       typeof admin.role === 'string' && VALID_STAFF_ROLES.has(admin.role) ? admin.role : null
-
-    await db.insert(user).values({
-      id: userId,
-      name: fullName,
-      email,
-      phone,
-      emailVerified: true,
-      role: chosenRole,
-      roleId: chosenRole,
-      banned: false,
-      username: staffId.toLowerCase(),
-      displayUsername: staffId,
-      twoFactorEnabled: true,
-      createdAt: now,
-      updatedAt: now,
-    })
-
-    await db.insert(account).values({
-      id: crypto.randomUUID(),
-      accountId: userId,
-      providerId: 'credential',
-      userId,
-      password: hashedPw,
-      createdAt: now,
-      updatedAt: now,
-    })
-
-    await db.insert(twoFactor).values({
-      id: crypto.randomUUID(),
-      userId,
-      secret: crypto.randomUUID(),
-      backupCodes: '[]',
-      verified: true,
-    })
 
     // Resolve capability flags (admin overrides, else staffType-driven defaults).
     const resolvedStaffType: 'internal' | 'external' =
@@ -834,161 +893,225 @@ app.post('/invites/:id/approve', async (c) => {
       data.dateOfBirth ? String(data.dateOfBirth) : null
     )
 
-    const [newStaff] = await db
-      .insert(staff)
-      .values({
-        staffId,
-        userId,
-        fullName,
-        username: providedEmail ? providedEmail.split('@')[0] : staffId.toLowerCase(),
+    // The account is provisioned in ONE transaction: the login, its credential and second-factor
+    // row, the staff record, the doctor record, the app grants, the bundle and the approval itself
+    // all happen, or none of them does. This used to be separate statements with a hand-written
+    // undo that deleted the credential and the login. `staff.userId` and `specialists.userId` are
+    // ON DELETE SET NULL, so a failure after the staff insert left the staff record and the doctor
+    // record behind with no login, the registration still "submitted", and the next approval
+    // refused for the phone number the failed one still held.
+    const { newStaff, staffId } = await db.transaction(async (tx) => {
+      // Claim the registration. Two approvals at the same moment (two reviewers, or one double
+      // click) both read it as "submitted" above; the row lock makes the second wait for the first
+      // and then see it approved.
+      const [open] = await tx
+        .select({ status: staffRegistrationInvites.status })
+        .from(staffRegistrationInvites)
+        .where(eq(staffRegistrationInvites.id, id))
+        .for('update')
+      if (open?.status !== 'submitted') throw new RegistrationNotOpen()
+
+      const staffId = await nextStaffId(tx)
+
+      // Email is optional on the form; Better Auth's user table needs a unique
+      // email, so synthesize a non-routable one when none was given. Login is
+      // phone+OTP so this address is never used to sign in.
+      const email = providedEmail || `${staffId.toLowerCase()}@staff.framada.local`
+
+      await tx.insert(user).values({
+        id: userId,
+        name: fullName,
         email,
         phone,
-        position: title,
-        employmentType: resolvedEmploymentType,
-        dateOfJoining,
-        status: 'active',
-        deviceUserId,
-        staffType: resolvedStaffType,
-        profileImage: (data.profileImage as string) || null,
-        // Emergency (§4)
-        emergencyContactName: (data.emergencyContactName as string) || null,
-        emergencyContactRelationship: (data.emergencyContactRelationship as string) || null,
-        emergencyContactPhone: (data.emergencyContactPhone as string) || null,
-        // Personal (§1)
-        dateOfBirth: data.dateOfBirth ? new Date(String(data.dateOfBirth)) : null,
-        birthDay,
-        birthMonth,
-        gender: (data.gender as string) || null,
-        ghanaCardPin: (data.ghanaCardPin as string) || null,
-        nationality: (data.nationality as string) || 'Ghanaian',
-        maritalStatus: (data.maritalStatus as string) || null,
-        residentialAddress: (data.residentialAddress as string) || null,
-        digitalAddress: (data.digitalAddress as string) || null,
-        nextOfKinName: (data.nextOfKinName as string) || null,
-        nextOfKinRelationship: (data.nextOfKinRelationship as string) || null,
-        nextOfKinPhone: (data.nextOfKinPhone as string) || null,
-        // Education (§3)
-        highestQualification: (data.highestQualification as string) || null,
-        institution: (data.institution as string) || null,
-        qualificationYear: Number.isFinite(qualYear) ? qualYear : null,
-        // Employment (§2)
-        department,
-        ssnitId: (data.ssnitId as string) || null,
-        bankName: (data.bankName as string) || null,
-        bankAccountName: (data.bankAccountName as string) || null,
-        bankAccountNumber: (data.bankAccountNumber as string) || null,
-        momoNetwork: (data.momoNetwork as string) || null,
-        momoNumber: (data.momoNumber as string) || null,
-        salaryBand: admin.salaryBand || null,
-        // Consent (Act 843)
-        consentGiven: true,
-        consentAt: data.consentAt ? new Date(String(data.consentAt)) : now,
-        cvUrl: inv.cvUrl || null,
-        // Capability flags (admin)
-        positionTag: resolvedPositionTag,
-        isClinicalPractitioner,
-        receivesCommission,
-        hasPayslip,
-        tracksAttendance,
-        requiresLicense,
-        isExternal: isExternalDerived,
-      })
-      .returning()
-
-    // Mirror the flat personal data into the child tables (migration 0177) —
-    // same as the HR create path, so both intake routes land identical records.
-    await syncPersonalChildRecords(db, newStaff.id, {
-      emergencyContactName: data.emergencyContactName as string,
-      emergencyContactRelationship: data.emergencyContactRelationship as string,
-      emergencyContactPhone: data.emergencyContactPhone as string,
-      nextOfKinName: data.nextOfKinName as string,
-      nextOfKinRelationship: data.nextOfKinRelationship as string,
-      nextOfKinPhone: data.nextOfKinPhone as string,
-      highestQualification: data.highestQualification as string,
-      institution: data.institution as string,
-      qualificationYear: Number.isFinite(qualYear) ? qualYear : null,
-    })
-
-    // Claim any orphaned attendance punches for this device ID.
-    if (deviceUserId) {
-      await db
-        .update(attendanceEvents)
-        .set({ staffId: newStaff.id })
-        .where(
-          and(eq(attendanceEvents.deviceUserId, deviceUserId), isNull(attendanceEvents.staffId))
-        )
-    }
-
-    // Clinical practitioner → also create the specialists row (canonical FK
-    // target for appointments/commissions).
-    if (isClinicalPractitioner) {
-      const sp = admin.specialist ?? {}
-      const [createdSpecialist] = await db
-        .insert(specialists)
-        .values({
-          name: fullName,
-          contactEmail: email,
-          contactPhone: phone,
-          tin: sp.tin || (data.ghanaCardPin as string) || null,
-          specialistType: isExternalDerived ? 'external' : 'internal',
-          userId: isExternalDerived ? null : userId,
-          defaultCommissionRate: receivesCommission ? Number(sp.defaultCommissionRate ?? 0) : 0,
-          withholdingTaxRate: Number(sp.withholdingTaxRate ?? 0),
-          payoutMethod: sp.payoutMethod || null,
-          isActive: true,
-          staffId: newStaff.id,
-        })
-        .returning()
-      await db
-        .update(staff)
-        .set({ specialistId: createdSpecialist.id })
-        .where(eq(staff.id, newStaff.id))
-    }
-
-    // Interface scopes — the Team app by default, like every HR onboarding.
-    // Every other app follows the role chosen above (role_scopes); a caller
-    // may still send an explicit 'portal'/'hr' grant as a one-off exception.
-    // Denials are never written: user_scopes overrides the role, so the old
-    // default `granted: false` rows kept an approved receptionist out of the
-    // portal (and anyone later made hr_admin out of HR) for good.
-    const wantScopes = new Set<string>(
-      Array.isArray(admin.scopes) && admin.scopes.length ? admin.scopes : ['pwa']
-    )
-    const scopeRows = (['pwa', 'portal', 'hr'] as const)
-      .filter((interfaceScope) => wantScopes.has(interfaceScope))
-      .map((interfaceScope) => ({
-        userId,
-        interfaceScope,
-        granted: true,
-        grantedById: authUser.id,
+        emailVerified: true,
+        role: chosenRole,
+        roleId: chosenRole,
+        banned: false,
+        username: staffId.toLowerCase(),
+        displayUsername: staffId,
+        twoFactorEnabled: true,
+        // The reviewer chose this password, so the person replaces it first (F20).
+        mustChangePassword: firstPassword !== null,
         createdAt: now,
         updatedAt: now,
-      }))
-    if (scopeRows.length > 0) await db.insert(userScopes).values(scopeRows)
+      })
 
-    if (resolvedPositionTag === 'staff') {
-      await db
-        .insert(userBundles)
-        .values({
-          userId,
-          bundleId: 'bundle_pwa_standard',
-          grantedById: authUser.id,
-          grantSource: 'auto_position_tag',
-        })
-        .onConflictDoNothing()
-    }
-
-    // Mark the invite approved + link the new staff row.
-    await db
-      .update(staffRegistrationInvites)
-      .set({
-        status: 'approved',
-        staffId: newStaff.id,
-        reviewedByUserId: authUser.id,
-        reviewedAt: now,
+      await tx.insert(account).values({
+        id: crypto.randomUUID(),
+        accountId: userId,
+        providerId: 'credential',
+        userId,
+        password: hashedPw,
+        createdAt: now,
         updatedAt: now,
       })
-      .where(eq(staffRegistrationInvites.id, id))
+
+      await tx.insert(twoFactor).values({
+        id: crypto.randomUUID(),
+        userId,
+        secret: crypto.randomUUID(),
+        backupCodes: '[]',
+        verified: true,
+      })
+
+      const [newStaff] = await tx
+        .insert(staff)
+        .values({
+          staffId,
+          userId,
+          fullName,
+          username: providedEmail ? providedEmail.split('@')[0] : staffId.toLowerCase(),
+          email,
+          phone,
+          position: title,
+          employmentType: resolvedEmploymentType,
+          dateOfJoining,
+          status: 'active',
+          deviceUserId,
+          staffType: resolvedStaffType,
+          profileImage: (data.profileImage as string) || null,
+          // Emergency (§4)
+          emergencyContactName: (data.emergencyContactName as string) || null,
+          emergencyContactRelationship: (data.emergencyContactRelationship as string) || null,
+          emergencyContactPhone: (data.emergencyContactPhone as string) || null,
+          // Personal (§1)
+          dateOfBirth: data.dateOfBirth ? new Date(String(data.dateOfBirth)) : null,
+          birthDay,
+          birthMonth,
+          gender: (data.gender as string) || null,
+          ghanaCardPin: (data.ghanaCardPin as string) || null,
+          nationality: (data.nationality as string) || 'Ghanaian',
+          maritalStatus: (data.maritalStatus as string) || null,
+          residentialAddress: (data.residentialAddress as string) || null,
+          digitalAddress: (data.digitalAddress as string) || null,
+          nextOfKinName: (data.nextOfKinName as string) || null,
+          nextOfKinRelationship: (data.nextOfKinRelationship as string) || null,
+          nextOfKinPhone: (data.nextOfKinPhone as string) || null,
+          // Education (§3)
+          highestQualification: (data.highestQualification as string) || null,
+          institution: (data.institution as string) || null,
+          qualificationYear: Number.isFinite(qualYear) ? qualYear : null,
+          // Employment (§2)
+          department,
+          ssnitId: (data.ssnitId as string) || null,
+          bankName: (data.bankName as string) || null,
+          bankAccountName: (data.bankAccountName as string) || null,
+          bankAccountNumber: (data.bankAccountNumber as string) || null,
+          momoNetwork: (data.momoNetwork as string) || null,
+          momoNumber: (data.momoNumber as string) || null,
+          salaryBand: admin.salaryBand || null,
+          // Consent (Act 843)
+          consentGiven: true,
+          consentAt: data.consentAt ? new Date(String(data.consentAt)) : now,
+          cvUrl: inv.cvUrl || null,
+          // Capability flags (admin)
+          positionTag: resolvedPositionTag,
+          isClinicalPractitioner,
+          receivesCommission,
+          hasPayslip,
+          tracksAttendance,
+          requiresLicense,
+          isExternal: isExternalDerived,
+        })
+        .returning()
+
+      // Mirror the flat personal data into the child tables (migration 0177) —
+      // same as the HR create path, so both intake routes land identical records.
+      await syncPersonalChildRecords(tx as unknown as DB, newStaff.id, {
+        emergencyContactName: data.emergencyContactName as string,
+        emergencyContactRelationship: data.emergencyContactRelationship as string,
+        emergencyContactPhone: data.emergencyContactPhone as string,
+        nextOfKinName: data.nextOfKinName as string,
+        nextOfKinRelationship: data.nextOfKinRelationship as string,
+        nextOfKinPhone: data.nextOfKinPhone as string,
+        highestQualification: data.highestQualification as string,
+        institution: data.institution as string,
+        qualificationYear: Number.isFinite(qualYear) ? qualYear : null,
+      })
+
+      // Claim any orphaned attendance punches for this device ID.
+      if (deviceUserId) {
+        await tx
+          .update(attendanceEvents)
+          .set({ staffId: newStaff.id })
+          .where(
+            and(eq(attendanceEvents.deviceUserId, deviceUserId), isNull(attendanceEvents.staffId))
+          )
+      }
+
+      // Clinical practitioner → also create the specialists row (canonical FK
+      // target for appointments/commissions).
+      if (isClinicalPractitioner) {
+        const sp = admin.specialist ?? {}
+        const [createdSpecialist] = await tx
+          .insert(specialists)
+          .values({
+            name: fullName,
+            contactEmail: email,
+            contactPhone: phone,
+            tin: sp.tin || (data.ghanaCardPin as string) || null,
+            specialistType: isExternalDerived ? 'external' : 'internal',
+            userId: isExternalDerived ? null : userId,
+            defaultCommissionRate: receivesCommission ? Number(sp.defaultCommissionRate ?? 0) : 0,
+            withholdingTaxRate: Number(sp.withholdingTaxRate ?? 0),
+            payoutMethod: sp.payoutMethod || null,
+            isActive: true,
+            staffId: newStaff.id,
+          })
+          .returning()
+        await tx
+          .update(staff)
+          .set({ specialistId: createdSpecialist.id })
+          .where(eq(staff.id, newStaff.id))
+      }
+
+      // Interface scopes — the Team app by default, like every HR onboarding.
+      // Every other app follows the role chosen above (role_scopes); a caller
+      // may still send an explicit 'portal'/'hr' grant as a one-off exception.
+      // Denials are never written: user_scopes overrides the role, so the old
+      // default `granted: false` rows kept an approved receptionist out of the
+      // portal (and anyone later made hr_admin out of HR) for good.
+      const wantScopes = new Set<string>(
+        Array.isArray(admin.scopes) && admin.scopes.length ? admin.scopes : ['pwa']
+      )
+      const scopeRows = (['pwa', 'portal', 'hr'] as const)
+        .filter((interfaceScope) => wantScopes.has(interfaceScope))
+        .map((interfaceScope) => ({
+          userId,
+          interfaceScope,
+          granted: true,
+          grantedById: authUser.id,
+          createdAt: now,
+          updatedAt: now,
+        }))
+      if (scopeRows.length > 0) await tx.insert(userScopes).values(scopeRows)
+
+      if (resolvedPositionTag === 'staff') {
+        await tx
+          .insert(userBundles)
+          .values({
+            userId,
+            bundleId: 'bundle_pwa_standard',
+            grantedById: authUser.id,
+            grantSource: 'auto_position_tag',
+          })
+          .onConflictDoNothing()
+      }
+
+      // Mark the invite approved + link the new staff row.
+      await tx
+        .update(staffRegistrationInvites)
+        .set({
+          status: 'approved',
+          staffId: newStaff.id,
+          reviewedByUserId: authUser.id,
+          reviewedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(staffRegistrationInvites.id, id))
+
+      return { newStaff, staffId }
+    })
 
     c.set('skipAudit', true)
     await createAuditLog(db, {
@@ -1010,23 +1133,16 @@ app.post('/invites/:id/approve', async (c) => {
       },
     })
   } catch (error) {
-    // Manual rollback of the auth user/account if the staff insert failed.
-    if (createdUserId) {
-      await db
-        .delete(account)
-        .where(eq(account.userId, createdUserId))
-        .catch(() => {})
-      await db
-        .delete(user)
-        .where(eq(user.id, createdUserId))
-        .catch(() => {})
+    if (error instanceof RegistrationNotOpen) {
+      return c.json({ error: 'This registration is no longer waiting for review.' }, 409)
     }
     logError(error, { context: '[staff-registration] approve' })
-    type PgErr = { code?: string; constraint?: string; detail?: string; cause?: PgErr }
-    const pg = error as PgErr
-    const cause = pg.cause ?? pg
-    if (cause?.code === '23505') {
-      return c.json({ error: cause.detail || 'Duplicate value violates a unique constraint.' }, 409)
+    const duplicate = uniqueViolationOf(error)
+    if (duplicate) {
+      return c.json(
+        { error: duplicate.detail || 'Duplicate value violates a unique constraint.' },
+        409
+      )
     }
     return c.json({ error: 'Failed to approve registration' }, 500)
   }

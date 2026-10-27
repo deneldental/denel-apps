@@ -28,7 +28,6 @@
 import { Hono } from 'hono'
 import { env } from '../config/env'
 import { getDb } from '../db'
-// Reuse the Calendar lib's HMAC state signing — same scheme, same secret.
 import { signState, verifyState } from '../lib/google-calendar'
 import {
   buildContactsAuthUrl,
@@ -43,15 +42,16 @@ import {
 import { resolveOAuthConfig } from '../lib/google-oauth-config'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
+// Reuse the Calendar lib's HMAC state signing — same scheme, same secret.
+import { portalLink } from '../lib/public-urls'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import type { HonoEnv } from '../lib/types'
 
 const googleContactsApp = new Hono<HonoEnv>()
 
-/** Where to send the user after callback — the CRM sync surface (§21.4). */
+/** Where to send the user after callback — the CRM sync surface (§21.4) of the clinic portal. */
 function getCrmSyncReturnUrl(): string {
-  const base = env.PORTAL_URL ?? 'http://localhost:5173'
-  return `${base.replace(/\/$/, '')}/crm/sync`
+  return portalLink('/crm/sync')
 }
 
 // ── GET /status ───────────────────────────────────────────────────────────────

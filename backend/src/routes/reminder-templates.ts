@@ -3,20 +3,12 @@ import { Hono } from 'hono'
 import { env } from '../config/env'
 import { getDb } from '../db'
 import { reminderTemplates } from '../db/schema'
-import { user as userSchema } from '../db/schema/auth'
-import { ROLES } from '../lib/modules'
+import { ACTIONS, MODULES } from '../lib/modules'
+import { checkPermission, isAdmin } from '../lib/rbac'
 import type { HonoEnv } from '../lib/types'
 import { verifySession } from '../rbac/middleware/verifySession'
 
 const reminderTemplatesApp = new Hono<HonoEnv>()
-
-async function requireAdmin(db: ReturnType<typeof getDb>, userId: string) {
-  const dbUser = await db.query.user.findFirst({
-    where: eq(userSchema.id, userId),
-    columns: { roleId: true },
-  })
-  return dbUser?.roleId === ROLES.ADMIN
-}
 
 // GET /api/reminder-templates — all active and non-admin-only (or all for admin)
 //
@@ -27,8 +19,8 @@ reminderTemplatesApp.get('/', verifySession(), async (c) => {
   const { user } = c.var
   const db = getDb(env.DATABASE_URL)
   try {
-    const isAdmin = await requireAdmin(db, user.id)
-    const rows = isAdmin
+    const admin = await isAdmin(c, user.id)
+    const rows = admin
       ? await db.select().from(reminderTemplates).orderBy(asc(reminderTemplates.name))
       : await db
           .select()
@@ -41,12 +33,13 @@ reminderTemplatesApp.get('/', verifySession(), async (c) => {
   }
 })
 
-// POST /api/reminder-templates — create (admin only)
+// POST /api/reminder-templates — create (messaging:create)
 reminderTemplatesApp.post('/', verifySession(), async (c) => {
   const { user } = c.var
   const db = getDb(env.DATABASE_URL)
   try {
-    if (!(await requireAdmin(db, user.id))) return c.json({ error: 'Unauthorized' }, 403)
+    if (!(await checkPermission(c, user.id, MODULES.MESSAGING, ACTIONS.CREATE)))
+      return c.json({ error: 'Unauthorized' }, 403)
 
     const body = await c.req.json()
     if (!body.name?.trim() || !body.messageTemplate?.trim()) {
@@ -69,13 +62,14 @@ reminderTemplatesApp.post('/', verifySession(), async (c) => {
   }
 })
 
-// PATCH /api/reminder-templates/:id — update (admin only)
+// PATCH /api/reminder-templates/:id — update (messaging:update)
 reminderTemplatesApp.patch('/:id', verifySession(), async (c) => {
   const { user } = c.var
   const { id } = c.req.param()
   const db = getDb(env.DATABASE_URL)
   try {
-    if (!(await requireAdmin(db, user.id))) return c.json({ error: 'Unauthorized' }, 403)
+    if (!(await checkPermission(c, user.id, MODULES.MESSAGING, ACTIONS.UPDATE)))
+      return c.json({ error: 'Unauthorized' }, 403)
 
     const body = await c.req.json()
     const updates: Partial<typeof reminderTemplates.$inferInsert> = { updatedAt: new Date() }
@@ -97,13 +91,14 @@ reminderTemplatesApp.patch('/:id', verifySession(), async (c) => {
   }
 })
 
-// DELETE /api/reminder-templates/:id — hard delete (admin only)
+// DELETE /api/reminder-templates/:id — hard delete (messaging:delete)
 reminderTemplatesApp.delete('/:id', verifySession(), async (c) => {
   const { user } = c.var
   const { id } = c.req.param()
   const db = getDb(env.DATABASE_URL)
   try {
-    if (!(await requireAdmin(db, user.id))) return c.json({ error: 'Unauthorized' }, 403)
+    if (!(await checkPermission(c, user.id, MODULES.MESSAGING, ACTIONS.DELETE)))
+      return c.json({ error: 'Unauthorized' }, 403)
 
     // System templates (with a stable `key`, e.g. lab_status:*) are wired into
     // backend events — deleting one silently breaks that SMS. Block it; admins

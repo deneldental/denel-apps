@@ -10,6 +10,7 @@ import {
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
+import { ClinicalTreatmentPlanSheet } from '@/features/clinical/components/clinical-treatment-plan-sheet'
 import { updateAppointment } from '@/lib/actions/appointments'
 import { getDoctorWorklist, routeVisit, type WorklistVisit } from '@/lib/actions/worklist'
 import { useApiQuery } from '@/lib/query'
@@ -32,6 +33,9 @@ export function DoctorLens({ date }: { date: string }) {
   const [viewEstimateFor, setViewEstimateFor] = useState<WorklistVisit | null>(null)
   const [createPlanFor, setCreatePlanFor] = useState<WorklistVisit | null>(null)
   const [cancelVisitFor, setCancelVisitFor] = useState<WorklistVisit | null>(null)
+  // The plan opens in place (decision D4). It used to link to /clinical/treatment-plans/:id,
+  // a route nothing registers, which landed outside the app shell on a bare 404.
+  const [viewPlanFor, setViewPlanFor] = useState<WorklistVisit | null>(null)
 
   const worklistQuery = useApiQuery(doctorWorklistKey(date), () => getDoctorWorklist(date))
   const visits = worklistQuery.data?.visits ?? []
@@ -145,11 +149,9 @@ export function DoctorLens({ date }: { date: string }) {
                         View estimate
                       </Button>
                       {v.treatmentPlanId ? (
-                        <Button size="sm" asChild>
-                          <Link to={`/clinical/treatment-plans/${v.treatmentPlanId}`}>
-                            <ClipboardPlus className="mr-1.5 h-3.5 w-3.5" />
-                            View Treatment Plan
-                          </Link>
+                        <Button size="sm" onClick={() => setViewPlanFor(v)}>
+                          <ClipboardPlus className="mr-1.5 h-3.5 w-3.5" />
+                          View Treatment Plan
                         </Button>
                       ) : (
                         // A plan may only be built once reception has ISSUED the
@@ -207,7 +209,6 @@ export function DoctorLens({ date }: { date: string }) {
         <CreateEstimateSheet
           appointmentId={estimateFor.appointmentId}
           patientName={estimateFor.patientName}
-          estimateInvoiceId={estimateFor.estimateInvoiceId}
           open={!!estimateFor}
           onOpenChange={(o) => !o && setEstimateFor(null)}
           onCreated={() => {
@@ -228,6 +229,20 @@ export function DoctorLens({ date }: { date: string }) {
             setCreatePlanFor(null)
             void worklistQuery.refetch()
           }}
+        />
+      )}
+
+      {viewPlanFor?.treatmentPlanId && (
+        <ClinicalTreatmentPlanSheet
+          planId={viewPlanFor.treatmentPlanId}
+          patient={{
+            id: viewPlanFor.patientId,
+            name: viewPlanFor.patientName,
+            patientId: null,
+          }}
+          open
+          onOpenChange={(o) => !o && setViewPlanFor(null)}
+          onPlanUpdated={() => void worklistQuery.refetch()}
         />
       )}
 

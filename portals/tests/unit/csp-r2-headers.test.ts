@@ -13,10 +13,7 @@ const APPS = ['portals', 'team', 'patient', 'hr', 'reports'] as const
 const R2_SOURCES = ['https://*.r2.cloudflarestorage.com', 'https://*.r2.dev']
 
 function cspOf(app: string): string {
-  const file = readFileSync(
-    resolve(__dirname, '../../..', app, 'public/_headers'),
-    'utf8'
-  )
+  const file = readFileSync(resolve(__dirname, '../../..', app, 'public/_headers'), 'utf8')
   const line = file.split('\n').find((l) => l.includes('Content-Security-Policy:'))
   if (!line) throw new Error(`${app}: no Content-Security-Policy line`)
   return line

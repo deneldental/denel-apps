@@ -93,6 +93,7 @@ const KIT_HOOK_NAMES = [
   'useCrmCampaignEntries',
   'useAppointmentPickers',
   'useInventoryLocations',
+  'useServiceCatalog',
 ]
 const KIT_MARKERS = new RegExp(
   KIT_HOOK_NAMES.map((name) => `\\b${name}\\b\\s*(?:<[^()]*>)?\\s*\\(`).join('|')
@@ -117,6 +118,8 @@ const ALLOWED: Record<string, string> = {
     'the only useEffect resets the reason textarea when the dialog opens, not a fetch; reversePayment is a GL-posting write called from the submit handler and deliberately left untouched (financially-sensitive)',
   'portals/src/features/payments/components/wallet-topup-dialog.tsx':
     'the only useEffect resets form fields when the dialog opens, not a fetch; createDraftPayment/postDraftPayment are GL-posting writes called from the submit handler and deliberately left untouched (financially-sensitive)',
+  'portals/src/features/appointments/components/check-in-flow.tsx':
+    'the only useEffect clears a pending-close timer on unmount, not a fetch; checkInAppointment is a write (payment, status, doctor note in one transaction) called from a click handler, and its caller reloads the list through onFinished',
 }
 
 /**

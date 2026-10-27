@@ -16,6 +16,7 @@ import { randomUUID } from 'node:crypto'
 import { Money } from '@denel/utils'
 import { and, desc, eq, gte, inArray, isNull, lt, sql } from 'drizzle-orm'
 import { Hono } from 'hono'
+import { z } from 'zod'
 import { type DB, getDb } from '../db'
 import {
   appointments,
@@ -31,12 +32,17 @@ import {
   user as userTable,
 } from '../db/schema'
 import type { PaymentMethod } from '../lib/channel-accounts'
-import { resolveDoctorForUser, resolveDoctorIdForUser } from '../lib/doctor-identity'
+import {
+  resolveDoctorForUser,
+  resolveDoctorIdForUser,
+  resolveLoginUserIdForDoctor,
+} from '../lib/doctor-identity'
 import { createEstimateDraft, EstimateValidationError } from '../lib/estimate-service'
 import { issueInvoice } from '../lib/invoice-service'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
 import { ensureCaseForPlan } from '../lib/patient-case-service'
+import { sendPaymentConfirmationSms } from '../lib/payment-confirmation-sms'
 import { createDraftPayment, postPayment } from '../lib/payment-service'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import { getInvoiceFundingBatch } from '../lib/treatment-funding'
@@ -83,12 +89,22 @@ export interface WorklistVisit {
 }
 
 /**
+ * Which standalone estimates (draft one-time invoices with no visit) a lens lists.
+ * Chosen by the caller, never defaulted: listing them all on a doctor's sheet put
+ * every patient's name, phone and estimate total in front of every doctor (F16).
+ */
+type StandaloneScope =
+  | { kind: 'all' } // reception, and an admin viewing every doctor
+  | { kind: 'createdBy'; userId: string } // a doctor: only the ones they wrote
+  | { kind: 'none' }
+
+/**
  * Load the day's active visits enriched with the estimate (draft/issued invoice
  * linked to the visit) and the pending-clinical-note flag.
  */
 async function loadVisits(
   db: ReturnType<typeof getDb>,
-  opts: { start: Date; end: Date; doctorId?: string }
+  opts: { start: Date; end: Date; doctorId?: string; standalone: StandaloneScope }
 ): Promise<WorklistVisit[]> {
   const conds = [
     gte(appointments.date, opts.start),
@@ -211,27 +227,34 @@ async function loadVisits(
   })
 
   // Append standalone estimates (draft one-time invoices with no appointment).
-  // These show up universally on the reception lens (they aren't restricted by date/doctor).
-  const standaloneEstimates = await db
-    .select({
-      id: invoices.id,
-      patientId: invoices.patientId,
-      patientName: patients.name,
-      patientPhone: patients.phone,
-      total: invoices.total,
-      status: invoices.status,
-      createdAt: invoices.createdAt,
-    })
-    .from(invoices)
-    .innerJoin(patients, eq(patients.id, invoices.patientId))
-    .where(
-      and(
-        isNull(invoices.appointmentId),
-        eq(invoices.type, 'one_time'),
-        eq(invoices.status, 'draft')
-      )
-    )
-    .orderBy(desc(invoices.createdAt))
+  // They are not tied to a date or a visit, so they stay listed until reception
+  // confirms or cancels them. Which of them a lens may show is the caller's call
+  // (`opts.standalone`): reception lists them all, a doctor only their own.
+  const standaloneConds = [
+    isNull(invoices.appointmentId),
+    eq(invoices.type, 'one_time'),
+    eq(invoices.status, 'draft'),
+  ]
+  if (opts.standalone.kind === 'createdBy') {
+    standaloneConds.push(eq(invoices.createdBy, opts.standalone.userId))
+  }
+  const standaloneEstimates =
+    opts.standalone.kind === 'none'
+      ? []
+      : await db
+          .select({
+            id: invoices.id,
+            patientId: invoices.patientId,
+            patientName: patients.name,
+            patientPhone: patients.phone,
+            total: invoices.total,
+            status: invoices.status,
+            createdAt: invoices.createdAt,
+          })
+          .from(invoices)
+          .innerJoin(patients, eq(patients.id, invoices.patientId))
+          .where(and(...standaloneConds))
+          .orderBy(desc(invoices.createdAt))
 
   const standaloneFunding = await getInvoiceFundingBatch(
     db,
@@ -264,8 +287,9 @@ async function loadVisits(
 }
 
 // GET /api/worklist/doctor?date=&doctorId= — the doctor's day-sheet queue.
-// Defaults to the caller's own doctor row; admins may pass ?doctorId or omit it
-// (omit → all doctors).
+// A doctor gets their own sheet: their visits and the standalone estimates they
+// wrote. Only an admin may name a doctor with ?doctorId, or omit it to see every
+// doctor's (F16); anyone else naming a doctor but themselves is refused.
 worklistApp.get('/doctor', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
@@ -280,21 +304,43 @@ worklistApp.get('/doctor', async (c) => {
   // returned an empty worklist to the Activity page.
   const isAdmin = user.roleId === 'admin'
 
+  const requestedDoctorId = c.req.query('doctorId') || undefined
+  if (requestedDoctorId && !z.string().uuid().safeParse(requestedDoctorId).success) {
+    return c.json({ error: 'Invalid doctorId' }, 400)
+  }
+
   try {
-    let doctorId = c.req.query('doctorId') || undefined
-    if (!doctorId && !isAdmin) {
+    let doctorId = requestedDoctorId
+    let standalone: StandaloneScope
+
+    if (isAdmin) {
+      if (doctorId) {
+        // One doctor's sheet: the estimates written by the account behind that row.
+        const owner = await resolveLoginUserIdForDoctor(db, doctorId)
+        standalone = owner ? { kind: 'createdBy', userId: owner } : { kind: 'none' }
+      } else {
+        standalone = { kind: 'all' }
+      }
+    } else {
       // Resolves BOTH linkage shapes. This used to check doctors.userId alone,
       // which is null for every doctor created through the portal's
       // add-specialist flow — so correctly-linked doctors were told their
       // account was unlinked.
       const doc = await resolveDoctorForUser(db, user.id)
+      // Naming a doctor used to skip the lookup above, so any holder of
+      // appointments:read could read any doctor's whole day-sheet by passing an id.
+      if (doctorId && doctorId !== doc?.id) {
+        return c.json({ error: 'You can only view your own day-sheet' }, 403)
+      }
       // No doctor profile is linked to this account, so there is no day-sheet to
       // show. `unlinked` distinguishes that from a genuinely empty day — without
       // it the UI renders "no visits today" and the misconfiguration stays hidden.
       if (!doc) return c.json({ success: true, data: { date: iso, visits: [], unlinked: true } })
       doctorId = doc.id
+      standalone = { kind: 'createdBy', userId: user.id }
     }
-    const visits = await loadVisits(db, { start, end, doctorId })
+
+    const visits = await loadVisits(db, { start, end, doctorId, standalone })
     return c.json({ success: true, data: { date: iso, visits, unlinked: false } })
   } catch (error) {
     logError(error, { context: 'Worklist doctor lens' })
@@ -549,7 +595,7 @@ worklistApp.get('/reception', async (c) => {
   const { start, end, iso } = dayRange(c.req.query('date'))
 
   try {
-    const visits = await loadVisits(db, { start, end })
+    const visits = await loadVisits(db, { start, end, standalone: { kind: 'all' } })
     return c.json({ success: true, data: { date: iso, visits } })
   } catch (error) {
     logError(error, { context: 'Worklist reception lens' })
@@ -603,8 +649,9 @@ worklistApp.post('/:id/estimate', async (c) => {
 })
 
 // ── P4: POST /api/worklist/:id/confirm — reception issues + optionally pays ────
-// Body: { payment?: { method, amount, externalReference? } }. Issues the draft
-// estimate (draft → issued, posts AR) and, if a payment is supplied, records it.
+// Body: { payment?: { method, amount, externalReference? }, sendSms?: boolean }. Issues the draft
+// estimate (draft → issued, posts AR) and, if a payment is supplied, records it; with `sendSms`, the
+// patient is texted a confirmation of what was paid (G08), once, after the commit.
 // Gated on PAYMENTS.UPDATE (reception authorizes billing).
 worklistApp.post('/:id/confirm', async (c) => {
   const user = await getCurrentUser(c)
@@ -798,7 +845,15 @@ worklistApp.post('/:id/confirm', async (c) => {
       return { invoiceId: invoice.id, paymentId }
     })
 
-    return c.json({ success: true, data: result })
+    // Committed. The text names what was posted (every method of a split, once) and cannot undo
+    // the confirm: it never throws, and a failure rides along as `smsError` (F31).
+    let smsError: string | undefined
+    if (body.sendSms === true && result.paymentId) {
+      smsError = (
+        await sendPaymentConfirmationSms(db, { paymentId: result.paymentId, userId: user.id })
+      ).error
+    }
+    return c.json({ success: true, data: result, ...(smsError ? { smsError } : {}) })
   } catch (error) {
     logError(error, { context: 'Worklist estimate confirm' })
     // A Drizzle failure's `message` is the entire SQL statement plus bound
@@ -867,20 +922,40 @@ worklistApp.post('/:id/cancel', async (c) => {
     return c.json({ error: 'Unauthorized' }, 403)
 
   const db = getDb(process.env.DATABASE_URL!)
-  const id = c.req.param('id')
+  const parsedId = z.string().uuid().safeParse(c.req.param('id'))
+  if (!parsedId.success) return c.json({ error: 'Not found' }, 404)
+  const id = parsedId.data
 
   try {
     let drafts = await db
-      .select({ id: invoices.id })
+      .select({ id: invoices.id, createdBy: invoices.createdBy })
       .from(invoices)
       .where(and(eq(invoices.appointmentId, id), eq(invoices.status, 'draft')))
 
     if (drafts.length === 0) {
-      // Fallback for standalone estimates where the frontend passes the invoice ID
+      // Standalone estimates are keyed by their invoice id (see loadVisits). Only a
+      // standalone one-time draft qualifies: this used to match ANY draft invoice
+      // with that id, so a doctor (appointments:update) could delete a draft plan
+      // instalment, or another doctor's estimate, by id.
       drafts = await db
-        .select({ id: invoices.id })
+        .select({ id: invoices.id, createdBy: invoices.createdBy })
         .from(invoices)
-        .where(and(eq(invoices.id, id), eq(invoices.status, 'draft')))
+        .where(
+          and(
+            eq(invoices.id, id),
+            isNull(invoices.appointmentId),
+            eq(invoices.type, 'one_time'),
+            eq(invoices.status, 'draft')
+          )
+        )
+    }
+
+    // Reception (who confirm billing) may cancel any estimate; anyone else only their own.
+    if (
+      drafts.some((d) => d.createdBy !== user.id) &&
+      !(await checkPermission(c, user.id, MODULES.PAYMENTS as string, ACTIONS.UPDATE as string))
+    ) {
+      return c.json({ error: 'You can only cancel estimates you created' }, 403)
     }
 
     for (const d of drafts) {

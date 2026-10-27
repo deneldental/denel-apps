@@ -2,6 +2,7 @@ import { and, asc, desc, eq, ilike, inArray, ne, or, sql } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { isValidPhoneNumber } from 'libphonenumber-js/max'
 import { z } from 'zod'
+import { env } from '../config/env'
 import { type DB, getDb } from '../db'
 import {
   invoices,
@@ -17,12 +18,15 @@ import {
   payments,
   walletTransactions,
 } from '../db/schema'
+import { verifyAdminPassword } from '../lib/archive'
 import { createAuditLog, recordDiffAudit } from '../lib/audit'
 import { DEFAULT_SMS_TEMPLATES } from '../lib/constants'
 import { logError, logger } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
 import { AUTO_TAG_NAMES, applyPediatricTag } from '../lib/patient-auto-tag'
+import { insertPatientWithUniqueId } from '../lib/patient-id'
 import { revokeAllDevicesForPhone } from '../lib/patient-trusted-device'
+import { patientAppUrl } from '../lib/public-urls'
 import { checkPermission, getCurrentUser, isAdmin } from '../lib/rbac'
 import { sendSMS } from '../lib/sms'
 import { resolveSmsTemplate } from '../lib/sms-templates'
@@ -75,7 +79,7 @@ async function tagsForPatient(db: DB, patientId: string): Promise<PatientTag[]> 
  * (re-added) when `isChild` is true regardless of `tagIds`, since it's derived
  * from the structural flag and must never be auto-removed.
  */
-async function syncPatientTags(
+export async function syncPatientTags(
   db: DB,
   patientId: string,
   tagIds: string[],
@@ -100,8 +104,30 @@ async function syncPatientTags(
     .where(eq(patientTagLinks.patientId, patientId))
   const existingSet = new Set(existing.map((e) => e.tagId))
 
+  // [Medium] System (auto-applied) tags are additive by design — see
+  // patient-auto-tag.ts's own top-of-file comment: "auto-tagging never
+  // removes a tag." Before this, only Pediatric was protected from the
+  // full-replace below; every other system tag (Ortho, External, Insurance)
+  // could be silently stripped by a save built from a stale tag snapshot —
+  // e.g. a receptionist's Edit Patient sheet, opened before an unrelated
+  // ortho-review-stage save auto-applied 'Ortho' moments later, submits a
+  // tagIds list that never knew about it. This generalises the existing
+  // Pediatric precedent to every system tag: none of them are ever removed
+  // by this endpoint, regardless of what the caller's tagIds contains.
+  const systemTagIds =
+    existingSet.size > 0
+      ? new Set(
+          (
+            await db
+              .select({ id: patientTags.id })
+              .from(patientTags)
+              .where(and(inArray(patientTags.id, [...existingSet]), eq(patientTags.isSystem, true)))
+          ).map((t) => t.id)
+        )
+      : new Set<string>()
+
   const toAdd = [...desired].filter((id) => !existingSet.has(id))
-  const toRemove = [...existingSet].filter((id) => !desired.has(id))
+  const toRemove = [...existingSet].filter((id) => !desired.has(id) && !systemTagIds.has(id))
 
   if (toAdd.length > 0) {
     await db
@@ -139,12 +165,22 @@ patientsApp.get('/', async (c) => {
       .filter(Boolean)
     const limitParam = c.req.query('limit')
     const offsetParam = c.req.query('offset')
+    // C5 — archived patients are hidden from every list by default. The only
+    // way to see them is the explicit Archived view (?archived=true), which
+    // always goes through the paginated/search branch below — pickers (the
+    // unpaginated branch) never show archived patients, full stop.
+    const archivedParam = c.req.query('archived')
+    const wantArchived = archivedParam === 'true'
 
     // Back-compat: callers without any pagination params get the full list
     // (used by appointment/payment pickers across the app). Callers that
     // explicitly opt in get server-side paging + search + tag counts.
     const wantsPaging =
-      limitParam !== undefined || offsetParam !== undefined || q !== '' || tagIds.length > 0
+      limitParam !== undefined ||
+      offsetParam !== undefined ||
+      q !== '' ||
+      tagIds.length > 0 ||
+      archivedParam !== undefined
 
     if (!wantsPaging) {
       // Hotfix (2026-09): this was capped at 2000 with no ORDER BY, so once
@@ -155,6 +191,7 @@ patientsApp.get('/', async (c) => {
       // the real fix is converting pickers to the server-side search below
       // instead of ever loading "all patients" into the browser.
       const data = await db.query.patients.findMany({
+        where: eq(patients.archived, false),
         limit: 10000,
         orderBy: (t, { asc: ascOp }) => [ascOp(t.name)],
       })
@@ -191,7 +228,9 @@ patientsApp.get('/', async (c) => {
           )}))`
         : undefined
 
-    const where = and(...[searchCondition, tagCondition].filter(Boolean))
+    const archivedCondition = eq(patients.archived, wantArchived)
+
+    const where = and(...[searchCondition, tagCondition, archivedCondition].filter(Boolean))
 
     const [rows, totalRow, tagCounts] = await Promise.all([
       db
@@ -828,6 +867,22 @@ patientsApp.get('/:patientId/ledger', async (c) => {
   }
 })
 
+// H4 — `dob` used to be an unvalidated string passed straight to `new
+// Date()`; a garbage value produced an Invalid Date that either silently
+// wrote a nonsense timestamp or surfaced as an opaque 500 from the DB driver
+// instead of a clean 400. See project-docs/patient-records-and-scheduling-audit.md.
+const isValidDobString = (val: string | Date) => !Number.isNaN(new Date(val).getTime())
+
+// The column comment (`db/schema/patients.ts`) has always documented exactly
+// these 3 values; every existing row is one of them (no 4th value has ever
+// been written server-side — 'other' is a live, valid value here, not
+// something being phased out. Contrast the *frontend's* PATIENT_GENDERS list
+// (`portals/src/features/patients/lib/patient-genders.ts`), which
+// deliberately still offers only male/female pending a separate, later
+// decision on whether to drop 'other' from the domain entirely — this enum
+// does not make that call, it only catches values outside the documented 3.
+const patientGenderEnum = z.enum(['male', 'female', 'other'])
+
 const createPatientSchema = z.object({
   // Required fields
   name: z.string().min(1),
@@ -835,10 +890,10 @@ const createPatientSchema = z.object({
     .string()
     .min(1)
     .refine((val) => !val || isValidPhoneNumber(val, 'GH'), 'Invalid phone number'),
-  dob: z.string(),
-  gender: z.string(),
+  dob: z.string().refine(isValidDobString, 'Invalid date of birth'),
+  gender: patientGenderEnum,
   // Optional demographic / contact fields
-  email: z.string().optional(),
+  email: z.string().email().optional().or(z.literal('')),
   address: z.string().optional(),
   occupation: z.string().optional(),
   profileImage: z.string().nullish(),
@@ -885,8 +940,8 @@ const updatePatientSchema = z.object({
     .min(1)
     .refine((val) => !val || isValidPhoneNumber(val, 'GH'), 'Invalid phone number')
     .nullish(),
-  dob: z.union([z.string(), z.date()]).optional(),
-  gender: z.string().optional(),
+  dob: z.union([z.string(), z.date()]).refine(isValidDobString, 'Invalid date of birth').optional(),
+  gender: patientGenderEnum.optional(),
   email: z.string().email().nullish().or(z.literal('')),
   address: z.string().nullish(),
   occupation: z.string().nullish(),
@@ -921,6 +976,15 @@ const updatePatientSchema = z.object({
   reason: z.string().optional(),
 })
 
+class DuplicatePatientNameError extends Error {
+  existingName: string
+  constructor(existingName: string) {
+    super(`Duplicate patient name: ${existingName}`)
+    this.name = 'DuplicatePatientNameError'
+    this.existingName = existingName
+  }
+}
+
 patientsApp.post('/', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
@@ -939,39 +1003,39 @@ patientsApp.post('/', async (c) => {
     const db = getDb(process.env.DATABASE_URL!)
     c.set('skipAudit', true)
 
-    // Check for duplicate patient name
-    const existingPatient = await db.execute<{ name: string }>(
-      sql`SELECT name FROM patients WHERE LOWER(name) = LOWER(${data.name})`
-    )
+    // Duplicate-name check + patientId assignment, race-proofed:
+    //  - an advisory lock keyed on the lowercased name serializes concurrent
+    //    creates for the same name, so two requests can't both pass the
+    //    SELECT before either INSERTs (the plain SELECT-then-INSERT this
+    //    replaced could produce two patients with the same name).
+    //  - patientId collisions (FD-YYMM-XXXX, ~1.2M possible suffixes/month)
+    //    retry with a fresh suffix instead of surfacing a raw DB error — see
+    //    lib/patient-id.ts for what makes that retry actually work.
+    // Kept to just this insert — no external calls (SMS, below) run inside
+    // the open transaction/lock.
+    let newPatient: typeof patients.$inferSelect
+    try {
+      newPatient = await db.transaction(async (tx) => {
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(LOWER(${data.name})))`)
 
-    if (existingPatient.rows.length > 0) {
-      return c.json(
-        {
-          error: `A patient with the name "${existingPatient.rows[0].name}" already exists.`,
-        },
-        400
-      )
-    }
+        const existingPatient = await tx.execute<{ name: string }>(
+          sql`SELECT name FROM patients WHERE LOWER(name) = LOWER(${data.name})`
+        )
+        if (existingPatient.rows.length > 0) {
+          throw new DuplicatePatientNameError(existingPatient.rows[0].name)
+        }
 
-    // Get next patient ID based on new format: FD-YYMM-XXXX
-    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-    let randomPart = ''
-    for (let i = 0; i < 4; i++) {
-      randomPart += alphabet.charAt(Math.floor(Math.random() * alphabet.length))
-    }
-    const now = new Date()
-    const yy = String(now.getFullYear()).slice(-2)
-    const mm = String(now.getMonth() + 1).padStart(2, '0')
-    const patientId = `FD-${yy}${mm}-${randomPart}`
-
-    const [newPatient] = await db
-      .insert(patients)
-      .values({
-        ...data,
-        patientId,
-        dob: new Date(data.dob),
+        return insertPatientWithUniqueId(tx, { ...data, dob: new Date(data.dob) })
       })
-      .returning()
+    } catch (err) {
+      if (err instanceof DuplicatePatientNameError) {
+        return c.json(
+          { error: `A patient with the name "${err.existingName}" already exists.` },
+          400
+        )
+      }
+      throw err
+    }
 
     const patientData = newPatient
 
@@ -1099,7 +1163,19 @@ patientsApp.patch('/:id', async (c) => {
   }
 })
 
-patientsApp.delete('/:id', async (c) => {
+// ─── Archive / restore / permanent-delete (C5) ───────────────────────────────
+// Patients are never hard-deleted by a normal action anymore — see
+// project-docs/patient-records-and-scheduling-audit.md, finding C5. The old
+// `DELETE /:id` cascaded through every appointment, invoice, payment, medical
+// record and timeline entry for that patient with no way back. Archive marks
+// the row hidden (excluded from every list by default) but keeps all of that
+// history intact; restore flips it back. Permanent delete is admin-only,
+// password-gated (re-typed in the portal modal), and only allowed on an
+// already-archived patient — mirrors the invoices/payment_plans convention in
+// `lib/archive.ts`.
+const permanentDeleteSchema = z.object({ password: z.string().min(1) })
+
+patientsApp.post('/:id/archive', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
 
@@ -1108,18 +1184,114 @@ patientsApp.delete('/:id', async (c) => {
 
   const id = c.req.param('id')
   try {
-    const db = getDb(process.env.DATABASE_URL!)
+    const db = getDb(env.DATABASE_URL)
     c.set('skipAudit', true)
 
-    const patient = await db.query.patients.findFirst({
-      where: eq(patients.id, id),
+    const existing = await db.query.patients.findFirst({ where: eq(patients.id, id) })
+    if (!existing) return c.json({ error: 'Patient not found' }, 404)
+    if (existing.archived) return c.json({ error: 'Already archived' }, 400)
+
+    const [updated] = await db
+      .update(patients)
+      .set({ archived: true, archivedAt: new Date(), archivedBy: user.id, updatedAt: new Date() })
+      .where(eq(patients.id, id))
+      .returning()
+
+    await recordDiffAudit(db, {
+      userId: user.id,
+      action: 'update',
+      module: 'patients',
+      entityId: id,
+      entityName: existing.name,
+      before: { archived: false },
+      after: { archived: true },
+      reason: 'archive',
     })
 
-    if (!patient) return c.json({ error: 'Patient not found' }, 404)
+    return c.json({ success: true, data: updated })
+  } catch (error) {
+    logError(error, { route: 'patients.archive', userId: user.id, patientId: id })
+    return c.json({ error: 'Failed to archive patient', code: 'PATIENT_ARCHIVE_FAILED' }, 500)
+  }
+})
 
-    // Capture the reason from query param (e.g. ?reason=...)
+patientsApp.post('/:id/unarchive', async (c) => {
+  const user = await getCurrentUser(c)
+  if (!user) return c.json({ error: 'Not authenticated' }, 401)
+
+  const hasPermission = await checkPermission(c, user.id, MODULES.PATIENTS, ACTIONS.DELETE)
+  if (!hasPermission) return c.json({ error: 'Unauthorized' }, 403)
+
+  const id = c.req.param('id')
+  try {
+    const db = getDb(env.DATABASE_URL)
+    c.set('skipAudit', true)
+
+    const existing = await db.query.patients.findFirst({ where: eq(patients.id, id) })
+    if (!existing) return c.json({ error: 'Patient not found' }, 404)
+    if (!existing.archived) return c.json({ error: 'Not archived' }, 400)
+
+    const [updated] = await db
+      .update(patients)
+      .set({ archived: false, archivedAt: null, archivedBy: null, updatedAt: new Date() })
+      .where(eq(patients.id, id))
+      .returning()
+
+    await recordDiffAudit(db, {
+      userId: user.id,
+      action: 'update',
+      module: 'patients',
+      entityId: id,
+      entityName: existing.name,
+      before: { archived: true },
+      after: { archived: false },
+      reason: 'unarchive',
+    })
+
+    return c.json({ success: true, data: updated })
+  } catch (error) {
+    logError(error, { route: 'patients.unarchive', userId: user.id, patientId: id })
+    return c.json({ error: 'Failed to restore patient', code: 'PATIENT_UNARCHIVE_FAILED' }, 500)
+  }
+})
+
+patientsApp.delete('/:id/permanent', async (c) => {
+  const user = await getCurrentUser(c)
+  if (!user) return c.json({ error: 'Not authenticated' }, 401)
+
+  const id = c.req.param('id')
+  try {
+    const parsed = permanentDeleteSchema.safeParse(await c.req.json().catch(() => null))
+    if (!parsed.success) return c.json({ error: 'Password is required' }, 400)
+
+    const db = getDb(env.DATABASE_URL)
+    const auth = await verifyAdminPassword(c, db, user.id, parsed.data.password)
+    if (!auth.ok) {
+      const status = auth.reason === 'unauthorized' ? 403 : 401
+      const msg =
+        auth.reason === 'unauthorized'
+          ? 'Only admins can permanently delete'
+          : auth.reason === 'no_credential'
+            ? 'Your account has no password set'
+            : 'Password is incorrect'
+      return c.json({ error: msg }, status)
+    }
+
+    c.set('skipAudit', true)
+
+    const existing = await db.query.patients.findFirst({ where: eq(patients.id, id) })
+    if (!existing) return c.json({ error: 'Patient not found' }, 404)
+    if (!existing.archived) {
+      return c.json({ error: 'Archive the patient before permanently deleting them' }, 400)
+    }
+
+    // Capture the reason from query param (e.g. ?reason=...), same as the old
+    // hard-delete route did.
     const reason = c.req.query('reason') ?? null
 
+    // Every clinical/financial child table's patientId FK is ON DELETE CASCADE
+    // (or SET NULL where the row should outlive the patient) — see
+    // db/schema/*.ts — so a single delete here is enough; no manual fan-out.
     await db.delete(patients).where(eq(patients.id, id))
 
     await recordDiffAudit(db, {
@@ -1127,15 +1299,15 @@ patientsApp.delete('/:id', async (c) => {
       action: 'delete',
       module: 'patients',
       entityId: id,
-      entityName: patient.name,
-      before: patient,
+      entityName: existing.name,
+      before: existing,
       after: null,
-      reason,
+      reason: reason ?? 'permanent_delete',
     })
 
     return c.json({ success: true })
   } catch (error) {
-    logError(error, { route: 'patients.delete', userId: user.id, patientId: id })
+    logError(error, { route: 'patients.permanentDelete', userId: user.id, patientId: id })
     return c.json({ error: 'Failed to delete patient', code: 'PATIENT_DELETE_FAILED' }, 500)
   }
 })
@@ -1188,8 +1360,8 @@ patientsApp.post('/:id/enable-pwa', async (c) => {
       .returning()
 
     try {
-      const portalUrl = process.env.PATIENT_PORTAL_URL ?? 'https://app.deneldental.com'
-      const message = `Hello ${patient.name}, your Denel patient app access is now active.\n\nOpen ${portalUrl} and sign in with this phone number — we'll text you a one-time code.`
+      // The invitation goes to the PATIENT app, not the portal.
+      const message = `Hello ${patient.name}, your Denel patient app access is now active.\n\nOpen ${patientAppUrl()} and sign in with this phone number — we'll text you a one-time code.`
       await sendSMS(
         [{ phone: rawPhone, message, patientId: patient.id }],
         undefined,

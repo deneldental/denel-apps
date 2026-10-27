@@ -44,6 +44,14 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
         return
       }
 
+      // An administrator set this password: the person chooses their own before the
+      // shell loads (F20 / D8). The backend already refuses every other call, so this
+      // is the way forward as much as the guard.
+      if (sessionData.user.mustChangePassword) {
+        navigate('/auth/change-password', { replace: true })
+        return
+      }
+
       setUserWithRole(sessionData.user)
 
       // Fetch full permission payload — must include X-App-Id so the backend

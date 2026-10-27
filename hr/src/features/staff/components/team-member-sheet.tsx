@@ -27,6 +27,7 @@ import { cn } from '@denel/utils'
 import { ArrowLeft, KeyRound, ShieldCheck, Upload } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
+import { type WizardRole, wizardRoleOptions } from '@/features/staff/role-access'
 import {
   type EmploymentTypeRow,
   type LookupRow,
@@ -39,6 +40,7 @@ import { AvatarCropperDialog } from '@/shared/components/avatar-cropper-dialog'
 import { ConfirmDiscardDialog } from '@/shared/components/confirm-discard-dialog'
 import { SheetFormLayout } from '@/shared/components/sheet-form-layout'
 import { useFormDirtyGuard } from '@/shared/hooks/use-form-dirty-guard'
+import { useCanAssignAnyRole } from '@/shared/hooks/use-role-authority'
 import { useSubmitGuard } from '@/shared/hooks/use-submit-guard'
 
 /**
@@ -119,32 +121,6 @@ interface WizardForm {
 }
 
 const UNSET = '__unset__'
-
-/**
- * The system roles this wizard onboards. The role decides what the person
- * can do and where they can sign in (onboardedSignIns); everyone onboarded
- * here also keeps the Team app for their own payslips, requests and
- * training. `doctor` and `external_trainer` are absent because they are
- * onboarded through their own flows.
- *
- * This replaced a 'Portal access' switch (off by default) plus a portal-role
- * picker: choosing the job title 'Receptionist' and leaving the switch off
- * produced a Team-only account that bounced off every portal page.
- */
-const SYSTEM_ROLE_OPTIONS = [
-  {
-    value: 'staff',
-    label: 'Staff',
-    hint: 'Payslips, requests, training and attendance in the Team app.',
-  },
-  {
-    value: 'receptionist',
-    label: 'Receptionist',
-    hint: 'Front-desk work in the clinic portal: patients, appointments and payments.',
-  },
-  { value: 'lab_technician', label: 'Lab Technician', hint: 'Lab cases in the Team app.' },
-  { value: 'admin', label: 'Admin', hint: 'Full access to the clinic portal and the HR app.' },
-] as const
 
 const INITIAL_FORM: WizardForm = {
   name: '',
@@ -443,6 +419,10 @@ export function TeamMemberSheet({ open, onOpenChange, onSave }: TeamMemberSheetP
   const [cropperSource, setCropperSource] = useState<File | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
+  // Offer only the roles this person may actually give (D15). The server refuses the rest.
+  const canAssignAnyRole = useCanAssignAnyRole()
+  const roleOptions = useMemo(() => wizardRoleOptions(canAssignAnyRole), [canAssignAnyRole])
+
   // ── Validation ──────────────────────────────────────────────────────────
   //
   // Required stays deliberately minimal: name, email, password. HR must be able
@@ -626,7 +606,7 @@ export function TeamMemberSheet({ open, onOpenChange, onSave }: TeamMemberSheetP
             />
           )}
           {step === 4 && <PayStep form={form} set={set} />}
-          {step === 5 && <AccessStep form={form} set={set} />}
+          {step === 5 && <AccessStep form={form} set={set} roleOptions={roleOptions} />}
         </div>
       </SheetFormLayout>
 
@@ -1198,8 +1178,16 @@ function PayStep({ form, set }: { form: WizardForm; set: SetFn }) {
 
 // ── Step 5 — Access ──────────────────────────────────────────────────────────
 
-function AccessStep({ form, set }: { form: WizardForm; set: SetFn }) {
-  const selectedRole = SYSTEM_ROLE_OPTIONS.find((r) => r.value === form.systemRole)
+function AccessStep({
+  form,
+  set,
+  roleOptions,
+}: {
+  form: WizardForm
+  set: SetFn
+  roleOptions: readonly WizardRole[]
+}) {
+  const selectedRole = roleOptions.find((r) => r.value === form.systemRole)
   return (
     <div className="grid gap-5">
       <div className="space-y-2">
@@ -1227,7 +1215,7 @@ function AccessStep({ form, set }: { form: WizardForm; set: SetFn }) {
             <SelectValue placeholder="Pick a role" />
           </SelectTrigger>
           <SelectContent>
-            {SYSTEM_ROLE_OPTIONS.map((r) => (
+            {roleOptions.map((r) => (
               <SelectItem key={r.value} value={r.value}>
                 {r.label}
               </SelectItem>

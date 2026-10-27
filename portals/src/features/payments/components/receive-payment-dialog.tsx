@@ -1,10 +1,17 @@
 import { cents } from '@denel/utils'
 import { useQueryClient } from '@tanstack/react-query'
 import { Plus, Trash2, X } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import {
+  type ReceiptDataShape,
+  ReceiptViewDialog,
+} from '@/features/payments/components/receipt-view-dialog'
+import {
   type InvoiceDraft,
+  type InvoiceLine,
+  type LegacyTreatment,
+  listInvoiceLines,
   listPatientInvoices,
   listPlanInvoices,
   type PlanInvoiceSummary,
@@ -23,6 +30,7 @@ import { ConfirmDiscardDialog } from '@/shared/components/confirm-discard-dialog
 import { PaymentMethodSelect } from '@/shared/components/payment-method-select'
 import { Badge } from '@/shared/components/ui/badge'
 import { Button } from '@/shared/components/ui/button'
+import { Checkbox } from '@/shared/components/ui/checkbox'
 import {
   Dialog,
   DialogContent,
@@ -44,6 +52,7 @@ import { useFormDirtyGuard } from '@/shared/hooks/use-form-dirty-guard'
 import { useSubmitGuard } from '@/shared/hooks/use-submit-guard'
 import { localDateISO } from '@/shared/lib/dates'
 import { formatCurrency, parseCurrency } from '@/shared/utils/currency'
+import { openReceiptWindow, printOutstandingBalanceSlip } from '@/shared/utils/receipt'
 
 type Props = {
   open: boolean
@@ -51,6 +60,8 @@ type Props = {
   patientId: string
   patientName?: string
   onPosted?: () => void
+  /** The visit this payment is for (at check-in); every payment posted names it. */
+  appointmentId?: string
   /** Scope to a plan's invoices when set. */
   planId?: string
   /** Scope to a single invoice when set. The user can still add other open
@@ -65,6 +76,84 @@ type OpenInvoice = {
   status: string
   balance: number
   dueDate: string | null
+  /** An archived invoice is put away: it is not offered for payment (the ledger's outstanding
+   *  total leaves it out too). */
+  archived: boolean
+  /** Only for invoices raised by the old plan path, which have no invoice lines (see
+   *  `deriveInvoiceDisplayItems`). */
+  treatments?: LegacyTreatment[] | null
+}
+
+export type InvoiceDisplayItem = { name: string; cost: number }
+
+/**
+ * What an invoice being paid is for, as a list of services with their amounts.
+ *
+ * It prefers the invoice's real lines. Invoices raised by the old payment-plan path never got
+ * lines: the services they were raised for live only in the invoice's `treatments` column, so
+ * that is used when there are no lines.
+ */
+export function deriveInvoiceDisplayItems(
+  lines: Pick<InvoiceLine, 'description' | 'lineTotal'>[] | undefined,
+  treatments: LegacyTreatment[] | null | undefined
+): InvoiceDisplayItem[] {
+  const fromLines = (lines ?? [])
+    .map((l) => ({ name: (l.description ?? '').trim(), cost: Number(l.lineTotal) }))
+    .filter((item) => item.name.length > 0)
+  if (fromLines.length > 0) return fromLines
+
+  return (treatments ?? [])
+    .map((t) => ({ name: (t.name ?? '').trim(), cost: Number(t.amount) }))
+    .filter((item) => item.name.length > 0 && Number.isFinite(item.cost))
+}
+
+/** One invoice's services, or the fact that they could not be loaded. */
+type InvoiceLines = { ok: true; lines: InvoiceLine[] } | { ok: false }
+
+/**
+ * What the patient's ledger (`GET /api/patients/:id/ledger`) says about money, as the SERVER works
+ * it out. Each part is null when it could not be read: a failed read is "unknown" and is shown as
+ * unknown, never as zero.
+ */
+type LedgerReadout = {
+  walletBalance: number | null
+  outstanding: {
+    total: number
+    invoices: Array<{ id: string; invoiceNumber: string; balance: number; dueDate: string | null }>
+  } | null
+}
+
+/** The part of the ledger that says what the patient owes, once it is known to have been read. */
+type KnownOutstanding = NonNullable<LedgerReadout['outstanding']>
+
+const UNKNOWN_LEDGER: LedgerReadout = { walletBalance: null, outstanding: null }
+
+const finiteOrNull = (v: unknown): number | null => {
+  if (v == null) return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+function readLedger(res: { success: boolean; data?: unknown }): LedgerReadout {
+  if (!res.success || !res.data || typeof res.data !== 'object') return UNKNOWN_LEDGER
+  const d = res.data as Record<string, unknown>
+  const total = finiteOrNull(d.outstandingBalance)
+  const list = d.outstandingInvoices
+  return {
+    walletBalance: finiteOrNull(d.walletBalance),
+    outstanding:
+      total !== null && Array.isArray(list)
+        ? {
+            total,
+            invoices: list.map((i: Record<string, unknown>) => ({
+              id: String(i.id),
+              invoiceNumber: String(i.invoiceNumber),
+              balance: Number(i.balance),
+              dueDate: i.dueDate ? String(i.dueDate) : null,
+            })),
+          }
+        : null,
+  }
 }
 
 /** A single payment source — wallet, cash, momo, etc. The submit handler
@@ -94,6 +183,7 @@ export function ReceivePaymentDialog({
   patientId,
   patientName,
   onPosted,
+  appointmentId,
   planId,
   invoiceId,
 }: Props) {
@@ -107,14 +197,30 @@ export function ReceivePaymentDialog({
   /** Sources funding this payment (split-payment support). */
   const [sources, setSources] = useState<PaymentSource[]>([newSource('cash', '')])
 
+  /** Print a "total outstanding balance" slip after the payment posts. Separate from the
+   *  per-payment receipt, which is unaffected. */
+  const [printOutstanding, setPrintOutstanding] = useState(false)
+
+  /** Text the patient a payment confirmation (G08). The server names what was posted and texts an
+   *  event once; the dialog asks with the last payment it posts, so a split is texted for its total. */
+  const [sendSms, setSendSms] = useState(true)
+
   const { isSubmitting: busy, submit } = useSubmitGuard()
   const queryClient = useQueryClient()
+
+  // ── Receipt (shown by itself after a successful post) ─────────────────────
+  const [showReceiptDialog, setShowReceiptDialog] = useState(false)
+  const [receiptData, setReceiptData] = useState<ReceiptDataShape | null>(null)
+  /** Closing the dialog and firing `onPosted` unmounts this component at several call sites (they
+   *  gate rendering on what `onPosted` clears), so both wait until the receipt is dismissed:
+   *  otherwise the receipt would never get the chance to render. */
+  const finalizeRef = useRef<(() => void) | null>(null)
 
   // ── Fetch ───────────────────────────────────────────────────────────────
   // Scoped by patient/plan/invoice — a dedicated key, not shared with any
   // other screen (this combines two reads + a client-side filter/sort that
   // no other consumer needs).
-  const dataQuery = useApiQuery<{ invoices: OpenInvoice[]; walletBalance: number }>(
+  const dataQuery = useApiQuery<{ invoices: OpenInvoice[]; ledger: LedgerReadout }>(
     ['receive-payment', patientId, planId ?? null, invoiceId ?? null] as const,
     async () => {
       const invoicesFetcher = planId
@@ -128,6 +234,9 @@ export function ReceivePaymentDialog({
                 status: inv.status,
                 balance: Number(inv.balance),
                 dueDate: inv.dueDate,
+                // The plan's own list already leaves archived invoices out.
+                archived: false,
+                treatments: inv.treatments ?? null,
               })
             ),
           }))
@@ -141,16 +250,21 @@ export function ReceivePaymentDialog({
                 status: inv.status,
                 balance: Number(inv.balance),
                 dueDate: inv.dueDate,
+                archived: inv.archived === true,
+                treatments: inv.treatments ?? null,
               })
             ),
           }))
 
-      const [invRes, wallet] = await Promise.all([
+      // The ledger is the server's own account of the patient's money: the wallet credit, and the
+      // total outstanding across EVERY open invoice (which the invoices listed here may be only a
+      // part of). A read that fails is unknown, not zero.
+      const [invRes, ledger] = await Promise.all([
         invoicesFetcher,
         api
-          .get<{ walletBalance: number }>(`/api/patients/${patientId}/ledger`)
-          .then((r) => (r.success && r.data ? Number(r.data.walletBalance) : 0))
-          .catch(() => 0),
+          .get<unknown>(`/api/patients/${patientId}/ledger`)
+          .then(readLedger)
+          .catch(() => UNKNOWN_LEDGER),
       ])
       if (!invRes.success) {
         return { success: false, error: invRes.error ?? 'Failed to load invoices' }
@@ -158,7 +272,7 @@ export function ReceivePaymentDialog({
       // Keep only invoices that actually have an outstanding balance and are
       // in a payable state.
       const payable = invRes.rows.filter(
-        (r) => r.balance > 0 && r.status !== 'void' && r.status !== 'written_off'
+        (r) => r.balance > 0 && !r.archived && r.status !== 'void' && r.status !== 'written_off'
       )
       // Sort oldest-first by due date so auto-allocation walks them in
       // chronological order.
@@ -167,13 +281,17 @@ export function ReceivePaymentDialog({
         const bd = b.dueDate ?? ''
         return ad.localeCompare(bd)
       })
-      return { success: true, data: { invoices: sorted, walletBalance: wallet } }
+      return { success: true, data: { invoices: sorted, ledger } }
     },
     { enabled: open }
   )
   const allOpenInvoices = dataQuery.data?.invoices ?? []
-  const walletBalance = dataQuery.data?.walletBalance ?? 0
+  const ledger = dataQuery.data?.ledger ?? UNKNOWN_LEDGER
+  // null = not known (still loading, or the ledger could not be read): never treated as zero.
+  const walletBalance = ledger.walletBalance
+  const outstanding = ledger.outstanding
   const loading = dataQuery.isLoading
+  const loadFailed = dataQuery.isError
 
   useEffect(() => {
     if (dataQuery.isError) toast.error(dataQuery.error.message || 'Failed to load invoices')
@@ -184,6 +302,8 @@ export function ReceivePaymentDialog({
     if (!open) return
     setSources([newSource('cash', '')])
     setPaymentDate(localDateISO())
+    setPrintOutstanding(false)
+    setSendSms(true)
   }, [open])
 
   // Seed the initial invoice selection once the invoice list loads (or
@@ -219,6 +339,24 @@ export function ReceivePaymentDialog({
     () => allOpenInvoices.filter((i) => !selectedInvoiceIds.includes(i.id)),
     [allOpenInvoices, selectedInvoiceIds]
   )
+
+  // What each selected invoice is for. One read per invoice, each recording on its own whether it
+  // worked, so a failure on one is shown on that invoice and does not blank the others.
+  const lineItemsKey = useMemo(() => [...selectedInvoiceIds].sort().join(','), [selectedInvoiceIds])
+  const lineItemsQuery = useApiQuery<Record<string, InvoiceLines>>(
+    ['receive-payment-lines', lineItemsKey] as const,
+    async () => {
+      const ids = lineItemsKey ? lineItemsKey.split(',') : []
+      const results = await Promise.all(ids.map((id) => listInvoiceLines(id)))
+      const byInvoiceId: Record<string, InvoiceLines> = {}
+      results.forEach((res, idx) => {
+        byInvoiceId[ids[idx]] = res.success ? { ok: true, lines: res.data } : { ok: false }
+      })
+      return { success: true, data: byInvoiceId }
+    },
+    { enabled: open && lineItemsKey.length > 0 }
+  )
+  const linesByInvoiceId = lineItemsQuery.data ?? {}
 
   // Source inputs hold cedis TEXT; `parseCurrency` returns integer CENTS —
   // the unit `inv.balance`, `walletBalance` and the API all use, so every
@@ -268,7 +406,10 @@ export function ReceivePaymentDialog({
   const overspill = Math.max(0, sourceTotal - allocatedTotal)
   const overspillSignificant = overspill > 0
 
-  const walletOverdrawn = walletUsed > walletBalance
+  // Paying from the wallet needs the wallet credit to be KNOWN and to cover it: credit that could
+  // not be read is not credit of zero to be silently worked around, it is a reason to say so.
+  const walletUnknown = walletUsed > 0 && walletBalance === null
+  const walletOverdrawn = walletUsed > 0 && walletBalance !== null && walletUsed > walletBalance
   const sourcesUnderfunded = sourceTotal <= 0
 
   // ── Dirty guard ─────────────────────────────────────────────────────────
@@ -304,6 +445,109 @@ export function ReceivePaymentDialog({
     setSelectedInvoiceIds((prev) => prev.filter((i) => i !== id))
   }
 
+  // ── Receipt ─────────────────────────────────────────────────────────────
+  /** Runs after a (fully or partly) successful post. Shows the receipt for `paymentId` and defers
+   *  closing the dialog and `onPosted` until it is dismissed. Not at a visit: a check-in follows
+   *  the payment as a request of its own and must not wait for a receipt to be closed. Finishes
+   *  at once when there is no receipt to show or it cannot be loaded. */
+  const showReceiptThenFinish = useCallback(
+    async (paymentId: string | null) => {
+      const finalize = () => {
+        queryClient.invalidateQueries({ queryKey: queryKeys.patients.balance(patientId) })
+        onOpenChange(false)
+        onPosted?.()
+      }
+      if (!paymentId || appointmentId) {
+        finalize()
+        return
+      }
+      try {
+        const res = await api.get<ReceiptDataShape>(`/api/payments/${paymentId}/receipt`)
+        if (res.success && res.data) {
+          finalizeRef.current = finalize
+          setReceiptData(res.data)
+          setShowReceiptDialog(true)
+          return
+        }
+      } catch {
+        // Fall through: the payment posted fine, only its receipt could not be loaded.
+      }
+      toast.error('Payment posted, but the receipt could not be loaded for printing.')
+      finalize()
+    },
+    [queryClient, patientId, appointmentId, onOpenChange, onPosted]
+  )
+
+  // ── Outstanding-balance slip ────────────────────────────────────────────
+  /** Print the patient's outstanding-balance slip into `win`. `before` is what the ledger said was
+   *  outstanding when the form loaded (the state before the payment): the slip is never made
+   *  without it, since a slip of zeros would be worse than none. The balances printed are the
+   *  SERVER's, read again after the posting: an invoice's balance before the payment is what the
+   *  server now says plus what this payment applied to it. If they cannot be read again, `before`
+   *  is used as it is. Never throws: the payment is posted whatever happens here. */
+  const printSlip = useCallback(
+    async (win: Window, before: KnownOutstanding) => {
+      try {
+        let invoices = before.invoices.map((i) => ({
+          invoiceNumber: i.invoiceNumber,
+          dueDate: i.dueDate,
+          balanceBefore: i.balance,
+        }))
+        let balanceDue = Math.max(0, before.total - allocatedTotal)
+        try {
+          const fresh = readLedger(
+            await api.get<unknown>(`/api/patients/${patientId}/ledger`)
+          ).outstanding
+          if (fresh) {
+            const listed = new Set(fresh.invoices.map((i) => i.id))
+            invoices = fresh.invoices.map((i) => ({
+              invoiceNumber: i.invoiceNumber,
+              dueDate: i.dueDate,
+              balanceBefore: i.balance + (allocations.get(i.id) ?? 0),
+            }))
+            // An invoice this payment settled is no longer outstanding on the server, but it was.
+            for (const inv of selectedInvoices) {
+              const applied = allocations.get(inv.id) ?? 0
+              if (!listed.has(inv.id) && applied > 0) {
+                invoices.push({
+                  invoiceNumber: inv.invoiceNumber,
+                  dueDate: inv.dueDate,
+                  balanceBefore: applied,
+                })
+              }
+            }
+            balanceDue = fresh.total
+          }
+        } catch {
+          // Keep the balances loaded with the form.
+        }
+        // Most call sites don't pass a name — look it up rather than print a placeholder.
+        let name = patientName
+        if (!name) {
+          try {
+            const res = await api.get<{ name: string }>(`/api/patients/${patientId}`)
+            name = res.data?.name
+          } catch {
+            // fall through to the placeholder
+          }
+        }
+        await printOutstandingBalanceSlip({
+          patientName: name ?? 'Patient',
+          invoices: [...invoices].sort((a, b) => (a.dueDate ?? '').localeCompare(b.dueDate ?? '')),
+          paidNow: allocatedTotal,
+          balanceDue,
+          existingWindow: win,
+        })
+      } catch {
+        win.close()
+        toast.error(
+          'The payment was posted, but the outstanding-balance slip could not be printed.'
+        )
+      }
+    },
+    [patientId, patientName, selectedInvoices, allocations, allocatedTotal]
+  )
+
   // ── Submit ──────────────────────────────────────────────────────────────
   const submitOnSubmit = useCallback(() => {
     submit(async () => {
@@ -336,9 +580,15 @@ export function ReceivePaymentDialog({
         )
         return
       }
+      if (walletUnknown) {
+        toast.error(
+          'Wallet credit could not be loaded, so a wallet payment cannot be taken right now. Try again, or pay by another method.'
+        )
+        return
+      }
       if (walletOverdrawn) {
         toast.error(
-          `Wallet credit available is ${formatCurrency(walletBalance)} — you've tried to use ${formatCurrency(walletUsed)}.`
+          `Wallet credit available is ${formatCurrency(walletBalance ?? 0)} — you've tried to use ${formatCurrency(walletUsed)}.`
         )
         return
       }
@@ -363,8 +613,18 @@ export function ReceivePaymentDialog({
       let allocRemaining = allocList[0]?.amount ?? 0
 
       // Track successfully posted draft ids so partial-failure can be surfaced
-      // without silently hiding work that did complete.
+      // without silently hiding work that did complete, and so the receipt can be loaded for
+      // the payment(s) that actually posted.
       const postedSourceIndices: number[] = []
+      const postedPaymentIds: string[] = []
+      /** Why the payment-confirmation text failed, when it did (the payment stands either way). */
+      let smsError: string | undefined
+
+      // Opened here, synchronously and still inside the click: a popup opened after the postings
+      // below would be blocked by the browser. Only when the slip can be made from known balances.
+      const slipBasis = printOutstanding ? outstanding : null
+      const slipWindow = slipBasis ? openReceiptWindow('balance slip') : null
+      let slipHandedOver = false
 
       try {
         for (let srcIdx = 0; srcIdx < sources.length; srcIdx++) {
@@ -401,6 +661,7 @@ export function ReceivePaymentDialog({
             paymentDate,
             externalReference: src.externalRef.trim() || null,
             allocations: sourceAllocs,
+            appointmentId: appointmentId ?? null,
             paymentPlanId: planId ?? null,
             paymentGroupId,
           }
@@ -408,42 +669,66 @@ export function ReceivePaymentDialog({
           if (!draftRes.success || !draftRes.data) {
             throw new Error(draftRes.error ?? 'Failed to create draft payment')
           }
-          const postRes = await postDraftPayment(draftRes.data.id)
+          // The text is asked for with the LAST payment only: the server names what has been
+          // posted for the whole group then, and texts the group once.
+          const postRes = await postDraftPayment(draftRes.data.id, {
+            sendSms: sendSms && srcIdx === sources.length - 1,
+          })
           if (!postRes.success) {
             throw new Error(postRes.error ?? 'Failed to post payment')
           }
+          if (postRes.smsError) smsError = postRes.smsError
           postedSourceIndices.push(srcIdx)
+          postedPaymentIds.push(draftRes.data.id)
         }
 
         toast.success(
           `Posted ${sources.length} payment${sources.length > 1 ? 's' : ''} — total ${formatCurrency(sourceTotal)}`
         )
-        queryClient.invalidateQueries({ queryKey: queryKeys.patients.balance(patientId) })
-        onOpenChange(false)
-        onPosted?.()
+        if (smsError) {
+          toast.warning(`Payment posted, but the confirmation text was not sent: ${smsError}`)
+        }
+        if (slipWindow && slipBasis) {
+          slipHandedOver = true
+          await printSlip(slipWindow, slipBasis)
+        } else if (slipBasis) {
+          toast.warning(
+            'The browser blocked the outstanding-balance slip. Allow pop-ups for this site to print it.'
+          )
+        }
+        // Any posted id works: the receipt endpoint gathers every payment that shares the
+        // group, so a split still shows every method on the one slip.
+        await showReceiptThenFinish(postedPaymentIds[0] ?? null)
       } catch (err) {
         const postedCount = postedSourceIndices.length
         if (postedCount > 0) {
-          // Partial success — close the dialog and refresh so posted payments
-          // are visible and the user is not at risk of double-posting.
+          // Partial success — say what posted and still offer its receipt; the dialog finishes
+          // (and refreshes the caller) once the receipt is dismissed, so posted payments are
+          // visible and the user is not at risk of double-posting.
           toast.error(
             `${postedCount} of ${sources.length} payment${sources.length > 1 ? 's' : ''} posted — one failed: ${err instanceof Error ? err.message : 'Unknown error'}. Check the transactions list.`
           )
-          queryClient.invalidateQueries({ queryKey: queryKeys.patients.balance(patientId) })
-          onOpenChange(false)
-          onPosted?.()
+          await showReceiptThenFinish(postedPaymentIds[0] ?? null)
         } else {
           toast.error(err instanceof Error ? err.message : 'Failed to post payment')
         }
+      } finally {
+        // A window that was opened but never handed to the slip (the payment was refused, or
+        // stopped part-way) must not be left behind blank.
+        if (slipWindow && !slipHandedOver) slipWindow.close()
       }
     })
   }, [
     submit,
+    printOutstanding,
+    outstanding,
+    printSlip,
     sources,
     sourcesUnderfunded,
     selectedInvoices,
     overspill,
     overspillSignificant,
+    walletUnknown,
     walletOverdrawn,
     walletBalance,
     walletUsed,
@@ -451,10 +736,10 @@ export function ReceivePaymentDialog({
     paymentDate,
     patientId,
     planId,
+    appointmentId,
     sourceTotal,
-    onOpenChange,
-    onPosted,
-    queryClient,
+    sendSms,
+    showReceiptThenFinish,
   ])
 
   return (
@@ -481,7 +766,7 @@ export function ReceivePaymentDialog({
                   <div className="text-sm font-medium">Payment sources</div>
                   <p className="text-[11px] text-muted-foreground">
                     Each source becomes its own transaction line with a receipt.
-                    {walletBalance > 0 && (
+                    {walletBalance !== null && walletBalance > 0 && (
                       <>
                         {' '}
                         Wallet credit available:{' '}
@@ -490,6 +775,9 @@ export function ReceivePaymentDialog({
                         </strong>
                         .
                       </>
+                    )}
+                    {!loading && walletBalance === null && (
+                      <span className="text-red-600"> Wallet credit could not be loaded.</span>
                     )}
                   </p>
                 </div>
@@ -503,7 +791,7 @@ export function ReceivePaymentDialog({
                   const overdraft =
                     src.method === 'wallet' &&
                     Number(src.amount) > 0 &&
-                    walletUsed > walletBalance + 0.005
+                    (walletBalance === null || walletUsed > walletBalance + 0.005)
                   return (
                     <div
                       key={src.key}
@@ -533,7 +821,9 @@ export function ReceivePaymentDialog({
                         >
                           <span>Wallet credit remaining</span>
                           <span className="font-mono font-semibold">
-                            {formatCurrency(Math.max(0, walletBalance - walletUsed))}
+                            {walletBalance === null
+                              ? 'unavailable'
+                              : formatCurrency(Math.max(0, walletBalance - walletUsed))}
                           </span>
                         </div>
                       ) : (
@@ -618,6 +908,21 @@ export function ReceivePaymentDialog({
 
               {loading ? (
                 <Skeleton className="h-32 m-3" />
+              ) : loadFailed ? (
+                <div
+                  role="alert"
+                  className="flex items-center justify-between gap-3 p-4 text-sm text-destructive"
+                >
+                  <span>Couldn’t load this patient’s invoices, so none can be paid from here.</span>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => dataQuery.refetch()}
+                  >
+                    Try again
+                  </Button>
+                </div>
               ) : selectedInvoices.length === 0 ? (
                 <p className="p-4 text-sm text-muted-foreground text-center">
                   {addableInvoices.length > 0
@@ -630,6 +935,12 @@ export function ReceivePaymentDialog({
                     const allocated = allocations.get(inv.id) ?? 0
                     const newBalance = Math.max(0, inv.balance - allocated)
                     const fullyPaid = newBalance < 0.005 && allocated > 0
+                    const loadedLines = linesByInvoiceId[inv.id]
+                    const displayItems = deriveInvoiceDisplayItems(
+                      loadedLines?.ok ? loadedLines.lines : undefined,
+                      inv.treatments
+                    )
+                    const linesFailed = lineItemsQuery.isError || (!!loadedLines && !loadedLines.ok)
                     return (
                       <div
                         key={inv.id}
@@ -644,6 +955,34 @@ export function ReceivePaymentDialog({
                               <Badge className="bg-emerald-600 hover:bg-emerald-700 text-[9px] h-4 px-1.5">
                                 Will be paid
                               </Badge>
+                            )}
+                          </div>
+                          {/* What the invoice is for: its lines, else the treatments recorded on a
+                              legacy invoice. A failed read is said, not shown as "no items". */}
+                          <div className="text-xs text-foreground">
+                            {lineItemsQuery.isLoading ? (
+                              'Loading treatments…'
+                            ) : displayItems.length > 0 ? (
+                              <ul className="space-y-0.5">
+                                {displayItems.map((item, idx) => (
+                                  <li
+                                    // biome-ignore lint/suspicious/noArrayIndexKey: two lines can share a name and an amount
+                                    key={`${idx}:${item.name}:${item.cost}`}
+                                    className="flex items-baseline justify-between gap-2"
+                                  >
+                                    <span className="truncate" title={item.name}>
+                                      {item.name}
+                                    </span>
+                                    <span className="font-mono text-[11px] text-muted-foreground shrink-0">
+                                      {formatCurrency(item.cost)}
+                                    </span>
+                                  </li>
+                                ))}
+                              </ul>
+                            ) : linesFailed ? (
+                              'Couldn’t load this invoice’s services'
+                            ) : (
+                              'No line items on this invoice'
                             )}
                           </div>
                           <div className="text-[11px] text-muted-foreground">
@@ -708,6 +1047,46 @@ export function ReceivePaymentDialog({
                   {formatCurrency(Math.max(0, invoicesOutstandingTotal - allocatedTotal))}
                 </span>
               </div>
+              {/* Everything the patient owes, as the server works it out: more than the invoices on
+                  this screen when only one is being paid. A figure that could not be read is said
+                  so, never shown as zero. */}
+              <div className="flex justify-between border-t pt-1">
+                <span>
+                  Patient total outstanding
+                  {outstanding
+                    ? ` (${outstanding.invoices.length} invoice${outstanding.invoices.length === 1 ? '' : 's'})`
+                    : ''}
+                </span>
+                <span className="font-mono">
+                  {loading
+                    ? 'Loading…'
+                    : outstanding
+                      ? formatCurrency(outstanding.total)
+                      : 'Couldn’t be loaded'}
+                </span>
+              </div>
+              <div className="flex items-center gap-2 pt-1">
+                <Checkbox
+                  id="rp-print-outstanding"
+                  checked={printOutstanding}
+                  onCheckedChange={(checked) => setPrintOutstanding(checked === true)}
+                  disabled={busy || !outstanding}
+                />
+                <Label htmlFor="rp-print-outstanding" className="text-xs font-normal">
+                  Print total outstanding balance (separate from the payment receipt)
+                </Label>
+              </div>
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id="rp-send-sms"
+                  checked={sendSms}
+                  onCheckedChange={(checked) => setSendSms(checked === true)}
+                  disabled={busy}
+                />
+                <Label htmlFor="rp-send-sms" className="text-xs font-normal">
+                  Text the patient a payment confirmation (SMS)
+                </Label>
+              </div>
 
               {/* Errors */}
               {overspillSignificant && (
@@ -735,6 +1114,7 @@ export function ReceivePaymentDialog({
               disabled={
                 busy ||
                 loading ||
+                loadFailed ||
                 sourcesUnderfunded ||
                 selectedInvoices.length === 0 ||
                 overspillSignificant ||
@@ -750,6 +1130,24 @@ export function ReceivePaymentDialog({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      {/* The receipt of what was just posted, printed as soon as it shows. Dismissing it is what
+          finishes the dialog (see `finalizeRef`). */}
+      {receiptData && (
+        <ReceiptViewDialog
+          open={showReceiptDialog}
+          onOpenChange={(o) => {
+            setShowReceiptDialog(o)
+            if (!o) {
+              setReceiptData(null)
+              const finalize = finalizeRef.current
+              finalizeRef.current = null
+              finalize?.()
+            }
+          }}
+          receiptData={receiptData}
+          autoPrint
+        />
+      )}
       <ConfirmDiscardDialog
         open={confirmOpen}
         onConfirm={confirmDiscard}

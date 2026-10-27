@@ -140,10 +140,25 @@ export async function setUserPassword(
   plaintextPassword: string
 ): Promise<void> {
   const hashed = await hashPassword(plaintextPassword)
-  await db
+  const now = new Date()
+  const updated = await db
     .update(schema.account)
-    .set({ password: hashed, updatedAt: new Date() })
+    .set({ password: hashed, updatedAt: now })
     .where(and(eq(schema.account.userId, userId), eq(schema.account.providerId, 'credential')))
+    .returning({ id: schema.account.id })
+  // A login created without a credential (a phone/OTP-only account) has no row to
+  // update; setting its password must create one, not report success and do nothing.
+  if (updated.length === 0) {
+    await db.insert(schema.account).values({
+      id: crypto.randomUUID(),
+      accountId: userId,
+      providerId: 'credential',
+      userId,
+      password: hashed,
+      createdAt: now,
+      updatedAt: now,
+    })
+  }
   await revokeAllSessionsForUser(db, userId)
 }
 

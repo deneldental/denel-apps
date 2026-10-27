@@ -1,5 +1,6 @@
 import { and, asc, count, desc, eq, inArray } from 'drizzle-orm'
 import { Hono } from 'hono'
+import { z } from 'zod'
 import { type DB, getDb } from '../db'
 import {
   invoiceLines,
@@ -331,6 +332,112 @@ treatmentPlansApp.get('/:id', async (c) => {
   }
 })
 
+/**
+ * Decision D12 (audit F36): a plan built from an estimate keeps the prices the patient
+ * was quoted. The caller names the estimate (`sourceInvoiceId`) and, for each
+ * procedure seeded from it, the estimate line it came from (`sourceLineId`). Each such
+ * procedure is priced at that line's quoted total; the catalogue base price, which
+ * drops any variant, tooth class, surcharge or discount, applies only to hand-added
+ * procedures. Runs inside the creating transaction, with the estimate row locked, so
+ * two requests cannot both build a plan for the same estimate.
+ */
+type QuotedLine = { serviceId: string | null; lineTotal: number; description: string }
+type QuoteResult =
+  | { ok: true; sourceInvoiceId: string | null; lines: Map<string, QuotedLine> }
+  | { ok: false; status: 400 | 404 | 409; error: string }
+
+const uuidSchema = z.string().uuid()
+
+async function loadQuote(
+  tx: DB,
+  patientId: string,
+  rawSource: unknown,
+  items: ReadonlyArray<{ sourceLineId?: unknown }>
+): Promise<QuoteResult> {
+  const lineIds: unknown[] = items
+    .map((it) => it?.sourceLineId)
+    .filter((v) => v != null && v !== '')
+  if (rawSource == null || rawSource === '') {
+    if (lineIds.length > 0) {
+      return { ok: false, status: 400, error: 'sourceLineId needs a sourceInvoiceId' }
+    }
+    return { ok: true, sourceInvoiceId: null, lines: new Map() }
+  }
+  const source = uuidSchema.safeParse(rawSource)
+  if (!source.success) return { ok: false, status: 400, error: 'Invalid sourceInvoiceId' }
+  if (lineIds.some((id) => !uuidSchema.safeParse(id).success)) {
+    return { ok: false, status: 400, error: 'Invalid sourceLineId' }
+  }
+  if (new Set(lineIds).size !== lineIds.length) {
+    return { ok: false, status: 400, error: 'Each estimate line can be used once' }
+  }
+
+  const [estimate] = await tx
+    .select({
+      id: invoices.id,
+      patientId: invoices.patientId,
+      type: invoices.type,
+      status: invoices.status,
+      invoiceNumber: invoices.invoiceNumber,
+    })
+    .from(invoices)
+    .where(eq(invoices.id, source.data))
+    .for('update')
+  if (!estimate || estimate.type !== 'one_time') {
+    return { ok: false, status: 404, error: 'Estimate not found' }
+  }
+  if (estimate.patientId !== patientId) {
+    return { ok: false, status: 400, error: 'That estimate belongs to another patient' }
+  }
+  // Same rule as /from-invoice: a plan exists once reception has committed the charge.
+  if (estimate.status === 'draft') {
+    return {
+      ok: false,
+      status: 409,
+      error: `Estimate ${estimate.invoiceNumber} has not been issued yet. Reception must confirm it before a treatment plan is created.`,
+    }
+  }
+  if (estimate.status === 'void') {
+    return { ok: false, status: 409, error: `Estimate ${estimate.invoiceNumber} was voided.` }
+  }
+  const [existing] = await tx
+    .select({ id: treatmentPlans.id })
+    .from(treatmentPlans)
+    .where(eq(treatmentPlans.sourceInvoiceId, estimate.id))
+    .limit(1)
+  if (existing) {
+    return {
+      ok: false,
+      status: 409,
+      error: `A treatment plan already exists for estimate ${estimate.invoiceNumber}.`,
+    }
+  }
+
+  const rows = await tx
+    .select({
+      id: invoiceLines.id,
+      serviceId: invoiceLines.serviceId,
+      lineTotal: invoiceLines.lineTotal,
+      description: invoiceLines.description,
+    })
+    .from(invoiceLines)
+    .where(eq(invoiceLines.invoiceId, estimate.id))
+  const lines = new Map(
+    rows.map((r) => [
+      r.id,
+      { serviceId: r.serviceId, lineTotal: Number(r.lineTotal), description: r.description },
+    ])
+  )
+  if (lineIds.some((id) => !lines.has(id as string))) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'A procedure names a line that is not on that estimate',
+    }
+  }
+  return { ok: true, sourceInvoiceId: estimate.id, lines }
+}
+
 // POST /api/treatment-plans — create plan with items
 // Body: { patientId, title, notes?, items: [{ procedureName, toothNumber?, phase, estimatedCost, notes? }] }
 treatmentPlansApp.post('/', async (c) => {
@@ -350,37 +457,87 @@ treatmentPlansApp.post('/', async (c) => {
   const body = await c.req.json()
   if (!body.patientId || !body.title) return c.json({ error: 'patientId and title required' }, 400)
 
+  // Reading an estimate's quoted prices is estimate access, so naming one needs it.
+  if (
+    body.sourceInvoiceId != null &&
+    body.sourceInvoiceId !== '' &&
+    !(await checkPermission(c, user.id, MODULES.ESTIMATES as string, ACTIONS.READ as string))
+  ) {
+    return c.json({ error: 'Unauthorized' }, 403)
+  }
+
   const db = getDb(process.env.DATABASE_URL!)
-  const items: any[] = Array.isArray(body.items) ? body.items : []
+  // Loose JSON from the client: every field is checked or converted where it is used.
+  const items: Array<Record<string, unknown>> = Array.isArray(body.items) ? body.items : []
+
+  // F37: a typed cost is a whole, non-negative number of cents. A fraction used to reach
+  // the integer column and come back as a raw 500, and a negative cost was stored. (A
+  // procedure quoted on the estimate takes its cost from there, so it is not checked.)
+  const badCost = items.some((it) => {
+    if (it?.sourceLineId) return false
+    if (it?.estimatedCost == null || it.estimatedCost === '') return false
+    const n = Number(it.estimatedCost)
+    return !Number.isInteger(n) || n < 0
+  })
+  if (badCost) {
+    return c.json({ error: 'estimatedCost must be a whole number of cents, zero or more' }, 400)
+  }
 
   try {
-    // §6.3 — catalog is the source of truth for name + cost where a service is linked.
-    const resolved = await resolveCatalogPlanItems(db, items)
-    const total = resolved.reduce((s, i) => s + i.estimatedCost, 0)
+    const outcome = await db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB
+      const quote = await loadQuote(tx, body.patientId, body.sourceInvoiceId, items)
+      if (!quote.ok) return quote
 
-    const [plan] = await db
-      .insert(treatmentPlans)
-      .values({
-        patientId: body.patientId,
-        title: body.title,
-        totalEstimated: total,
-        status: 'created',
-        notes: body.notes ?? null,
+      // A procedure seeded from the estimate takes that line's service, so its catalogue
+      // details (treatment type) match the line it is priced from.
+      const quotedFor = (it: { sourceLineId?: unknown }) =>
+        typeof it?.sourceLineId === 'string' ? quote.lines.get(it.sourceLineId) : undefined
+      const normalised = items.map((it) => {
+        const q = quotedFor(it)
+        return q ? { ...it, serviceId: q.serviceId } : it
+      })
+      // §6.3 — catalog is the source of truth for name + cost where a service is linked,
+      // except for a procedure quoted on the estimate (D12): the quote stands, and the
+      // doctor's own wording of the procedure is kept.
+      const resolved = (await resolveCatalogPlanItems(tx, normalised)).map((r, idx) => {
+        const q = quotedFor(items[idx])
+        if (!q) return r
+        const rawName = items[idx]?.procedureName
+        const typed = typeof rawName === 'string' ? rawName.trim() : ''
+        return { ...r, estimatedCost: q.lineTotal, procedureName: typed || q.description }
+      })
+      const total = resolved.reduce((s, i) => s + i.estimatedCost, 0)
+
+      const [plan] = await tx
+        .insert(treatmentPlans)
+        .values({
+          patientId: body.patientId,
+          title: body.title,
+          // The real link (0208): the day-sheet and reception's confirm find the plan by it.
+          sourceInvoiceId: quote.sourceInvoiceId,
+          totalEstimated: total,
+          status: 'created',
+          notes: body.notes ?? null,
+          createdById: user.id,
+        })
+        .returning()
+
+      if (resolved.length > 0) {
+        await tx.insert(treatmentPlanItems).values(resolved.map((r) => ({ ...r, planId: plan.id })))
+      }
+
+      // Every plan is a case — the case number is what staff quote, and the UI
+      // shows it in place of the plan title.
+      const patientCase = await ensureCaseForPlan(tx, {
+        planId: plan.id,
+        patientId: plan.patientId,
         createdById: user.id,
       })
-      .returning()
-
-    if (resolved.length > 0) {
-      await db.insert(treatmentPlanItems).values(resolved.map((r) => ({ ...r, planId: plan.id })))
-    }
-
-    // Every plan is a case — the case number is what staff quote, and the UI
-    // shows it in place of the plan title.
-    const patientCase = await ensureCaseForPlan(db, {
-      planId: plan.id,
-      patientId: plan.patientId,
-      createdById: user.id,
+      return { ok: true as const, plan, patientCase, total }
     })
+    if (!outcome.ok) return c.json({ error: outcome.error }, outcome.status)
+    const { plan, patientCase, total } = outcome
 
     await createAuditLog(db, {
       userId: user.id,
@@ -423,79 +580,121 @@ treatmentPlansApp.post('/from-invoice', async (c) => {
   const body = await c.req.json().catch(() => ({}))
   if (!body.invoiceId) return c.json({ error: 'invoiceId required' }, 400)
 
+  const invoiceId = z.string().uuid().safeParse(body.invoiceId)
+  if (!invoiceId.success) return c.json({ error: 'Estimate not found' }, 404)
+
   const db = getDb(process.env.DATABASE_URL!)
 
   try {
-    const [invoice] = await db
-      .select({
-        id: invoices.id,
-        patientId: invoices.patientId,
-        invoiceNumber: invoices.invoiceNumber,
-        status: invoices.status,
-      })
-      .from(invoices)
-      .where(eq(invoices.id, body.invoiceId))
-      .limit(1)
-    if (!invoice) return c.json({ error: 'Estimate not found' }, 404)
-    if (!invoice.patientId) return c.json({ error: 'Estimate has no patient' }, 400)
-    // D3 tier 1: a plan may be drafted once reception has COMMITTED the charge.
-    // Building one from a draft estimate is what let a treatment plan exist for
-    // an amount nobody had agreed to bill yet.
-    if (invoice.status === 'draft') {
-      return c.json(
-        {
+    // One transaction on a locked estimate row (F40): promoting an estimate that
+    // already has a plan, or two promotions at once, used to make a second plan.
+    const outcome = await db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB
+      const [invoice] = await tx
+        .select({
+          id: invoices.id,
+          patientId: invoices.patientId,
+          invoiceNumber: invoices.invoiceNumber,
+          status: invoices.status,
+          type: invoices.type,
+        })
+        .from(invoices)
+        .where(eq(invoices.id, invoiceId.data))
+        .for('update')
+      // Only an estimate (a one-time invoice) is promoted, never a plan instalment.
+      if (!invoice || invoice.type !== 'one_time') {
+        return { ok: false as const, status: 404 as const, error: 'Estimate not found' }
+      }
+      if (!invoice.patientId) {
+        return { ok: false as const, status: 400 as const, error: 'Estimate has no patient' }
+      }
+      // D3 tier 1: a plan may be drafted once reception has COMMITTED the charge.
+      // Building one from a draft estimate is what let a treatment plan exist for
+      // an amount nobody had agreed to bill yet.
+      if (invoice.status === 'draft') {
+        return {
+          ok: false as const,
+          status: 409 as const,
           error: `Estimate ${invoice.invoiceNumber} has not been issued yet. Reception must confirm it before a treatment plan is created.`,
-        },
-        409
+        }
+      }
+      if (invoice.status === 'void') {
+        return {
+          ok: false as const,
+          status: 409 as const,
+          error: `Estimate ${invoice.invoiceNumber} was voided.`,
+        }
+      }
+      // One plan per estimate — the same rule as the plan sheet and reception's confirm.
+      const [existing] = await tx
+        .select({ id: treatmentPlans.id })
+        .from(treatmentPlans)
+        .where(eq(treatmentPlans.sourceInvoiceId, invoice.id))
+        .limit(1)
+      if (existing) {
+        return {
+          ok: false as const,
+          status: 409 as const,
+          error: `A treatment plan already exists for estimate ${invoice.invoiceNumber}.`,
+        }
+      }
+
+      const lines = await tx
+        .select({
+          serviceId: invoiceLines.serviceId,
+          description: invoiceLines.description,
+          lineTotal: invoiceLines.lineTotal,
+        })
+        .from(invoiceLines)
+        .where(eq(invoiceLines.invoiceId, invoice.id))
+      if (lines.length === 0) {
+        return { ok: false as const, status: 400 as const, error: 'Estimate has no lines' }
+      }
+
+      const title = (body.title as string) || `Plan from Estimate ${invoice.invoiceNumber}`
+      const total = lines.reduce((s, l) => s + Number(l.lineTotal), 0)
+
+      const [plan] = await tx
+        .insert(treatmentPlans)
+        .values({
+          patientId: invoice.patientId,
+          title,
+          // The real link (0208) — `title` is caller-supplied and may be edited.
+          sourceInvoiceId: invoice.id,
+          totalEstimated: total,
+          status: 'created',
+          notes: body.notes ?? null,
+          createdById: user.id,
+        })
+        .returning()
+
+      await tx.insert(treatmentPlanItems).values(
+        lines.map((l, i) => ({
+          planId: plan.id,
+          procedureName: l.description || 'Procedure',
+          serviceId: l.serviceId,
+          estimatedCost: Number(l.lineTotal),
+          status: 'pending',
+          sortOrder: i,
+        }))
       )
-    }
-    if (invoice.status === 'void') {
-      return c.json({ error: `Estimate ${invoice.invoiceNumber} was voided.` }, 409)
-    }
 
-    const lines = await db
-      .select({
-        serviceId: invoiceLines.serviceId,
-        description: invoiceLines.description,
-        lineTotal: invoiceLines.lineTotal,
-      })
-      .from(invoiceLines)
-      .where(eq(invoiceLines.invoiceId, invoice.id))
-    if (lines.length === 0) return c.json({ error: 'Estimate has no lines' }, 400)
-
-    const title = (body.title as string) || `Plan from Estimate ${invoice.invoiceNumber}`
-    const total = lines.reduce((s, l) => s + Number(l.lineTotal), 0)
-
-    const [plan] = await db
-      .insert(treatmentPlans)
-      .values({
-        patientId: invoice.patientId,
-        title,
-        // The real link (0208) — `title` is caller-supplied and may be edited.
-        sourceInvoiceId: invoice.id,
-        totalEstimated: total,
-        status: 'created',
-        notes: body.notes ?? null,
+      const patientCase = await ensureCaseForPlan(tx, {
+        planId: plan.id,
+        patientId: plan.patientId,
         createdById: user.id,
       })
-      .returning()
-
-    await db.insert(treatmentPlanItems).values(
-      lines.map((l, i) => ({
-        planId: plan.id,
-        procedureName: l.description || 'Procedure',
-        serviceId: l.serviceId,
-        estimatedCost: Number(l.lineTotal),
-        status: 'pending',
-        sortOrder: i,
-      }))
-    )
-
-    const patientCase = await ensureCaseForPlan(db, {
-      planId: plan.id,
-      patientId: plan.patientId,
-      createdById: user.id,
+      return {
+        ok: true as const,
+        plan,
+        patientCase,
+        total,
+        lineCount: lines.length,
+        invoiceId: invoice.id,
+      }
     })
+    if (!outcome.ok) return c.json({ error: outcome.error }, outcome.status)
+    const { plan, patientCase, total, lineCount } = outcome
 
     await createAuditLog(db, {
       userId: user.id,
@@ -504,8 +703,8 @@ treatmentPlansApp.post('/from-invoice', async (c) => {
       entityId: plan.id,
       entityName: `Treatment Plan: ${patientCase.caseNumber}`,
       changes: {
-        fromInvoiceId: invoice.id,
-        itemCount: lines.length,
+        fromInvoiceId: outcome.invoiceId,
+        itemCount: lineCount,
         total,
         case: patientCase.caseNumber,
       },

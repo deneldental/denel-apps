@@ -1,12 +1,4 @@
-import {
-  Avatar,
-  AvatarFallback,
-  Button,
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-} from '@denel/ui'
+import { Avatar, AvatarFallback, Button, Tabs, TabsContent, TabsList, TabsTrigger } from '@denel/ui'
 import type { ColumnDef } from '@tanstack/react-table'
 import { formatDistanceToNow } from 'date-fns'
 import { Loader2, Plus } from 'lucide-react'

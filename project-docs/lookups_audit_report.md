@@ -209,7 +209,7 @@ lookup_type,code,display_name,colour,icon,sort_order,is_active,category_or_kind,
 ## 6. Generated Master Lookups Catalog
 
 A complete master lookup seed file has been generated and placed in the project workspace:
-- **File Location**: [`scratch/master_lookups.csv`](file:///f:/2026/DEV%20PROJECTS/framada-latest/scratch/master_lookups.csv)
+- **File Location**: [`master_lookups.csv`](master_lookups.csv) (in this folder)
 - **Artifact Copy**: [`master_lookups.csv`](file:///C:/Users/MAESTRO_DESKTOP/.gemini/antigravity-ide/brain/20c20803-473a-4db2-8106-c019e9058f7f/master_lookups.csv)
 - **Total Records**: 162 rows across 23 domains.
 

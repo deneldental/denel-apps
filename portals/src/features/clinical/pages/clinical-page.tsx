@@ -1,6 +1,7 @@
 import { FolderOpen, Pill, Stethoscope } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/shared/components/ui/tabs'
+import { usePermissions } from '@/shared/hooks/use-permissions'
 import { ClinicalCasesTab } from '../components/clinical-cases-tab'
 import { ClinicalPrescriptionsTab } from '../components/clinical-prescriptions-tab'
 import { ClinicalTreatmentsTab } from '../components/clinical-treatments-tab'
@@ -16,6 +17,7 @@ export function ClinicalPage() {
   const navigate = useNavigate()
   const { tab } = useParams<{ tab?: string }>()
   const activeTab: ClinicalTab = isValidTab(tab) ? tab : 'cases'
+  const { hasPermission } = usePermissions()
 
   return (
     <div className="flex h-full flex-col p-6">
@@ -46,7 +48,12 @@ export function ClinicalPage() {
         </TabsList>
 
         <TabsContent value="cases" className="mt-4 flex-1 overflow-auto">
-          <ClinicalCasesTab canEdit isAdmin />
+          {/* What the server will do: opening a case is clinical work, archiving one is
+              a patient-record delete. Offering more than that was a button that 403'd. */}
+          <ClinicalCasesTab
+            canEdit={hasPermission('medical_records', 'create')}
+            canArchive={hasPermission('patients', 'delete')}
+          />
         </TabsContent>
         <TabsContent value="treatments" className="mt-4 flex-1 overflow-auto">
           <ClinicalTreatmentsTab />

@@ -38,6 +38,7 @@ import { getBranding } from '../lib/branding'
 import { buildEmployeeDataSheetHtml } from '../lib/employee-data-sheet'
 import { logError } from '../lib/logger'
 import { memoTargetsStaff } from '../lib/memo-audience'
+import { clearPasswordChange } from '../lib/password-change'
 import { checkPasswordPolicy, isSameAsCurrent } from '../lib/password-policy'
 import { handleGetSinglePayslipPdf } from '../lib/pdf-handlers'
 import { renderHtmlToPdf } from '../lib/pdf-render'
@@ -1803,6 +1804,11 @@ staffPortalApp.post('/forgot-password/reset', async (c) => {
   // no hook fires, so nothing revoked the sessions and a reset left both the
   // attacker's and the victim's existing sessions alive.
   await setUserPassword(db, staffMember.userId, newPassword)
+
+  // The person chose this password themselves (through the SMS code), which ends any
+  // "an administrator set it" state (F20 / D8) — otherwise the portal or HR app would ask
+  // them to change a password they have just chosen.
+  await clearPasswordChange(db, staffMember.userId)
 
   // Password change also resets all device trust.
   await revokeAllStaffDevices(db, staffMember.id)

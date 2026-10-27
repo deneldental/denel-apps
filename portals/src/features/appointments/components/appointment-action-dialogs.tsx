@@ -19,7 +19,7 @@ import {
   DEFAULT_APPOINTMENT_MINUTES,
   findBlockTimeForAppointment,
 } from '@/features/appointments/conflicts'
-import { updateAppointment } from '@/lib/actions/appointments'
+import { checkInAppointment, updateAppointment } from '@/lib/actions/appointments'
 import { getDoctorUnavailability } from '@/lib/actions/doctor-availability'
 import { api } from '@/lib/api-client'
 import { useApiQuery } from '@/lib/query'
@@ -59,6 +59,9 @@ export interface ActionAppointment {
 
 // ─── No-payment check-in ─────────────────────────────────────────────────────
 
+/** The server refuses a shorter reason (checkInSchema in routes/appointment-workflow.ts). */
+const MIN_NO_PAYMENT_REASON = 3
+
 interface NoPaymentCheckInProps {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -86,20 +89,18 @@ export function NoPaymentCheckInDialog({
   async function handleConfirm() {
     if (!appointment) return
     const trimmed = reason.trim()
-    if (!trimmed) {
-      toast.error('Reason is required for a no-payment check-in')
+    if (trimmed.length < MIN_NO_PAYMENT_REASON) {
+      toast.error(`Give a reason of at least ${MIN_NO_PAYMENT_REASON} characters`)
       return
     }
     await submit(async () => {
-      // Use the workflow transition endpoint so checkedInAt is stamped correctly
-      // and the audit trail matches normal check-ins. The backend appends the
-      // note with its own timestamp stamp.
-      const res = await api.patch(`/api/appointment-workflow/${appointment.id}/transition`, {
-        action: 'check-in',
-        notes: `Checked in without payment — ${trimmed}`,
-      })
+      // The check-in request stamps the arrival, queues the doctor's note and keeps
+      // the reason on the visit, and a repeat is harmless (the patient is simply
+      // reported as already checked in).
+      const res = await checkInAppointment(appointment.id, { noPaymentReason: trimmed })
       if (res.success) {
-        toast.success('Checked in (no payment recorded)')
+        if (res.data?.alreadyCheckedIn) toast.info('This patient was already checked in.')
+        else toast.success('Checked in (no payment recorded)')
         onOpenChange(false)
         onCheckedIn?.()
       } else {
@@ -134,7 +135,10 @@ export function NoPaymentCheckInDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={isSubmitting}>
             Cancel
           </Button>
-          <Button onClick={handleConfirm} disabled={isSubmitting || !reason.trim()}>
+          <Button
+            onClick={handleConfirm}
+            disabled={isSubmitting || reason.trim().length < MIN_NO_PAYMENT_REASON}
+          >
             {isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
             Confirm check-in
           </Button>

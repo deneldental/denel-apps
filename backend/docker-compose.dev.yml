@@ -17,7 +17,16 @@
 # Postgres or another project's container. Override with FRAMADA_DB_PORT —
 # scripts/dev-local.mjs reads the same variable, so the two never drift.
 #
+# Fixed Compose project name. Without it Compose uses the folder name
+# ("backend"), and any other repo whose compose file also lives in a `backend/`
+# folder with a service called `db` (the Framada clone does) shares that project:
+# `up` here then "recreates" the other repo's container instead of starting this
+# one. Pinning the name keeps this database's container, network and volume
+# separate (volume: `denel-local_framada-dev-db`).
+#
 # See project-docs/local-dev-database.md for the full workflow.
+name: denel-local
+
 services:
   db:
     image: postgres:17-alpine

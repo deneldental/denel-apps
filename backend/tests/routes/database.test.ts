@@ -23,6 +23,8 @@ vi.mock('../../src/lib/audit', () => ({ createAuditLog: vi.fn() }))
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
+import { getDb } from '../../src/db'
+import { createAuditLog } from '../../src/lib/audit'
 import { getCurrentUser } from '../../src/lib/rbac'
 import { databaseApp } from '../../src/routes/database'
 
@@ -77,5 +79,61 @@ describe('GET /api/database/tables', () => {
     expect(body.success).toBe(true)
     expect(body.data).toContain('patients')
     expect(body.data).toEqual([...body.data].sort())
+  })
+})
+
+describe('POST /api/database/clear-all', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs()
+    vi.clearAllMocks()
+  })
+
+  /** A database double that records where each delete happens: inside the transaction or outside it. */
+  function fakeDb(failOn?: number) {
+    const outside: unknown[] = []
+    const inside: unknown[] = []
+    const tx = {
+      delete: vi.fn(async (table: unknown) => {
+        if (failOn !== undefined && inside.length === failOn) throw new Error('boom')
+        inside.push(table)
+      }),
+    }
+    const db = {
+      delete: vi.fn(async (table: unknown) => {
+        outside.push(table)
+      }),
+      transaction: vi.fn(async (fn: (t: typeof tx) => Promise<void>) => fn(tx)),
+    }
+    return { db, outside, inside }
+  }
+
+  it('is refused unless the environment allows clearing', async () => {
+    mockGetCurrentUser.mockResolvedValue(adminUser)
+    const res = await makeApp().request('/api/database/clear-all', { method: 'POST' })
+    expect(res.status).toBe(403)
+  })
+
+  it('wipes every table inside ONE transaction, never outside it', async () => {
+    vi.stubEnv('ALLOW_TABLE_CLEAR', 'true')
+    mockGetCurrentUser.mockResolvedValue(adminUser)
+    const { db, outside, inside } = fakeDb()
+    vi.mocked(getDb).mockReturnValue(db as never)
+
+    const res = await makeApp().request('/api/database/clear-all', { method: 'POST' })
+    expect(res.status).toBe(200)
+    expect(db.transaction).toHaveBeenCalledTimes(1)
+    expect(outside).toEqual([])
+    expect(inside).toHaveLength(21)
+  })
+
+  it('reports a failure part-way as a failure, and records nothing as done', async () => {
+    vi.stubEnv('ALLOW_TABLE_CLEAR', 'true')
+    mockGetCurrentUser.mockResolvedValue(adminUser)
+    const { db } = fakeDb(5)
+    vi.mocked(getDb).mockReturnValue(db as never)
+
+    const res = await makeApp().request('/api/database/clear-all', { method: 'POST' })
+    expect(res.status).toBe(500)
+    expect(createAuditLog).not.toHaveBeenCalled()
   })
 })

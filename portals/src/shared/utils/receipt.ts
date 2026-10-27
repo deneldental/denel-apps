@@ -1,6 +1,13 @@
 import { format } from 'date-fns'
 import { type BrandingConfig, getBranding } from '@/lib/actions/branding'
+import { parseLocalDate } from '@/shared/lib/dates'
 import { formatAmount } from '@/shared/utils/currency'
+import {
+  escapeHtml,
+  hasInvoiceTotals,
+  methodStatusSuffix,
+  reversalBanner,
+} from '@/shared/utils/receipt-display'
 
 interface ReceiptData {
   patientName: string
@@ -21,7 +28,12 @@ interface ReceiptData {
     amount: number
     reference?: string | null
     paymentNumber?: string | null
+    /** 'reversed' once this method's payment has been reversed. */
+    status?: string
   }>
+  /** 'reversed' | 'partly_reversed' | 'posted'; `amountPaid` counts only payments still in force. */
+  status?: 'posted' | 'reversed' | 'partly_reversed'
+  reversedAmount?: number
   allocations?: {
     invoiceNumber: string
     invoiceTotal: number | null
@@ -87,19 +99,33 @@ function loadBranding(): Promise<BrandingConfig | null> {
 }
 
 /**
+ * The clinic details printed in a document's header: branding first, env vars as a fallback for
+ * the offline/failed-fetch case. `phones` is ordered primary-first, so [0] is the number to print.
+ */
+function clinicDetailsFrom(branding: BrandingConfig | null) {
+  return {
+    clinicName: branding?.name || import.meta.env.VITE_CLINIC_NAME || 'Denel Dental Clinic',
+    clinicPhone: branding?.phones?.[0] || import.meta.env.VITE_CLINIC_PHONE || undefined,
+    clinicAddress: branding?.address || import.meta.env.VITE_CLINIC_ADDRESS || undefined,
+    clinicWebsite: branding?.website || undefined,
+  }
+}
+
+/**
  * Open the receipt window. MUST be called synchronously from the click handler:
  * browsers only trust `window.open` while the user gesture is still active, and
  * a popup opened after an awaited network call is blocked. `generatePaymentReceipt`
- * therefore opens the window first and fetches branding second.
+ * therefore opens the window first and fetches branding second. `what` names the
+ * document being prepared, for the placeholder shown until it is written.
  */
-export function openReceiptWindow(): Window | null {
+export function openReceiptWindow(what = 'receipt'): Window | null {
   // Width/height mimic a receipt view while still allowing printing.
   const w = window.open('', '_blank', 'width=400,height=800')
   if (w) {
     // Something to look at while branding loads — an empty popup reads as broken.
     w.document.write(
       '<!DOCTYPE html><html><head><title>Receipt</title></head>' +
-        '<body style="font-family:system-ui;padding:24px;color:#555">Preparing receipt…</body></html>'
+        `<body style="font-family:system-ui;padding:24px;color:#555">Preparing ${what}…</body></html>`
     )
   }
   return w
@@ -132,12 +158,13 @@ export function generateReceipt(
         ? receiptData.methods
         : [{ method: receiptData.paymentType, amount: receiptData.amountPaid }]
     const isSplit = methods.length > 1
+    const banner = reversalBanner(receiptData.status)
 
     receiptWindow.document.write(`
       <!DOCTYPE html>
       <html>
       <head>
-        <title>Receipt - ${receiptData.patientName}</title>
+        <title>Receipt - ${escapeHtml(receiptData.patientName)}</title>
         <style>
           body { 
             font-family: 'Courier New', Courier, monospace; 
@@ -272,25 +299,26 @@ export function generateReceipt(
               <!-- Use absolute path or full URL if needed, but relative usually works if same domain -->
               <img src="/logo.png" alt="Logo" onerror="this.style.display='none'"/>
             </div>
-            <div class="clinic-name">${receiptData.clinicName}</div>
-            ${receiptData.clinicWebsite ? `<div class="clinic-website">${receiptData.clinicWebsite.replace(/^https?:\/\//i, '').replace(/\/$/, '')}</div>` : ''}
-            ${receiptData.clinicPhone ? `<div class="clinic-phone">${receiptData.clinicPhone}</div>` : ''}
-            ${receiptData.clinicAddress ? `<div class="clinic-address">${receiptData.clinicAddress}</div>` : ''}
-            <div class="clinic-date" style="font-size: 11px; line-height: 1.4; margin-top: 3px;">Date: ${formatReceiptDate(receiptData.generatedAt)}</div>
+            <div class="clinic-name">${escapeHtml(receiptData.clinicName)}</div>
+            ${receiptData.clinicWebsite ? `<div class="clinic-website">${escapeHtml(receiptData.clinicWebsite.replace(/^https?:\/\//i, '').replace(/\/$/, ''))}</div>` : ''}
+            ${receiptData.clinicPhone ? `<div class="clinic-phone">${escapeHtml(receiptData.clinicPhone)}</div>` : ''}
+            ${receiptData.clinicAddress ? `<div class="clinic-address">${escapeHtml(receiptData.clinicAddress)}</div>` : ''}
+            <div class="clinic-date" style="font-size: 11px; line-height: 1.4; margin-top: 3px;">Date: ${escapeHtml(formatReceiptDate(receiptData.generatedAt))}</div>
             <div class="receipt-title">Payment Receipt</div>
+            ${banner ? `<div style="font-size: 14px; font-weight: bold; margin-top: 8px; border: 2px solid #000; padding: 3px 0; letter-spacing: 2px;">${banner}</div>` : ''}
           </div>
 
           <div class="content">
             <div class="row">
               <span class="label">Patient:</span>
-              <span class="value">${receiptData.patientName}</span>
+              <span class="value">${escapeHtml(receiptData.patientName)}</span>
             </div>
             ${
               receiptData.appointmentDate
                 ? `
             <div class="row">
               <span class="label">Date:</span>
-              <span class="value">${receiptData.appointmentDate}</span>
+              <span class="value">${escapeHtml(receiptData.appointmentDate)}</span>
             </div>`
                 : ''
             }
@@ -312,7 +340,7 @@ export function generateReceipt(
                     .map(
                       (item) => `
                     <tr>
-                      <td style="padding: 4px 0; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${item.name}">${truncateService(item.name)}</td>
+                      <td style="padding: 4px 0; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(item.name)}">${escapeHtml(truncateService(item.name))}</td>
                       <td style="text-align: right; padding: 4px 0;">GHS ${formatAmount(item.cost)}</td>
                     </tr>
                   `
@@ -324,7 +352,7 @@ export function generateReceipt(
                 : `
             <div class="row">
               <span class="label">Service:</span>
-              <span class="value">${truncateService(receiptData.paymentFor)}</span>
+              <span class="value">${escapeHtml(truncateService(receiptData.paymentFor))}</span>
             </div>`
             }
             ${
@@ -332,7 +360,7 @@ export function generateReceipt(
                 ? `
             <div class="row" style="flex-direction: column;">
               <span class="label">Notes:</span>
-              <span class="value" style="text-align: left; font-size: 12px;">${receiptData.notes}</span>
+              <span class="value" style="text-align: left; font-size: 12px;">${escapeHtml(receiptData.notes)}</span>
             </div>`
                 : ''
             }
@@ -340,7 +368,7 @@ export function generateReceipt(
 
           <div class="amount-section">
             ${
-              receiptData.allocations && receiptData.allocations.length > 0
+              hasInvoiceTotals(receiptData.allocations)
                 ? (
                     () => {
                       const subtotal = receiptData.allocations!.reduce(
@@ -372,6 +400,15 @@ export function generateReceipt(
               <span>PAID:</span>
               <span>GHS ${formattedAmountPaid}</span>
             </div>
+            ${
+              receiptData.reversedAmount
+                ? `
+            <div class="row">
+              <span class="label">Reversed:</span>
+              <span>GHS ${formatAmount(receiptData.reversedAmount)}</span>
+            </div>`
+                : ''
+            }
             <div style="margin: 6px 0 8px 0;">
               ${
                 isSplit
@@ -382,7 +419,7 @@ export function generateReceipt(
                     .map(
                       (m) => `
                     <div style="display: flex; justify-content: space-between; padding-left: 8px; margin-bottom: 2px; font-size: 12px;">
-                      <span>${methodLabel(m.method)}${m.reference ? ` (${m.reference})` : ''}:</span>
+                      <span>${escapeHtml(methodLabel(m.method))}${methodStatusSuffix(m.status)}${m.reference ? ` (${escapeHtml(m.reference)})` : ''}:</span>
                       <span style="font-weight: bold;">GHS ${formatAmount(m.amount)}</span>
                     </div>`
                     )
@@ -391,7 +428,7 @@ export function generateReceipt(
                   : `
                 <div class="row" style="margin-bottom: 2px;">
                   <span class="label">Method:</span>
-                  <span class="value">${methodLabel(methods[0]?.method || receiptData.paymentType)}${methods[0]?.reference ? ` (${methods[0].reference})` : ''}</span>
+                  <span class="value">${escapeHtml(methodLabel(methods[0]?.method || receiptData.paymentType))}${methodStatusSuffix(methods[0]?.status)}${methods[0]?.reference ? ` (${escapeHtml(methods[0].reference)})` : ''}</span>
                 </div>`
               }
             </div>
@@ -576,14 +613,155 @@ export async function generatePaymentReceipt(params: PaymentReceiptParams) {
     paymentFor: finalPaymentFor, // Use treatment types or backend paymentFor
     notes: additionalNotes, // Use additional notes in the notes field
     allocations, // Included for the rich tabular receipt
-    // Branding first, env vars as a fallback for the offline/failed-fetch case.
-    // `phones` is ordered primary-first, so [0] is the number to print.
-    clinicName: branding?.name || import.meta.env.VITE_CLINIC_NAME || 'Denel Dental Clinic',
-    clinicPhone: branding?.phones?.[0] || import.meta.env.VITE_CLINIC_PHONE || undefined,
-    clinicAddress: branding?.address || import.meta.env.VITE_CLINIC_ADDRESS || undefined,
-    clinicWebsite: branding?.website || undefined,
+    ...clinicDetailsFrom(branding),
     generatedAt: new Date().toLocaleString(),
   }
 
   generateReceipt(receiptData, autoPrint, receiptWindow)
+}
+
+interface OutstandingBalanceSlipParams {
+  patientName: string
+  /** The invoices that were open, each with the balance it had BEFORE this payment (cents). */
+  invoices: Array<{ invoiceNumber: string; dueDate: string | null; balanceBefore: number }>
+  /** What was paid just now (cents). */
+  paidNow: number
+  /** What the patient still owes after it (cents): the server's figure, printed as given. */
+  balanceDue: number
+  /** A window opened inside the click (`openReceiptWindow`); one is opened here when none is given. */
+  existingWindow?: Window | null
+  /** Whether to open the browser's print dialog (default: yes). */
+  autoPrint?: boolean
+}
+
+/** A due date for print: `01 Oct 2026` for a plain `YYYY-MM-DD`, else whatever it was. */
+function formatDueDate(due: string | null): string {
+  if (!due) return 'No due date'
+  const day = due.slice(0, 10)
+  return /^\d{4}-\d{2}-\d{2}$/.test(day) ? format(parseLocalDate(day), 'dd MMM yyyy') : due
+}
+
+/**
+ * Print what a patient owes: the invoices that were open (with the balance each had before today's
+ * payment), what was paid now, and the balance still due. A different paper from the payment
+ * receipt: it is printed only when asked for, and the figures are printed as given (the Receive
+ * Payment dialog hands in the server's), never worked out here.
+ */
+export async function printOutstandingBalanceSlip(params: OutstandingBalanceSlipParams) {
+  const { patientName, invoices, paidNow, balanceDue, existingWindow, autoPrint = true } = params
+
+  // The caller normally opens the window inside the click and hands it in; opened here (before
+  // the await) only for a caller that did not.
+  const slipWindow = existingWindow ?? openReceiptWindow('balance slip')
+  if (!slipWindow) return
+
+  const clinic = clinicDetailsFrom(await loadBranding())
+  const rows =
+    invoices.length > 0
+      ? invoices
+          .map(
+            (inv) => `
+                <tr>
+                  <td style="padding: 3px 0;">${escapeHtml(inv.invoiceNumber)}</td>
+                  <td style="padding: 3px 4px;">${escapeHtml(formatDueDate(inv.dueDate))}</td>
+                  <td style="text-align: right; padding: 3px 0;">GHS ${formatAmount(inv.balanceBefore)}</td>
+                </tr>`
+          )
+          .join('')
+      : `
+                <tr>
+                  <td colspan="3" style="padding: 6px 0; text-align: center;">No outstanding invoices</td>
+                </tr>`
+
+  slipWindow.document.open()
+  slipWindow.document.write(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Outstanding Balance - ${escapeHtml(patientName)}</title>
+        <style>
+          body { font-family: 'Courier New', Courier, monospace; margin: 0; padding: 20px; color: #000; font-size: 14px; line-height: 1.4; }
+          .container { max-width: 350px; margin: 0 auto; background: #fff; }
+          .header { text-align: center; margin-bottom: 20px; padding-bottom: 10px; }
+          .logo img { max-width: 120px; height: auto; margin-bottom: 10px; display: block; margin-left: auto; margin-right: auto; }
+          .clinic-name { font-weight: bold; font-size: 16px; margin-bottom: 5px; }
+          .clinic-phone, .clinic-address, .clinic-website { font-size: 11px; line-height: 1.4; }
+          .slip-title { font-size: 16px; font-weight: bold; margin-top: 10px; text-transform: uppercase; border-top: 1px dashed #000; border-bottom: 1px dashed #000; padding: 10px 0; display: block; }
+          .content { margin: 20px 0; }
+          .row { display: flex; justify-content: space-between; margin-bottom: 8px; }
+          .label { font-weight: bold; }
+          .value { text-align: right; }
+          .totals { border-top: 1px dashed #000; border-bottom: 1px dashed #000; padding: 12px 0; margin: 16px 0; }
+          .total-row { display: flex; justify-content: space-between; font-size: 18px; font-weight: bold; }
+          .note { font-size: 11px; margin-top: 6px; }
+          .footer { margin-top: 24px; font-size: 12px; }
+          @media print { body { padding: 0.5cm; } }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <div class="logo">
+              <img src="/logo.png" alt="Logo" onerror="this.style.display='none'"/>
+            </div>
+            <div class="clinic-name">${escapeHtml(clinic.clinicName)}</div>
+            ${clinic.clinicWebsite ? `<div class="clinic-website">${escapeHtml(clinic.clinicWebsite.replace(/^https?:\/\//i, '').replace(/\/$/, ''))}</div>` : ''}
+            ${clinic.clinicPhone ? `<div class="clinic-phone">${escapeHtml(clinic.clinicPhone)}</div>` : ''}
+            ${clinic.clinicAddress ? `<div class="clinic-address">${escapeHtml(clinic.clinicAddress)}</div>` : ''}
+            <div style="font-size: 11px; line-height: 1.4; margin-top: 3px;">Date: ${escapeHtml(formatReceiptDate(null))}</div>
+            <div class="slip-title">Outstanding Balance</div>
+          </div>
+
+          <div class="content">
+            <div class="row">
+              <span class="label">Patient:</span>
+              <span class="value">${escapeHtml(patientName)}</span>
+            </div>
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px;">
+              <thead>
+                <tr>
+                  <th style="text-align: left; border-bottom: 1px solid #000; padding-bottom: 4px;">Invoice</th>
+                  <th style="text-align: left; border-bottom: 1px solid #000; padding-bottom: 4px;">Due</th>
+                  <th style="text-align: right; border-bottom: 1px solid #000; padding-bottom: 4px;">Balance</th>
+                </tr>
+              </thead>
+              <tbody>${rows}
+              </tbody>
+            </table>
+            ${paidNow > 0 ? '<div class="note">Balances shown are before today’s payment.</div>' : ''}
+
+            <div class="totals">
+              <div class="row">
+                <span class="label">Paid now</span>
+                <span class="value">GHS ${formatAmount(paidNow)}</span>
+              </div>
+              <div class="total-row">
+                <span>Balance due</span>
+                <span>GHS ${formatAmount(balanceDue)}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="footer">
+            <p>Thank you!</p>
+          </div>
+        </div>
+
+        ${
+          autoPrint
+            ? `
+        <script>
+          window.onload = function() {
+            // Short delay to ensure the logo loads
+            setTimeout(function() {
+              window.print();
+            }, 1000);
+          }
+        </script>`
+            : ''
+        }
+      </body>
+      </html>
+    `)
+  slipWindow.document.close()
 }

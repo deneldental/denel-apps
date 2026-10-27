@@ -8,11 +8,30 @@ import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import { getHubtelCredentials, sendSMS as sendSMSUtil } from '../lib/sms'
+import { isRedactedSmsContent } from '../lib/sms-redaction'
 import type { HonoEnv } from '../lib/types'
 
 const smsApp = new Hono<HonoEnv>()
 
 const MODULE = MODULES.MESSAGING
+
+/** SMS log page size. The screens show the newest messages; the rest is bounded, not dumped. */
+const MESSAGES_DEFAULT_LIMIT = 200
+const MESSAGES_MAX_LIMIT = 500
+
+function wholeNumber(raw: string | undefined): number | null {
+  return raw !== undefined && /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : null
+}
+
+/** `?limit=&offset=` with safe fallbacks: a bad value means the default, never an error or an unbounded read. */
+function pageParams(limitRaw: string | undefined, offsetRaw: string | undefined) {
+  const requested = wholeNumber(limitRaw)
+  const limit =
+    requested !== null && requested >= 1
+      ? Math.min(requested, MESSAGES_MAX_LIMIT)
+      : MESSAGES_DEFAULT_LIMIT
+  return { limit, offset: wholeNumber(offsetRaw) ?? 0 }
+}
 
 smsApp.get('/upcoming-birthdays', async (c) => {
   const user = await getCurrentUser(c)
@@ -72,6 +91,9 @@ smsApp.get('/upcoming-birthdays', async (c) => {
 smsApp.get('/followup-appointments', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+
+  if (!(await checkPermission(c, user.id, MODULE as string, ACTIONS.READ as string)))
+    return c.json({ error: 'Unauthorized' }, 403)
 
   try {
     const db = getDb(process.env.DATABASE_URL!)
@@ -175,18 +197,32 @@ smsApp.get('/messages', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
 
+  if (!(await checkPermission(c, user.id, MODULE as string, ACTIONS.READ as string)))
+    return c.json({ error: 'Unauthorized' }, 403)
+
   try {
     const db = getDb(process.env.DATABASE_URL!)
     const status = c.req.query('status')
+    const { limit, offset } = pageParams(c.req.query('limit'), c.req.query('offset'))
 
     const whereClause = status ? eq(smsMessages.status, status) : undefined
 
-    const data = await db.query.smsMessages.findMany({
+    // One extra row tells us whether another page exists without a count query.
+    // Only the patient columns the screens show are joined: this log used to
+    // return every patient's full record, for every message, unbounded.
+    const rows = await db.query.smsMessages.findMany({
       where: whereClause,
       orderBy: (smsMessages, { desc }) => [desc(smsMessages.sentAt)],
-      with: { patient: true },
+      with: { patient: { columns: { id: true, name: true } } },
+      limit: limit + 1,
+      offset,
     })
-    return c.json({ success: true, data })
+    const hasMore = rows.length > limit
+    return c.json({
+      success: true,
+      data: hasMore ? rows.slice(0, limit) : rows,
+      pagination: { limit, offset, hasMore },
+    })
   } catch (_error: unknown) {
     return c.json({ error: 'Failed to fetch messages' }, 500)
   }
@@ -195,6 +231,9 @@ smsApp.get('/messages', async (c) => {
 smsApp.get('/status/:id', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+
+  if (!(await checkPermission(c, user.id, MODULE as string, ACTIONS.READ as string)))
+    return c.json({ error: 'Unauthorized' }, 403)
 
   const id = c.req.param('id')
   const isBatch = c.req.query('isBatch') === 'true'
@@ -219,9 +258,12 @@ smsApp.get('/status/:id', async (c) => {
     }
 
     const authHeader = btoa(`${credentials.clientId}:${credentials.clientSecret}`)
+    // `id` is caller input: encoded so it stays one path segment and cannot add
+    // path or query parts to the Hubtel request.
+    const segment = encodeURIComponent(id)
     const endpoint = isBatch
-      ? `https://sms.hubtel.com/v1/messages/batch/${id}`
-      : `https://sms.hubtel.com/v1/messages/${id}`
+      ? `https://sms.hubtel.com/v1/messages/batch/${segment}`
+      : `https://sms.hubtel.com/v1/messages/${segment}`
 
     const response = await fetch(endpoint, {
       headers: { Authorization: `Basic ${authHeader}` },
@@ -242,6 +284,11 @@ smsApp.post('/retry/:id', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
 
+  // Resending costs money (it books a ledger expense), so it needs the same
+  // permission as sending.
+  if (!(await checkPermission(c, user.id, MODULE as string, ACTIONS.CREATE as string)))
+    return c.json({ error: 'Unauthorized' }, 403)
+
   const id = c.req.param('id')
 
   try {
@@ -249,6 +296,19 @@ smsApp.post('/retry/:id', async (c) => {
     const [message] = await db.select().from(smsMessages).where(eq(smsMessages.id, id)).limit(1)
 
     if (!message) return c.json({ error: 'Message not found' }, 404)
+
+    // What is stored for a code or tokenised link is a stand-in, not the text
+    // that was sent. Resending it would text the patient a message with the
+    // secret cut out.
+    if (isRedactedSmsContent(message.content)) {
+      return c.json(
+        {
+          error: 'This message contained a one-time code or private link, so it cannot be resent.',
+          code: 'SMS_REDACTED_NOT_RETRYABLE',
+        },
+        400
+      )
+    }
 
     const result = await sendSMSUtil(
       [

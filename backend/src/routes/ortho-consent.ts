@@ -1,4 +1,5 @@
-﻿import { and, eq, ilike, or } from 'drizzle-orm'
+﻿import { randomBytes } from 'node:crypto'
+import { and, eq, ilike, or } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { getDb } from '../db'
 import { orthoConsentForms, patients } from '../db/schema'
@@ -16,6 +17,9 @@ const orthoConsentApp = new Hono<HonoEnv>()
 orthoConsentApp.get('/', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+
+  if (!(await checkPermission(c, user.id, MODULES.ORTHO_CONSENT as string, ACTIONS.READ as string)))
+    return c.json({ error: 'Unauthorized' }, 403)
 
   const searchTerm = c.req.query('searchTerm')
   const db = getDb(process.env.DATABASE_URL!)
@@ -153,9 +157,12 @@ orthoConsentApp.post('/process', async (c) => {
       return c.json({ error: 'PDF_TEMPLATE_BASE_URL not configured' }, 500)
     }
     const processedBuffer = await processUploadedConsentForm(arrayBuffer, templateBaseUrl)
-    const fileName = await generateFileName(patientName, new Date(), 'pdf')
+    // `<name>_<ddMMMyyyy>.pdf` is readable, and it is NOT unique: two patients of the same name on
+    // one day, or one patient twice, would write to the same key and a plain PutObject overwrites,
+    // so the earlier signed form would be replaced by someone else's. Random bits make it theirs.
+    const fileName = (await generateFileName(patientName, new Date(), 'pdf')).replace(/\.pdf$/, '')
 
-    const key = `consent-forms/${fileName}`
+    const key = `consent-forms/${fileName}-${randomBytes(8).toString('hex')}.pdf`
     const result = await uploadToCategory(
       'patient_records',
       key,

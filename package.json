@@ -34,6 +34,10 @@
     "db:generate": "turbo run db:generate --filter=backend",
     "db:drift": "pnpm --filter backend db:drift",
     "audit:contracts": "node scripts/api-contract-audit.mjs",
+    "package:source": "node scripts/package-source.mjs",
+    "test:package-source": "node --test scripts/package-source.test.mjs",
+    "test:contract-audit": "node --test scripts/api-contract-audit.test.mjs",
+    "test:deploy-workflow": "node --test scripts/deploy-workflow.test.mjs",
     "clean": "turbo run clean && rm -rf node_modules",
     "deploy:trigger": "echo 'Triggering full deployment'"
   },

@@ -9,17 +9,30 @@
 
 import { eq } from 'drizzle-orm'
 import { Hono } from 'hono'
-import { getDb } from '../db'
-import { appointments } from '../db/schema'
+import { z } from 'zod'
+import { type DB, getDb } from '../db'
+import { appointments, patients } from '../db/schema'
+import { CheckInError, checkInAppointment } from '../lib/appointment-checkin'
+import {
+  canChangeStatus,
+  isPreArrivalStatus,
+  pastDayDecision,
+  TERMINAL_APPOINTMENT_STATUSES,
+} from '../lib/appointment-status'
 import { createAuditLog } from '../lib/audit'
 import { enrichAppointment, syncAppointmentUpdated } from '../lib/google-calendar'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
+import { sendPaymentReceiptSms } from '../lib/payment-receipt-sms'
+import { ensurePendingMedicalRecord } from '../lib/pending-medical-record-service'
+import { portalLink } from '../lib/public-urls'
 import { createRateLimiter, requireClientIp } from '../lib/rate-limiter'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import { sendSMS } from '../lib/sms'
+import { REDACTED_TOKEN_MARKER } from '../lib/sms-redaction'
 import { renderSms, resolveSmsTemplate } from '../lib/sms-templates'
 import type { HonoEnv } from '../lib/types'
+import { isPastAppointmentDate } from '../lib/validate-date'
 
 const appointmentWorkflowApp = new Hono<HonoEnv>()
 
@@ -51,61 +64,284 @@ appointmentWorkflowApp.patch('/:id/transition', async (c) => {
   if (!transition) return c.json({ error: `Invalid action: ${action}` }, 400)
 
   const db = getDb(process.env.DATABASE_URL!)
-  const updates: any = { status: transition.status, updatedAt: new Date() }
-  if (transition.timestampField) {
-    updates[transition.timestampField] = new Date()
-  }
+  const now = new Date()
+  const overrideReason = typeof body.overrideReason === 'string' ? body.overrideReason.trim() : ''
 
-  // Estimate routing (0168): a requires-estimate visit enters the doctor's
-  // Activity queue on check-in (awaiting_estimate) rather than reception-direct.
-  if (transition.status === 'checked_in') {
-    const appt = await db.query.appointments.findFirst({
-      where: eq(appointments.id, id),
-      columns: { requiresEstimate: true, estimateStatus: true },
-    })
-    if (appt?.requiresEstimate && !appt.estimateStatus) {
-      updates.estimateStatus = 'awaiting_estimate'
-    }
-  }
+  // The check, the write and (on check-in) the doctor's note are one transaction
+  // on a locked row. A second request for the same visit waits for the first and
+  // then sees the result, so the status machine cannot be raced past (F19).
+  type Outcome =
+    | {
+        ok: true
+        updated: typeof appointments.$inferSelect
+        updates: Record<string, unknown>
+        pastReason: string | null
+      }
+    | { ok: false; status: 400 | 403 | 404 | 409; body: { error: string; code: string } }
 
-  // Append a timestamped note when provided (e.g. no-show "last response from patient")
-  if (incomingNote) {
-    const existing = await db.query.appointments.findFirst({
-      where: eq(appointments.id, id),
-      columns: { notes: true },
-    })
-    const stamp = `[${transition.status} ${new Date().toISOString()}]: ${incomingNote}`
-    updates.notes = existing?.notes ? `${existing.notes}\n${stamp}` : stamp
-  }
-
+  let outcome: Outcome
   try {
-    const [updated] = await db
-      .update(appointments)
-      .set(updates)
-      .where(eq(appointments.id, id))
-      .returning()
-    if (!updated) return c.json({ error: 'Appointment not found' }, 404)
+    outcome = await db.transaction(async (rawTx): Promise<Outcome> => {
+      const [current] = await rawTx
+        .select()
+        .from(appointments)
+        .where(eq(appointments.id, id))
+        .for('update')
+      if (!current) {
+        return {
+          ok: false,
+          status: 404,
+          body: { error: 'Appointment not found', code: 'APPOINTMENT_NOT_FOUND' },
+        }
+      }
+      if (TERMINAL_APPOINTMENT_STATUSES.has(current.status)) {
+        return {
+          ok: false,
+          status: 409,
+          body: {
+            error: `This appointment is already ${current.status.replace('_', ' ')} and can't be changed further.`,
+            code: 'APPOINTMENT_TERMINAL',
+          },
+        }
+      }
+      if (!canChangeStatus(current.status, transition.status)) {
+        return {
+          ok: false,
+          status: 409,
+          body: {
+            error: `A ${current.status.replace('_', ' ')} appointment can't be moved to ${transition.status.replace('_', ' ')}.`,
+            code: 'APPOINTMENT_INVALID_TRANSITION',
+          },
+        }
+      }
 
+      // A visit from a previous day: admin with a reason, or yesterday's close-out (D6).
+      const decision = pastDayDecision({
+        appointmentDate: new Date(current.date),
+        now,
+        isAdmin: user.roleId === 'admin',
+        targetStatus: transition.status,
+        statusOnly: true,
+      })
+      if (decision === 'locked') {
+        return {
+          ok: false,
+          status: 403,
+          body: { error: 'Past appointments are read-only', code: 'APPOINTMENT_PAST_LOCKED' },
+        }
+      }
+      if (decision === 'needs_reason' && overrideReason.length < 3) {
+        return {
+          ok: false,
+          status: 400,
+          body: {
+            error: 'Changing a past appointment requires a reason (3+ chars)',
+            code: 'OVERRIDE_REASON_REQUIRED',
+          },
+        }
+      }
+
+      const updates: Record<string, unknown> = { status: transition.status, updatedAt: now }
+      if (transition.timestampField) updates[transition.timestampField] = now
+
+      // Estimate routing (0168): a requires-estimate visit enters the doctor's
+      // Activity queue on check-in (awaiting_estimate) rather than reception-direct.
+      if (
+        transition.status === 'checked_in' &&
+        current.requiresEstimate &&
+        !current.estimateStatus
+      ) {
+        updates.estimateStatus = 'awaiting_estimate'
+      }
+
+      // Append a timestamped note when provided (e.g. no-show "last response from patient")
+      if (incomingNote) {
+        const stamp = `[${transition.status} ${now.toISOString()}]: ${incomingNote}`
+        updates.notes = current.notes ? `${current.notes}\n${stamp}` : stamp
+      }
+
+      const [updated] = await rawTx
+        .update(appointments)
+        .set(updates)
+        .where(eq(appointments.id, id))
+        .returning()
+
+      // A booked patient who arrives is the doctor's next to-do (F18).
+      if (transition.status === 'checked_in') {
+        await ensurePendingMedicalRecord(rawTx as unknown as DB, {
+          patientId: current.patientId,
+          doctorId: current.doctorId,
+          appointmentId: current.id,
+        })
+      }
+
+      return {
+        ok: true,
+        updated,
+        updates,
+        pastReason: decision === 'needs_reason' ? overrideReason : null,
+      }
+    })
+  } catch (error) {
+    logError(error, { route: 'appointment-workflow.transition' })
+    return c.json({ error: 'Failed to transition', code: 'WORKFLOW_TRANSITION_FAILED' }, 500)
+  }
+
+  if (!outcome.ok) return c.json(outcome.body, outcome.status)
+  const { updated, updates, pastReason } = outcome
+
+  await createAuditLog(db, {
+    userId: user.id,
+    action: 'update',
+    module: 'appointments',
+    entityId: id,
+    entityName: `Appointment transition → ${transition.status}`,
+    changes: updates,
+    reason: pastReason ? `[PAST-EDIT] ${pastReason}` : null,
+  })
+
+  // Sync status change to Google Calendar — sync helper deletes the event
+  // if the new status is cancelled / no_show, patches it otherwise.
+  enrichAppointment(updated)
+    .then((enriched) => syncAppointmentUpdated(enriched))
+    .catch((err) => logError(err, { route: 'appointment-workflow.transition.sync' }))
+
+  return c.json({ success: true, data: updated })
+})
+
+// ─── POST /api/appointment-workflow/:id/check-in ─────────────────────────────
+// Check a patient in: the payment (if any), the status change and the doctor's
+// note in ONE transaction. See lib/appointment-checkin.ts.
+// Body: exactly one of
+//   { payment: { amount, method, description?, treatments?, sendNotification? } }
+//   { noPaymentReason: string }
+//   { paymentRecordedElsewhere: true }   — plan or insurance, already linked to this visit
+// plus { overrideReason } when an admin changes a visit from a previous day.
+const checkInSchema = z
+  .object({
+    payment: z
+      .object({
+        amount: z.number().positive(),
+        method: z.string().trim().min(1),
+        description: z.string().nullish(),
+        treatments: z.array(z.unknown()).optional(),
+        sendNotification: z.boolean().optional(),
+        transactionId: z.string().nullish(),
+        externalReference: z.string().nullish(),
+        paymentDate: z.coerce.date().optional(),
+      })
+      .optional(),
+    noPaymentReason: z.string().trim().min(3).optional(),
+    paymentRecordedElsewhere: z.literal(true).optional(),
+    overrideReason: z.string().optional(),
+  })
+  .refine(
+    (v) =>
+      [v.payment, v.noPaymentReason, v.paymentRecordedElsewhere].filter((m) => m !== undefined)
+        .length === 1,
+    { message: 'Give exactly one of payment, noPaymentReason or paymentRecordedElsewhere' }
+  )
+
+appointmentWorkflowApp.post('/:id/check-in', async (c) => {
+  const user = await getCurrentUser(c)
+  if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  if (
+    !(await checkPermission(c, user.id, MODULES.APPOINTMENTS as string, ACTIONS.UPDATE as string))
+  ) {
+    return c.json({ error: 'Unauthorized' }, 403)
+  }
+
+  const parsed = checkInSchema.safeParse(await c.req.json().catch(() => null))
+  if (!parsed.success) {
+    return c.json(
+      {
+        error: 'Invalid check-in request',
+        code: 'CHECKIN_PAYMENT_MODE_REQUIRED',
+        issues: parsed.error.issues,
+      },
+      400
+    )
+  }
+  const body = parsed.data
+
+  // Taking money is a payments action, not an appointments one.
+  if (
+    body.payment &&
+    !(await checkPermission(c, user.id, MODULES.PAYMENTS as string, ACTIONS.CREATE as string))
+  ) {
+    return c.json({ error: 'Unauthorized' }, 403)
+  }
+
+  const id = c.req.param('id')
+  const db = getDb(process.env.DATABASE_URL!)
+
+  let result: Awaited<ReturnType<typeof checkInAppointment>>
+  try {
+    result = await checkInAppointment(db, {
+      appointmentId: id,
+      user: { id: user.id, roleId: user.roleId },
+      payment: body.payment,
+      noPaymentReason: body.noPaymentReason,
+      paymentRecordedElsewhere: body.paymentRecordedElsewhere,
+      overrideReason: body.overrideReason,
+    })
+  } catch (error) {
+    if (error instanceof CheckInError) return c.json(error.body, error.httpStatus)
+    logError(error, { route: 'appointment-workflow.check-in', appointmentId: id })
+    return c.json({ error: 'Failed to check in', code: 'CHECKIN_FAILED' }, 500)
+  }
+
+  // Everything below happens AFTER the commit and may not undo it.
+  let smsError: string | undefined
+  if (!result.alreadyCheckedIn) {
+    c.set('skipAudit', true)
     await createAuditLog(db, {
       userId: user.id,
       action: 'update',
       module: 'appointments',
       entityId: id,
-      entityName: `Appointment transition → ${transition.status}`,
-      changes: updates,
+      entityName: 'Appointment check-in',
+      changes: {
+        status: 'checked_in',
+        paymentId: result.payment?.id ?? null,
+        mode: body.payment ? 'payment' : body.noPaymentReason ? 'no_payment' : 'recorded_elsewhere',
+        noPaymentReason: body.noPaymentReason ?? null,
+      },
+      reason: result.pastDayReason ? `[PAST-EDIT] ${result.pastDayReason}` : null,
     })
 
-    // Sync status change to Google Calendar — sync helper deletes the event
-    // if the new status is cancelled / no_show, patches it otherwise.
-    enrichAppointment(updated)
+    enrichAppointment(result.appointment)
       .then((enriched) => syncAppointmentUpdated(enriched))
-      .catch((err) => logError(err, { route: 'appointment-workflow.transition.sync' }))
+      .catch((err) => logError(err, { route: 'appointment-workflow.check-in.sync' }))
 
-    return c.json({ success: true, data: updated })
-  } catch (error) {
-    logError(error, { route: 'appointment-workflow.transition' })
-    return c.json({ error: 'Failed to transition', code: 'WORKFLOW_TRANSITION_FAILED' }, 500)
+    if (result.payment && body.payment?.sendNotification) {
+      const [patient] = await db
+        .select()
+        .from(patients)
+        .where(eq(patients.id, result.appointment.patientId))
+        .limit(1)
+      if (patient) {
+        const sms = await sendPaymentReceiptSms(db, {
+          patient,
+          amount: body.payment.amount,
+          balance: null,
+          description: body.payment.description,
+          userId: user.id,
+        })
+        smsError = sms.error
+      }
+    }
   }
+
+  return c.json({
+    success: true,
+    data: {
+      appointment: result.appointment,
+      payment: result.payment,
+      alreadyCheckedIn: result.alreadyCheckedIn,
+    },
+    ...(smsError ? { smsError } : {}),
+  })
 })
 
 // ─── POST /api/appointment-workflow/:id/send-confirmation ───────────────────
@@ -130,8 +366,8 @@ appointmentWorkflowApp.post('/:id/send-confirmation', async (c) => {
 
   // Generate new token (rotate on each send)
   const token = crypto.randomUUID()
-  const baseUrl = process.env.PORTAL_URL ?? 'https://app.deneldental.com'
-  const confirmationUrl = `${baseUrl}/c/${token}`
+  // /c/:token is a page of the clinic portal (not of the patient app).
+  const confirmationUrl = portalLink(`/c/${token}`)
 
   const patientPhone =
     appt.patient?.isChild && appt.patient?.guardianPhone
@@ -146,13 +382,20 @@ appointmentWorkflowApp.post('/:id/send-confirmation', async (c) => {
     'appointment:confirm_link',
     'Hi {name}, reminder: appointment at {ClinicName} on {date} at {time} with {doctor}. Confirm or cancel: {url}'
   )
-  const message = renderSms(template, {
+  const templateVars = {
     name: appt.patient?.name || 'Patient',
     ClinicName: process.env.CLINIC_NAME || 'Denel',
     date: apptDate.toLocaleDateString(),
     time: apptDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     doctor: doctorName,
-    url: confirmationUrl,
+  }
+  const message = renderSms(template, { ...templateVars, url: confirmationUrl })
+  // The token in the link is a bearer credential (anyone holding it can confirm
+  // or cancel this appointment), so the SMS log keeps the message without it.
+  // Same treatment as `confirmationToken` in lib/audit.ts.
+  const storedMessage = renderSms(template, {
+    ...templateVars,
+    url: portalLink(`/c/${REDACTED_TOKEN_MARKER}`),
   })
 
   // Save token first so the URL is valid before SMS fires
@@ -169,7 +412,7 @@ appointmentWorkflowApp.post('/:id/send-confirmation', async (c) => {
 
   // Send SMS
   const smsResult = await sendSMS(
-    [{ phone: patientPhone, message, patientId: appt.patient?.id }],
+    [{ phone: patientPhone, message, storedMessage, patientId: appt.patient?.id }],
     undefined,
     'appointment',
     user.id
@@ -255,8 +498,9 @@ appointmentWorkflowApp.get('/public/confirm/:token', async (c) => {
     data: {
       date: appt.date,
       currentResponse: appt.confirmationResponse,
-      alreadyActed:
-        appt.status === 'cancelled' || appt.status === 'completed' || appt.status === 'no_show',
+      // The link can no longer act once the visit is over, the patient has
+      // arrived, or the day has passed.
+      alreadyActed: !isPreArrivalStatus(appt.status) || isPastAppointmentDate(new Date(appt.date)),
     },
   })
 })
@@ -285,8 +529,30 @@ appointmentWorkflowApp.post('/public/confirm/:token', async (c) => {
   if (!appt) return c.json({ error: 'Link not found or expired' }, 404)
 
   // Can't act on already-cancelled/completed appointments
-  if (appt.status === 'cancelled' || appt.status === 'completed' || appt.status === 'no_show') {
+  if (TERMINAL_APPOINTMENT_STATUSES.has(appt.status)) {
     return c.json({ error: 'This appointment cannot be modified.' }, 400)
+  }
+
+  // The link is a token anyone holding the SMS can use, so it may only do what
+  // the machine allows a patient to do: confirm or cancel a visit that has not
+  // started. An old link must not pull a patient who is already here back to
+  // "confirmed" (re-opening check-in and a second payment) or cancel their visit
+  // while it is under way (F19).
+  if (isPastAppointmentDate(new Date(appt.date))) {
+    return c.json({ error: 'This appointment has passed.', code: 'APPOINTMENT_PASSED' }, 400)
+  }
+  if (!isPreArrivalStatus(appt.status)) {
+    if (response === 'no') {
+      return c.json(
+        {
+          error: "You've already arrived. Please speak to reception to make changes.",
+          code: 'APPOINTMENT_ALREADY_ARRIVED',
+        },
+        400
+      )
+    }
+    // "Yes, I'm coming" from someone already here: nothing to change.
+    return c.json({ success: true, response })
   }
 
   const updates: any = {
@@ -295,7 +561,8 @@ appointmentWorkflowApp.post('/public/confirm/:token', async (c) => {
     updatedAt: new Date(),
   }
   if (response === 'yes') {
-    updates.status = 'confirmed'
+    // Already confirmed is not a move; only record the answer.
+    if (appt.status !== 'confirmed') updates.status = 'confirmed'
   } else if (response === 'no') {
     updates.status = 'cancelled'
   }

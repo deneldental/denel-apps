@@ -28,6 +28,8 @@ brand-assets-inbox/
 scripts/neon-legacy-data-migration.env
 # CSV exports of patient/staff data made by scripts/neon-legacy-data-migration.sh
 tmp-neon-migration/
+# Source archives made by `pnpm run package:source` (scripts/package-source.mjs)
+/tmp/
 .env.local
 .env.*.local
 .env.development
@@ -71,6 +73,21 @@ tmp-neon-migration/
 # Personal Claude Code state — never commit (settings.local.json once held DB URLs)
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# One-off patch scripts and stray copies at the repo root — never commit
+scratch/
+
+# Throwaway output dumps of the one-off parity scripts (money-parity.mjs,
+# plan-parity-snapshot.mjs write them with `> file`); they hold per-patient balances
+backend/scripts/plan-parity-*.txt
+backend/scripts/sums.*.txt
+
+# Metadata files a document tool leaves beside a report
+*.md.metadata.json
+
+# Claude Code: a personal permission allow-list is not project config. (The tracked one held
+# only one-off grep/python/rm approvals with paths from the original author's machine.)
+.claude/settings.json
 
 # Local dev scratch / one-off diagnostic scripts — never commit
 backend/scratch*.ts

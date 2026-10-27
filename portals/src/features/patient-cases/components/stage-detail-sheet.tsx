@@ -1,10 +1,8 @@
-import { format } from 'date-fns'
 import { ChevronLeft, ChevronRight as ChevronRightIcon, X } from 'lucide-react'
 import { useState } from 'react'
 import { Odontogram } from 'react-odontogram'
 import { Badge } from '@/shared/components/ui/badge'
 import type { LookupSelection } from '@/shared/components/ui/lookup-multiselect'
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/shared/components/ui/sheet'
 import { formatAmount } from '@/shared/utils/currency'
 import type { CaseStage } from './case-detail-sheet'
 
@@ -578,32 +576,4 @@ function StageBody({ stage }: { stage: CaseStage }) {
     default:
       return <p className="text-sm text-muted-foreground">No renderer for {stageType}.</p>
   }
-}
-
-interface Props {
-  stage: CaseStage
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  canEdit?: boolean
-  onUpdated?: (stage: CaseStage) => void
-}
-
-export function StageDetailSheet({ stage, open, onOpenChange }: Props) {
-  const label = STAGE_LABEL[stage.stageType] ?? stage.stageType
-  return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent className="w-full sm:!max-w-[40vw] overflow-y-auto">
-        <SheetHeader className="pb-4 border-b">
-          <SheetTitle>{label}</SheetTitle>
-          <p className="text-xs text-muted-foreground">
-            Recorded {format(new Date(stage.createdAt), 'MMM d, yyyy · h:mm a')}
-            {stage.createdBy ? ` by ${stage.createdBy.name}` : ''}
-          </p>
-        </SheetHeader>
-        <div className="pt-4 space-y-4">
-          <StageBody stage={stage} />
-        </div>
-      </SheetContent>
-    </Sheet>
-  )
 }

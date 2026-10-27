@@ -121,7 +121,7 @@ export function OrthoConsentContent({
     meta: {
       onUpload: canEdit ? handleUpload : undefined,
       onDelete: canEdit ? handleDelete : undefined,
-      onView: (patient: OrthoConsent) => navigate(`/ortho-consent/${patient.id}`),
+      onView: (patient: OrthoConsent) => navigate(`/consents/ortho/${patient.id}`),
       canEdit: canEdit,
     },
   })
@@ -195,7 +195,7 @@ export function OrthoConsentContent({
                 <TableRow
                   key={row.id}
                   data-state={row.getIsSelected() && 'selected'}
-                  onClick={() => navigate(`/ortho-consent/${row.original.id}`)}
+                  onClick={() => navigate(`/consents/ortho/${row.original.id}`)}
                   className="cursor-pointer hover:bg-muted/50"
                 >
                   {row.getVisibleCells().map((cell) => (

@@ -25,6 +25,8 @@ interface PlanPaymentSheetProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   onSuccess?: () => void
+  /** The visit this payment is for, at check-in; every payment posted names it. */
+  appointmentId?: string
   /**
    * Locks the payment to this patient — the picker stage is skipped and the
    * plan-receive dialog opens directly. Only pass this when the caller
@@ -53,6 +55,7 @@ export function PlanPaymentSheet({
   open,
   onOpenChange,
   onSuccess,
+  appointmentId,
   presetPatientId,
   onBack,
 }: PlanPaymentSheetProps) {
@@ -111,6 +114,7 @@ export function PlanPaymentSheet({
         patientId={patientId}
         patientName={selectedPatient?.name}
         planId={plan.id}
+        appointmentId={appointmentId}
         onPosted={onSuccess}
       />
     )

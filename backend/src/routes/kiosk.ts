@@ -38,6 +38,7 @@ import {
 } from '../lib/kiosk-crypto'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
+import { normalizeEmail } from '../lib/normalize-email'
 import { createRateLimiter } from '../lib/rate-limiter'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import { clearStaffSession } from '../lib/staff-session'
@@ -852,7 +853,7 @@ kioskApp.post('/session', async (c) => {
     let targetUserId = st.userId
     if (!targetUserId) {
       const generatedId = `kiosk-user-${st.id}`
-      const userEmail = st.email || `kiosk-${st.id}@framada.local`
+      const userEmail = normalizeEmail(st.email || `kiosk-${st.id}@framada.local`)
       const [createdUser] = await tx
         .insert(user)
         .values({

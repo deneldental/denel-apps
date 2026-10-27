@@ -14,9 +14,12 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { eq, inArray, sql } from 'drizzle-orm'
+import { eq, inArray, or, sql } from 'drizzle-orm'
 import type { DB } from '../../src/db'
 import {
+  appointments,
+  clinicChairs,
+  doctors,
   invoiceLines,
   invoices,
   journalEntries,
@@ -70,6 +73,45 @@ export async function makeSpecialist(
     })
     .returning()
   return s.id
+}
+
+/** A `doctors` row (linked via a fresh specialist) — needed for appointments.doctorId. */
+export async function makeDoctor(tx: DB): Promise<string> {
+  const specialistId = await makeSpecialist(tx)
+  const [d] = await tx.insert(doctors).values({ specialistId, specialty: 'General' }).returning()
+  return d.id
+}
+
+export async function makeAppointment(
+  tx: DB,
+  opts: {
+    patientId: string
+    doctorId: string
+    status?: string
+    date?: Date
+    durationMinutes?: number
+    chairId?: string | null
+  }
+): Promise<string> {
+  const [a] = await tx
+    .insert(appointments)
+    .values({
+      patientId: opts.patientId,
+      doctorId: opts.doctorId,
+      date: opts.date ?? new Date(),
+      durationMinutes: opts.durationMinutes ?? 30,
+      status: opts.status ?? 'scheduled',
+      type: 'consultation',
+      chairId: opts.chairId ?? null,
+    })
+    .returning()
+  return a.id
+}
+
+/** A `clinic_chairs` row. */
+export async function makeChair(tx: DB, name = 'IT Chair'): Promise<string> {
+  const [c] = await tx.insert(clinicChairs).values({ name }).returning()
+  return c.id
 }
 
 /**
@@ -144,7 +186,10 @@ export async function sweepLeakedFixtures(): Promise<void> {
       const entries = await db.execute<{ id: string }>(
         sql`SELECT id FROM journal_entries WHERE source_doc_id IN (${sql.join(docIds, sql`, `)})`
       )
-      const ids = entries.rows.map((e) => e.id)
+      const ids = await withReversals(
+        db,
+        entries.rows.map((e) => e.id)
+      )
       if (ids.length > 0) {
         await db.delete(journalLines).where(inArray(journalLines.entryId, ids))
         await db
@@ -156,6 +201,23 @@ export async function sweepLeakedFixtures(): Promise<void> {
     }
     await db.delete(patients).where(eq(patients.id, id))
   }
+}
+
+/**
+ * `ids` plus the entries that reverse them. A reversal's source document is the entry it reverses,
+ * so it is not found through the patient's invoices and payments. Left behind, it outlives the
+ * original it undoes (a phantom reversal in the ledger) and keeps its author from ever being
+ * deleted: `deleteLoginUsers` then bans the fixture user instead, one per run.
+ */
+async function withReversals(db: DB, ids: string[]): Promise<string[]> {
+  if (ids.length === 0) return ids
+  const reversals = await db
+    .select({ id: journalEntries.id })
+    .from(journalEntries)
+    .where(
+      or(inArray(journalEntries.reversesEntryId, ids), inArray(journalEntries.sourceDocId, ids))
+    )
+  return [...new Set([...ids, ...reversals.map((r) => r.id)])]
 }
 
 /**
@@ -178,7 +240,7 @@ export async function withCommittedFixtures<T>(
   } finally {
     // Journal entries first (no cascade), then the patient (cascades the rest).
     if (entryIds.size > 0) {
-      const ids = [...entryIds]
+      const ids = await withReversals(db, [...entryIds])
       await db.delete(journalLines).where(inArray(journalLines.entryId, ids))
       // A reversal entry references its original via reverses_entry_id — null
       // those refs out before deleting the tracked entries themselves.

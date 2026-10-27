@@ -44,7 +44,11 @@ async function hmacKey(): Promise<CryptoKey> {
 }
 
 /** HMAC-SHA256 of a one-time code, hex encoded. */
-export async function hashOtp(code: string, domain: 'staff' | 'patient'): Promise<string> {
+export async function hashOtp(
+  code: string,
+  // One domain per table: a digest from one can never be replayed against another.
+  domain: 'staff' | 'patient' | 'staff_registration'
+): Promise<string> {
   const key = await hmacKey()
   const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(`otp:v1:${domain}:${code}`))
   return Array.from(new Uint8Array(sig))

@@ -202,6 +202,8 @@ describe.skipIf(skip)('SMS paths leave the sender to the configured Sender ID', 
   beforeEach(() => {
     vi.clearAllMocks()
     vi.stubEnv('HUBTEL_SENDER_ID', 'EnvSender')
+    // The confirmation link is a page of the portal; a deployed backend always states where it is.
+    vi.stubEnv('PORTAL_URL', 'https://portal.example.test')
     vi.mocked(getCurrentUser).mockResolvedValue({
       id: adminUserId,
       email: 'admin@framada.app',
@@ -290,6 +292,21 @@ describe.skipIf(skip)('SMS paths leave the sender to the configured Sender ID', 
       method: 'cash',
       sendNotification: true,
     })
+    expect(status, JSON.stringify(body)).toBe(200)
+
+    expect(sendersPassedFor(PHONE)).toEqual([undefined])
+  })
+
+  it('payment confirmation SMS when a draft payment is posted (G08)', async () => {
+    const drafted = await send('POST', '/api/payments/draft', {
+      patientId,
+      amount: 5000,
+      method: 'cash',
+    })
+    expect(drafted.status, JSON.stringify(drafted.body)).toBe(200)
+    const draftId = (drafted.body as { data: { id: string } }).data.id
+
+    const { status, body } = await send('POST', `/api/payments/${draftId}/post`, { sendSms: true })
     expect(status, JSON.stringify(body)).toBe(200)
 
     expect(sendersPassedFor(PHONE)).toEqual([undefined])

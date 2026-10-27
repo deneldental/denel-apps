@@ -1,0 +1,89 @@
+{
+  "_comment": "Findings of scripts/api-contract-audit.mjs that are known and deliberately not blocking. Every entry needs a reason. The audit lists an entry that no longer matches anything as stale: delete it then. The portal, patient and team apps have no entries and must stay that way.",
+  "entries": [
+    {
+      "app": "hr",
+      "method": "GET",
+      "path": "/api/staff/*/*",
+      "reason": "Built at run time from the typed ChildResource union (contacts | qualifications | dependents | work-experience) in hr/src/lib/actions/staff-personal.ts. The backend registers each of the four in a loop (backend/src/routes/staff-personal.ts), which a static inventory cannot expand, so the audit can prove neither side."
+    },
+    {
+      "app": "hr",
+      "method": "POST",
+      "path": "/api/staff/*/*",
+      "reason": "Same ChildResource call as above (add a child record); the backend registers POST /:staffId/<resource> for each of the four in a loop."
+    },
+    {
+      "app": "hr",
+      "method": "PATCH",
+      "path": "/api/staff/*/*",
+      "reason": "Same ChildResource call as above (update a child record); the backend registers PATCH /<resource>/:id for each of the four in a loop."
+    },
+    {
+      "app": "hr",
+      "method": "DELETE",
+      "path": "/api/staff/*/*",
+      "reason": "Same ChildResource call as above (remove a child record); the backend registers DELETE /<resource>/:id for each of the four in a loop."
+    },
+    {
+      "app": "reports",
+      "method": "POST",
+      "path": "/api/audit-logs",
+      "reason": "reports/ is outside the current scope (audit §11, recorded not scheduled): the backend only has GET /api/audit-logs."
+    },
+    {
+      "app": "reports",
+      "method": "DELETE",
+      "path": "/api/patients/*",
+      "reason": "reports/ is outside the current scope (audit §11): patients are archived now, the backend has no DELETE /api/patients/:id."
+    },
+    {
+      "app": "reports",
+      "method": "POST",
+      "path": "/api/patients/import",
+      "reason": "reports/ is outside the current scope (audit §11): there is no patient CSV import route."
+    },
+    {
+      "app": "reports",
+      "method": "POST",
+      "path": "/api/payment-plans/*/pause",
+      "reason": "reports/ is outside the current scope (audit §11): the backend pauses a plan with PATCH."
+    },
+    {
+      "app": "reports",
+      "method": "POST",
+      "path": "/api/payment-plans/*/unpause",
+      "reason": "reports/ is outside the current scope (audit §11): the backend resumes a plan with PATCH."
+    },
+    {
+      "app": "reports",
+      "method": "GET",
+      "path": "/api/payment-plans/templates/*",
+      "reason": "reports/ is outside the current scope (audit §11): the backend has no read-one route for a plan template (only list, PATCH and DELETE)."
+    },
+    {
+      "app": "reports",
+      "method": "GET",
+      "path": "/api/ortho-consent/template",
+      "reason": "reports/ is outside the current scope (audit §11): no such route exists."
+    },
+    {
+      "app": "reports",
+      "method": "GET",
+      "path": "/api/settings/finance-visibility",
+      "reason": "reports/ is outside the current scope: finance visibility is not implemented (CLAUDE.md 'Reports visibility'; settings audit D7). Every report is treated as visible."
+    },
+    {
+      "app": "reports",
+      "method": "POST",
+      "path": "/api/sync/medical-records-payments",
+      "reason": "reports/ is outside the current scope (audit §11): no such route exists."
+    },
+    {
+      "app": "reports",
+      "method": "POST",
+      "path": "/api/upload/delete",
+      "reason": "reports/ is outside the current scope (audit §11): no such route exists; files are not deleted through the API."
+    }
+  ]
+}

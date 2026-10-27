@@ -6,6 +6,7 @@ import { CsvUploadDialog } from '@/features/settings/components/csv-upload-dialo
 import {
   clearAllBusinessData,
   clearTable,
+  getImportableTables,
   getManageableTables,
   getTableTemplate,
 } from '@/lib/actions/database'
@@ -44,6 +45,12 @@ export function DatabaseManagementSection() {
   const tablesQuery = useApiQuery<string[]>(TABLES_KEY, () => getManageableTables())
   const tables = tablesQuery.data ?? []
   const isLoading = tablesQuery.isLoading
+  // Only the lookup tables can be loaded from a CSV (the other tables are written by their own
+  // screens, which keep the ledger, patient numbers and the schedule correct).
+  const importableQuery = useApiQuery<string[]>(queryKeys.database.importableTables(), () =>
+    getImportableTables()
+  )
+  const importable = new Set(importableQuery.data ?? [])
 
   // A table clear or full wipe can invalidate almost any screen in the app, so
   // both mutations invalidate the whole cache rather than a specific list.
@@ -141,27 +148,38 @@ export function DatabaseManagementSection() {
                   </TableCell>
                   <TableCell className="text-right">
                     <div className="flex justify-end gap-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => handleDownloadTemplate(table)}
-                        title="Download Template"
-                      >
-                        <Download className="h-4 w-4 mr-2" />
-                        Template
-                      </Button>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => {
-                          setSelectedTable(table)
-                          setUploadDialogOpen(true)
-                        }}
-                        title="Upload CSV"
-                      >
-                        <Upload className="h-4 w-4 mr-2" />
-                        Upload
-                      </Button>
+                      {importable.has(table) ? (
+                        <>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => handleDownloadTemplate(table)}
+                            title="Download Template"
+                          >
+                            <Download className="h-4 w-4 mr-2" />
+                            Template
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => {
+                              setSelectedTable(table)
+                              setUploadDialogOpen(true)
+                            }}
+                            title="Upload CSV"
+                          >
+                            <Upload className="h-4 w-4 mr-2" />
+                            Upload
+                          </Button>
+                        </>
+                      ) : (
+                        <span
+                          className="self-center px-2 text-xs text-muted-foreground"
+                          title="Only lookup tables can be imported from a CSV"
+                        >
+                          Not importable
+                        </span>
+                      )}
                       <Button
                         variant="ghost"
                         size="sm"

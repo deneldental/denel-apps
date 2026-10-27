@@ -18,7 +18,7 @@ also have to be settled before the first push to `main` or `staging`.
 | Secrets in the working tree | **GO** | None. The only hits are test fixtures (fake hosts) and a UI placeholder |
 | Secrets in git history | **NO-GO** | Neon passwords and credentialed DB URLs, added or removed across 28 commits — see below |
 | Tracked personal tool files | **Fix first** | `.claude/settings.local.json`, `.claude/scheduled_tasks.lock` |
-| `website/` | **Decide** | Not rebranded; 139 MB of photos (26 files over 1 MB), several apparently of the original clinic's staff; a push to `main` deploys it to production |
+| `website/` | **Decide** | Not rebranded; 139 MB of photos (26 files over 1 MB), several apparently of the original clinic's staff; a manual production deploy (Actions → Deploy → Run workflow, on `main`) builds and ships it |
 | Pipeline prerequisites | **Set up first** | 15 GitHub secrets, Doppler service tokens, Cloudflare projects, VPS, Render — see below |
 | Portal E2E smoke (CI step) | Not run locally | Needs the staging backend and Doppler `stg` |
 
@@ -83,10 +83,13 @@ commit until the Denel site is built, or disable its job until then.
 
 ## Pipeline prerequisites
 
-A push to `main` runs the production deploy immediately (GHCR image, Hetzner
-over SSH, migrations + seeds on the VPS, Cloudflare); `staging` deploys staging.
-Pull requests only run the quality gates. Set these up first, or push to a
-branch that deploys nothing (e.g. `dev`, PR-checked only) until they exist.
+Production deploys only when someone runs **Actions → Deploy → Run workflow** on
+`main` (GHCR image, Hetzner over SSH, migrations + seeds on the VPS, Cloudflare;
+since 2026-10-26 a push to `main` runs the quality gates and stops there); a push
+to `staging` deploys staging. Pull requests only run the quality gates. Set these
+up before the first staging push or the first manual run; until they exist, push
+to a branch that deploys nothing (e.g. `dev`, PR-checked only) or to `main`, which
+only runs the gates.
 
 - **GitHub secrets (15):** `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`,
   `DOPPLER_TOKEN_STAGING`, `DOPPLER_TOKEN_PRODUCTION`, `HETZNER_HOST`,

@@ -1,7 +1,13 @@
 import { Download, FileText, Loader2, Upload } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { downloadCsv, getTableTemplate, importTableData } from '@/lib/actions/database'
+import { ImportReport } from '@/features/settings/components/import-report'
+import {
+  downloadCsv,
+  getTableTemplate,
+  type ImportResult,
+  importTableData,
+} from '@/lib/actions/database'
 import { Button } from '@/shared/components/ui/button'
 import {
   Dialog,
@@ -23,7 +29,8 @@ interface CsvUploadDialogProps {
   onSuccess: () => void
 }
 
-const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024 // 5 MB
+// The server reads at most 1 MB of JSON per request; a lookup table never needs more.
+const MAX_FILE_SIZE_BYTES = 1 * 1024 * 1024 // 1 MB
 
 export function CsvUploadDialog({
   open,
@@ -32,7 +39,15 @@ export function CsvUploadDialog({
   onSuccess,
 }: CsvUploadDialogProps) {
   const [file, setFile] = useState<File | null>(null)
+  const [report, setReport] = useState<ImportResult | null>(null)
   const { isSubmitting, submit } = useSubmitGuard()
+
+  const finish = () => {
+    setReport(null)
+    setFile(null)
+    onOpenChange(false)
+    onSuccess()
+  }
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = e.target.files?.[0]
@@ -49,7 +64,7 @@ export function CsvUploadDialog({
     }
 
     if (selected.size > MAX_FILE_SIZE_BYTES) {
-      toast.error('File exceeds the 5 MB limit. Please use a smaller CSV.')
+      toast.error('File exceeds the 1 MB limit. Please use a smaller CSV.')
       e.target.value = ''
       return
     }
@@ -84,12 +99,16 @@ export function CsvUploadDialog({
       const result = await importTableData(tableName, text)
 
       if (result.success) {
-        toast.success(`Successfully imported ${result.count} records`)
-        setFile(null)
-        onOpenChange(false)
-        onSuccess()
+        toast.success(`Imported ${result.count ?? 0} records`)
+        // Nothing left out: done. Otherwise stay open so the person can read what was.
+        if ((result.skippedTotal ?? 0) === 0 && (result.existing ?? 0) === 0) {
+          finish()
+        } else {
+          setReport(result)
+        }
       } else {
         surfaceApiError(result, 'Import failed')
+        if (result.skipped?.length) setReport(result)
       }
     })
 
@@ -107,6 +126,12 @@ export function CsvUploadDialog({
             Select a CSV file to import. Ensure the headers match the template.
           </DialogDescription>
         </DialogHeader>
+
+        {report ? (
+          <div className="py-4">
+            <ImportReport result={report} />
+          </div>
+        ) : null}
 
         <div className="grid w-full max-w-sm items-center gap-4 py-4">
           <div className="flex flex-col gap-2">
@@ -130,9 +155,15 @@ export function CsvUploadDialog({
         </div>
 
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={isSubmitting}>
-            Cancel
-          </Button>
+          {report?.success ? (
+            <Button variant="outline" onClick={finish}>
+              Done
+            </Button>
+          ) : (
+            <Button variant="outline" onClick={() => onOpenChange(false)} disabled={isSubmitting}>
+              Cancel
+            </Button>
+          )}
           <Button onClick={handleUpload} disabled={!file || isSubmitting}>
             {isSubmitting ? (
               <>

@@ -10,6 +10,12 @@ export type Specialist = {
   /** Avatar URL on DO Spaces. PR-16. */
   profileImage: string | null
   contactEmail: string | null
+  /**
+   * The address this specialist SIGNS IN with, when they have a login (null otherwise). Only the
+   * detail response carries it. It is not the same field as `contactEmail` and cannot be changed
+   * from the specialist screens (D17 / F48).
+   */
+  signInEmail?: string | null
   contactPhone: string | null
   tin: string | null
   specialistType: SpecialistType
@@ -99,4 +105,25 @@ export async function updateSpecialist(id: string, input: Partial<Specialist>) {
 
 export async function deactivateSpecialist(id: string) {
   return api.delete<Specialist>(`/api/specialists/${id}`)
+}
+
+export async function reactivateSpecialist(id: string) {
+  return api.patch<Specialist>(`/api/specialists/${id}`, { isActive: true })
+}
+
+export type GrantedSpecialistLogin = {
+  specialistId: string
+  userId: string
+  /** The employment record now linked — created if the specialist had none. */
+  staffRowId: string
+  specialist: Specialist
+}
+
+/**
+ * Give an existing specialist a portal login. Turns an external specialist into
+ * an internal one (employment record + `doctor` login) in a single request —
+ * editing the Type field alone never could. The email is lowercased server-side.
+ */
+export async function grantSpecialistLogin(id: string, input: { email: string; password: string }) {
+  return api.post<GrantedSpecialistLogin>(`/api/specialists/${id}/grant-login`, input)
 }

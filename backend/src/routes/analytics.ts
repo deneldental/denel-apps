@@ -45,6 +45,7 @@ import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
 import { hasOrthoTag } from '../lib/patient-tags-query'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
+import { denyUnless } from '../lib/route-access'
 import type { HonoEnv } from '../lib/types'
 
 const analyticsApp = new Hono<HonoEnv>()
@@ -72,6 +73,11 @@ function growth(prev: number, curr: number): number | null {
 analyticsApp.get('/', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, {
+    apps: ['portal'],
+    anyOf: [[MODULES.ANALYTICS, ACTIONS.READ]],
+  })
+  if (denied) return denied
 
   const yearParam = c.req.query('year')
   const year = yearParam ? parseInt(yearParam, 10) : new Date().getFullYear()

@@ -11,35 +11,9 @@ import { ROLES } from '../lib/modules'
 import { getCurrentUser } from '../lib/rbac'
 import { uploadToCategory } from '../lib/storage-router'
 import type { HonoEnv } from '../lib/types'
+import { buildExpenseKey } from '../lib/upload-policy'
+import { uploadProfiles, validateUpload } from '../lib/upload-validation'
 
-const MONTH_NAMES = [
-  'JANUARY',
-  'FEBRUARY',
-  'MARCH',
-  'APRIL',
-  'MAY',
-  'JUNE',
-  'JULY',
-  'AUGUST',
-  'SEPTEMBER',
-  'OCTOBER',
-  'NOVEMBER',
-  'DECEMBER',
-]
-
-function getOrdinalSuffix(day: number): string {
-  if (day > 3 && day < 21) return 'th'
-  switch (day % 10) {
-    case 1:
-      return 'st'
-    case 2:
-      return 'nd'
-    case 3:
-      return 'rd'
-    default:
-      return 'th'
-  }
-}
 const ledgerAdjustmentsApp = new Hono<HonoEnv>()
 
 // Helper: verify requestor is admin, returns { user, adminName } or responds with error
@@ -844,27 +818,31 @@ ledgerAdjustmentsApp.post('/expense-bulk', async (c) => {
       if (attachmentPath) {
         const normalizedName = attachmentPath.replace(/^\//, '').toLowerCase()
         const file = attachmentMap.get(normalizedName)
-        if (file) {
-          const year = date.getFullYear()
-          const month = MONTH_NAMES[date.getMonth()]
-          const day = date.getDate()
-          const ext = file.name.split('.').pop() || 'bin'
-          const categorySlug = category.toLowerCase().replace(/\s+/g, '_')
-          const paidToSlug = paidTo ? paidTo.toLowerCase().replace(/\s+/g, '_') : ''
-          const dayOrdinal = `${day}${getOrdinalSuffix(day)}`
-          const monthLower = month.toLowerCase()
-          let fileName = categorySlug
-          if (paidToSlug) fileName += `_${paidToSlug}`
-          fileName += `_${dayOrdinal}_${monthLower}_${year}.${ext}`
-          const key = `expenses/${year}/${month}/${fileName}`
-
-          const buffer = await file.arrayBuffer()
-          const upload = await uploadToCategory('system_docs', key, Buffer.from(buffer), file.type)
-          attachmentUrl = upload.url
-        } else {
+        if (!file) {
           errors.push(
             `Row ${rowNum}: Attachment file "${attachmentPath}" not found in uploaded files`
           )
+        } else {
+          // A receipt gets the checks and the object name it would get uploaded one at a time
+          // (POST /api/upload/expense): its bytes must be what its name and type say, and the
+          // server names the object. The category and payee are CSV cells, and the old name built
+          // from them let a cell add path segments and made two receipts for one category on one
+          // day replace each other.
+          const validation = await validateUpload(file, uploadProfiles.imageOrPdf)
+          if (validation.ok) {
+            const upload = await uploadToCategory(
+              'system_docs',
+              buildExpenseKey({ category, paidTo, date, filename: file.name }),
+              Buffer.from(validation.buffer),
+              file.type || 'application/octet-stream'
+            )
+            attachmentUrl = upload.url
+          } else {
+            // The expense is still imported, as it is when the named file was not sent.
+            errors.push(
+              `Row ${rowNum}: Attachment "${attachmentPath}" was not saved. ${validation.error}`
+            )
+          }
         }
       }
 

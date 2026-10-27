@@ -1,7 +1,7 @@
 import { Loader2, Upload, X } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { API_BASE_URL } from '@/lib/api-client'
+import { uploadFile } from '@/lib/actions/upload'
 import { cn } from '@/lib/utils'
 import { Button } from '@/shared/components/ui/button'
 import { formatBytes, useFileUpload } from '@/shared/hooks/use-file-upload'
@@ -58,28 +58,22 @@ export function SingleImageUpload({
 
       setUploading(true)
       try {
-        // Upload via the storage routing in admin Integrations UI
-        const formData = new FormData()
-        formData.append('file', file)
-        formData.append('storageCategory', 'system_docs')
-        formData.append('folder', folder)
-        formData.append('name', entityName)
-
-        const response = await fetch(`${API_BASE_URL}/api/upload`, {
-          method: 'POST',
-          credentials: 'include',
-          body: formData,
+        // Through the shared upload action, like every other screen: it goes by the app's API
+        // client, which sends the CSRF token and app id the backend requires on a POST. A bare
+        // fetch() here sent neither, so the backend refused every product and inventory image.
+        const result = await uploadFile(file, {
+          storageCategory: 'system_docs',
+          folder,
+          name: entityName,
+          profile: 'image',
         })
 
-        const result = await response.json()
-
-        if (!result.success) {
+        if (!result.success || !result.url) {
           toast.error(result.error || 'Failed to upload image')
           removeFile(file.id)
           return
         }
 
-        // Update with the DO Spaces URL
         onChange(result.url)
 
         // Clear the hook's files after upload

@@ -44,10 +44,12 @@ import {
   createExternalLabInvoice,
   createInternalLabInvoice,
 } from '../lib/lab-case-billing'
+import { insertLabCase } from '../lib/lab-case-service'
 import { getLabDailySummary } from '../lib/lab-summary'
 import { resolveTurnaroundDays } from '../lib/lab-turnaround'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
+import { isUniqueViolation } from '../lib/pg-errors'
 import { checkPermission, getCurrentUser, isAdmin } from '../lib/rbac'
 import { getDefaultLabTurnaroundDays } from '../lib/settings-store'
 import { sendSMS } from '../lib/sms'
@@ -276,8 +278,7 @@ labsApp.post('/vendors/:vendorId/services', async (c) => {
       .returning()
     return c.json({ success: true, data: row })
   } catch (err: unknown) {
-    const pgErr = err as { code?: string; message?: string }
-    if (pgErr.code === '23505') {
+    if (isUniqueViolation(err)) {
       return c.json({ error: 'This vendor already offers that base service' }, 409)
     }
     throw err
@@ -495,8 +496,7 @@ labsApp.post('/base-services', async (c) => {
       .returning()
     return c.json({ success: true, data: row })
   } catch (err: unknown) {
-    const pgErr = err as { code?: string; message?: string }
-    if (pgErr.code === '23505') return c.json({ error: 'Service name already exists' }, 409)
+    if (isUniqueViolation(err)) return c.json({ error: 'Service name already exists' }, 409)
     throw err
   }
 })
@@ -576,8 +576,7 @@ labsApp.patch('/base-services/:id', async (c) => {
     if (!row) return c.json({ error: 'Not found' }, 404)
     return c.json({ success: true, data: row })
   } catch (err: unknown) {
-    const pgErr = err as { code?: string; message?: string }
-    if (pgErr.code === '23505') return c.json({ error: 'Service name already exists' }, 409)
+    if (isUniqueViolation(err)) return c.json({ error: 'Service name already exists' }, 409)
     throw err
   }
 })
@@ -616,8 +615,7 @@ labsApp.post('/categories', async (c) => {
       .returning()
     return c.json({ success: true, data: row })
   } catch (err: unknown) {
-    const pgErr = err as { code?: string; message?: string }
-    if (pgErr.code === '23505') return c.json({ error: 'Category name already exists' }, 409)
+    if (isUniqueViolation(err)) return c.json({ error: 'Category name already exists' }, 409)
     return c.json({ error: 'Failed to create category' }, 500)
   }
 })
@@ -643,8 +641,7 @@ labsApp.patch('/categories/:id', async (c) => {
     if (!row) return c.json({ error: 'Not found' }, 404)
     return c.json({ success: true, data: row })
   } catch (err: unknown) {
-    const pgErr = err as { code?: string; message?: string }
-    if (pgErr.code === '23505') return c.json({ error: 'Category name already exists' }, 409)
+    if (isUniqueViolation(err)) return c.json({ error: 'Category name already exists' }, 409)
     return c.json({ error: 'Failed to update category' }, 500)
   }
 })
@@ -668,18 +665,6 @@ labsApp.delete('/categories/:id', async (c) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // Cases
 // ═════════════════════════════════════════════════════════════════════════════
-
-async function generateCaseNumber(db: any): Promise<string> {
-  const latest = await db.query.labCases.findFirst({
-    orderBy: desc(labCases.createdAt),
-  })
-  let next = 1
-  if (latest?.caseNumber) {
-    const m = latest.caseNumber.match(/LC-(\d+)/)
-    if (m) next = parseInt(m[1], 10) + 1
-  }
-  return `LC-${next.toString().padStart(6, '0')}`
-}
 
 // §8.2 — lab-case list search/filter + pagination, extracted so it's testable
 // against a real DB (the route parses params, gates auth, runs the lazy fallback).
@@ -935,34 +920,31 @@ labsApp.post('/cases', async (c) => {
       ? new Date(body.expectedReturn)
       : new Date(Date.now() + turnaroundDays * 24 * 60 * 60 * 1000)
 
-    const caseNumber = await generateCaseNumber(db)
-    const [caseRow] = await db
-      .insert(labCases)
-      .values({
-        caseNumber,
-        patientId: domain === 'internal' ? body.patientId : null,
-        vendorId: body.vendorId,
-        serviceId: body.serviceId,
-        serviceName: vendorService.baseService.name,
-        status: body.status ?? 'draft',
-        domain,
-        expressOptionId: expressOption?.id ?? null,
-        units,
-        labCost,
-        patientCharge,
-        referringDoctorId: domain === 'external' ? body.referringDoctorId : null,
-        externalPatientName: domain === 'external' ? body.externalPatientName.trim() : null,
-        sentAt: body.sentAt ? new Date(body.sentAt) : null,
-        expectedReturn,
-        // Mirror labCost into legacy `cost` so older readers / external-expense
-        // auto-creation still see the same value.
-        cost: labCost,
-        assignedDoctorId: body.assignedDoctorId ?? null,
-        assignedTechnicianId: body.assignedTechnicianId ?? null,
-        createdById: user.id,
-        notes: body.notes ?? null,
-      })
-      .returning()
+    // Numbered and inserted together, so two cases opened at the same moment each get their own
+    // number instead of one of them failing on the unique index.
+    const caseRow = await insertLabCase(db, {
+      patientId: domain === 'internal' ? body.patientId : null,
+      vendorId: body.vendorId,
+      serviceId: body.serviceId,
+      serviceName: vendorService.baseService.name,
+      status: body.status ?? 'draft',
+      domain,
+      expressOptionId: expressOption?.id ?? null,
+      units,
+      labCost,
+      patientCharge,
+      referringDoctorId: domain === 'external' ? body.referringDoctorId : null,
+      externalPatientName: domain === 'external' ? body.externalPatientName.trim() : null,
+      sentAt: body.sentAt ? new Date(body.sentAt) : null,
+      expectedReturn,
+      // Mirror labCost into legacy `cost` so older readers / external-expense
+      // auto-creation still see the same value.
+      cost: labCost,
+      assignedDoctorId: body.assignedDoctorId ?? null,
+      assignedTechnicianId: body.assignedTechnicianId ?? null,
+      createdById: user.id,
+      notes: body.notes ?? null,
+    })
 
     // Auto-create the billing invoice for this case.
     //   Internal  → patient-billed   (Phase 2)

@@ -39,9 +39,14 @@ export type StorageCategory = 'patient_records' | 'staff' | 'system_docs' | 'mis
  * `storageCategory` is decided by the admin Integrations UI; callers do not
  * pick a bucket or endpoint here.
  *
+ * The backend accepts only the folders it knows (backend/src/lib/upload-policy.ts): each one is a
+ * kind of file with its own category, permission and validation profile, and the server generates
+ * the object name (`name` is only a hint). A new folder needs a new kind there first, or the call
+ * is refused with 400 UPLOAD_PATH_UNKNOWN; a test fails until the two agree.
+ *
  * Examples:
- *   uploadFile(file, { storageCategory: 'patient_records', folder: 'photos', profile: 'image' })
- *   uploadFile(file, { storageCategory: 'system_docs', folder: 'insurance', profile: 'pdf' })
+ *   uploadFile(file, { storageCategory: 'patient_records', folder: 'patients', subfolder: `${patientId}/photos`, profile: 'image' })
+ *   uploadFile(file, { storageCategory: 'system_docs', folder: 'compliance', profile: 'imageOrPdf' })
  */
 export async function uploadFile(
   file: File,

@@ -27,6 +27,10 @@ export const PATH_MODULE_MAP: ReadonlyArray<{ prefix: string; module: string }> 
   { prefix: '/medical-records', module: 'medical_records' },
   { prefix: '/clinical', module: 'medical_records' },
   { prefix: '/ortho-consent', module: 'ortho_consent' },
+  // Ortho consent has its own API and permission, so its pages in the Consents hub
+  // follow it. The compliance-only decision (2026-09-30) covers consent documents,
+  // consent forms and templates, not this. The longest prefix wins over '/consents'.
+  { prefix: '/consents/ortho', module: 'ortho_consent' },
   { prefix: '/consents', module: 'compliance' },
   { prefix: '/insurance', module: 'insurance' },
   { prefix: '/xrays', module: 'xrays' },

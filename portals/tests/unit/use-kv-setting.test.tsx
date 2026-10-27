@@ -9,7 +9,7 @@
  */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, renderHook, waitFor } from '@testing-library/react'
-import type { ReactNode } from 'react'
+import { type ReactNode, useLayoutEffect } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('@/lib/api-client', () => ({
@@ -128,5 +128,35 @@ describe('useKvSetting', () => {
     })
     await waitFor(() => expect(result.current.loading).toBe(false))
     await expect(result.current.save()).rejects.toThrow('Unauthorized')
+  })
+})
+
+// F43 — the draft was copied from the stored value in an effect, so one committed
+// render had `loading: false` and `canSave: true` while `value` (what Save writes)
+// still held the DEFAULTS. A save in that render would have written the defaults
+// over the stored settings, which is exactly what `canSave` exists to stop. The full
+// portal suite caught that render under load. Recording every committed render
+// makes it deterministic.
+describe('useKvSetting — no render offers the defaults as if they were loaded (F43)', () => {
+  it('never commits loading=false with the defaults still in the draft', async () => {
+    mockApiGet.mockResolvedValue({ success: true, data: { a: 5 } })
+    const renders: Array<{ loading: boolean; canSave: boolean; a: number }> = []
+    const { result } = renderHook(
+      () => {
+        const s = useKvSetting<Policy>('scheduling:policies', DEFAULTS)
+        // A layout effect runs once per COMMITTED render: a render React throws away
+        // (state set during render) is never seen by the user, so it is not recorded.
+        useLayoutEffect(() => {
+          renders.push({ loading: s.loading, canSave: s.canSave, a: s.value.a })
+        })
+        return s
+      },
+      { wrapper }
+    )
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    await waitFor(() => expect(result.current.value.a).toBe(5))
+
+    const offeredDefaults = renders.filter((r) => !r.loading && r.canSave && r.a !== 5)
+    expect(offeredDefaults, JSON.stringify(renders)).toEqual([])
   })
 })

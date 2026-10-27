@@ -23,14 +23,19 @@ import { flattenSignedPdf, sha256Hex } from '../lib/document-signing'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
 import { readStoredFile } from '../lib/private-files'
+import { portalLink } from '../lib/public-urls'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import { type FileCategory, uploadToCategory } from '../lib/storage-router'
 import { issueSigningToken } from '../lib/tokens'
 import type { HonoEnv } from '../lib/types'
+import { uploadProfiles, validateUpload } from '../lib/upload-validation'
 
 export const documentsApp = new Hono<HonoEnv>()
 
 const MODULE = MODULES.COMPLIANCE
+
+/** What Postgres accepts for a uuid column (not only the RFC 4122 versions). */
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 function categoryFor(subjectType: string): FileCategory {
   if (subjectType === 'patient') return 'patient_records'
@@ -217,7 +222,6 @@ documentsApp.post('/instances', async (c) => {
     // 2. Insert document_signers and generate magic links
     const signersInput = body.signers || []
     const responseSigners = []
-    const portalUrl = process.env.PORTAL_URL || 'http://localhost:5173'
 
     for (let i = 0; i < signersInput.length; i++) {
       const s = signersInput[i]
@@ -238,7 +242,7 @@ documentsApp.post('/instances', async (c) => {
 
       // Generate JWT and Magic Link
       const token = await issueSigningToken(signerId)
-      const magicLink = `${portalUrl}/sign/${token}`
+      const magicLink = portalLink(`/sign/${token}`)
 
       responseSigners.push({
         id: signerRow.id,
@@ -405,16 +409,26 @@ documentsApp.post('/instances/upload', async (c) => {
     const templateId = (form.get('templateId') as string | null) || null
     if (!file || !subjectType || !subjectId || !title)
       return c.json({ error: 'file, subjectType, subjectId and title are required' }, 400)
+    // The column is a uuid. Checked before anything is stored: the file used to be uploaded first and
+    // the row insert then failed with a 500, leaving the object behind with nothing pointing at it.
+    if (!UUID_SHAPE.test(subjectId)) return c.json({ error: 'subjectId must be a valid id' }, 400)
 
-    const bytes = new Uint8Array(await file.arrayBuffer())
+    // A signed scan is a PDF or a photo of one. The bytes are checked against what the file says it
+    // is (this endpoint used to store anything, under whatever content type the client declared:
+    // a web page or an SVG with a script would have been served back to whoever opened the link),
+    // and the object is named for what it is, not `.bin`.
+    const validation = await validateUpload(file, uploadProfiles.imageOrPdf)
+    if (!validation.ok) return c.json({ error: validation.error }, 400)
+
+    const bytes = new Uint8Array(validation.buffer)
     const hash = sha256Hex(bytes)
     const id = randomUUID()
-    const ext = file.type === 'application/pdf' ? 'pdf' : 'bin'
+    const ext = (file.name.split('.').pop() ?? '').toLowerCase()
     const { url } = await uploadToCategory(
       categoryFor(subjectType),
       `documents/${id}.${ext}`,
       Buffer.from(bytes),
-      file.type || 'application/pdf'
+      validation.contentType ?? 'application/octet-stream'
     )
 
     const now = new Date()

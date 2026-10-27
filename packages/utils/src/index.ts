@@ -23,7 +23,7 @@ export {
   inputToCents,
   parseCurrency,
 } from './currency'
-export { formatDate, formatDateTime } from './date'
+export { CLINIC_TIME_ZONE, formatDate, formatDateTime, zonedStartOfDay } from './date'
 export { Money, type MoneyLike, type RoundingMode } from './money'
 export {
   cedisToPesewas,

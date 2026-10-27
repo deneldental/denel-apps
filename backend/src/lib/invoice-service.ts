@@ -481,6 +481,13 @@ export async function voidInvoice(
 export function computeLine(input: {
   quantity: number | string
   unitPrice: number | string
+  /**
+   * First-unit / additional-unit tariff: the price of each unit after the first. When given, the
+   * subtotal is `unitPrice + additionalUnitPrice × (quantity − 1)`; one unit costs `unitPrice`
+   * alone. Omit (or null) for the flat `unitPrice × quantity`. Only the catalog-priced paths (estimate,
+   * walk-in) pass it; a manual line add never does.
+   */
+  additionalUnitPrice?: number | string | null
   surchargeType?: 'none' | 'percent' | 'amount'
   surchargeValue?: number | string
   discountType?: 'none' | 'percent' | 'amount'
@@ -508,7 +515,12 @@ export function computeLine(input: {
   // against the (possibly surcharged) gross — so "10% off" after a surcharge
   // reduces the surcharged total, not just the base price. Unlike discount,
   // surcharge has no self-cap: it's additive, not a percentage of itself.
-  const lineSubtotal = unitPrice.mul(quantity)
+  const additionalUnitPrice =
+    input.additionalUnitPrice == null ? null : Money.from(input.additionalUnitPrice)
+  const lineSubtotal =
+    additionalUnitPrice && quantity > 1
+      ? unitPrice.add(additionalUnitPrice.mul(quantity - 1))
+      : unitPrice.mul(quantity)
   let surchargeAmount = Money.zero()
   if (surchargeType === 'percent') surchargeAmount = lineSubtotal.percent(surchargeValue)
   else if (surchargeType === 'amount') surchargeAmount = Money.from(surchargeValue)

@@ -3,7 +3,9 @@ import { Hono } from 'hono'
 import { getDb } from '../db'
 import { inventoryLocations } from '../db/schema'
 import { ACTIONS, MODULES } from '../lib/modules'
+import { isUniqueViolation } from '../lib/pg-errors'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
+import { denyUnless } from '../lib/route-access'
 import type { HonoEnv } from '../lib/types'
 
 const inventoryLocationsApp = new Hono<HonoEnv>()
@@ -11,6 +13,15 @@ const inventoryLocationsApp = new Hono<HonoEnv>()
 inventoryLocationsApp.get('/', async (c) => {
   const currentUser = await getCurrentUser(c)
   if (!currentUser) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, currentUser.id, {
+    apps: ['portal'],
+    anyOf: [
+      [MODULES.INVENTORY, ACTIONS.READ],
+      [MODULES.ITEMS, ACTIONS.READ],
+      [MODULES.SETTINGS, ACTIONS.READ],
+    ],
+  })
+  if (denied) return denied
 
   const db = getDb(process.env.DATABASE_URL!)
   try {
@@ -49,8 +60,7 @@ inventoryLocationsApp.post('/', async (c) => {
       .returning()
     return c.json({ success: true, data: location }, 201)
   } catch (err: unknown) {
-    const pgErr = err as { code?: string; message?: string }
-    if (pgErr.code === '23505')
+    if (isUniqueViolation(err))
       return c.json({ error: 'A location with that code already exists' }, 409)
     return c.json({ error: 'Failed to create inventory location' }, 500)
   }

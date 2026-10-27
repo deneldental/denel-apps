@@ -56,11 +56,13 @@ type ClinicalCase = {
 // ─── Component ────────────────────────────────────────────────────────────────
 
 interface Props {
+  /** May open a case (`medical_records:create`). */
   canEdit?: boolean
-  isAdmin?: boolean
+  /** May archive a case (`patients:delete`). */
+  canArchive?: boolean
 }
 
-export function ClinicalCasesTab({ canEdit = true, isAdmin = false }: Props) {
+export function ClinicalCasesTab({ canEdit = true, canArchive = false }: Props) {
   const navigate = useNavigate()
   const [cases, setCases] = useState<ClinicalCase[]>([])
   const [loading, setLoading] = useState(true)
@@ -255,7 +257,7 @@ export function ClinicalCasesTab({ canEdit = true, isAdmin = false }: Props) {
                     </span>
                   </TableCell>
                   <TableCell onClick={(e) => e.stopPropagation()}>
-                    {isAdmin ? (
+                    {canArchive ? (
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
                           <Button

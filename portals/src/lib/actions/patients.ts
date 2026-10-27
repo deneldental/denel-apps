@@ -7,6 +7,8 @@ export type PatientListParams = {
   q?: string
   /** admin-v1 §2.7 — filter by tag ids (sent as repeated `tagIds[]=`). */
   tagIds?: string[]
+  /** C5 — true shows only archived patients; omitted/false shows active ones. */
+  archived?: boolean
 }
 
 /** admin-v1 §2.7 — per-tag counts surfaced by the filter chips. */
@@ -39,6 +41,7 @@ export async function getPatientsPage<T = any>(
   if (params.q) search.set('q', params.q)
   // §2.7 — repeated `tagIds[]=<id>` (backend filters the list by tag).
   for (const id of params.tagIds ?? []) search.append('tagIds[]', id)
+  if (params.archived) search.set('archived', 'true')
   const qs = search.toString()
   const res = await api.get<T[]>(`/api/patients${qs ? `?${qs}` : ''}`)
   const raw = res as any
@@ -72,7 +75,21 @@ export async function updatePatient(
   return res
 }
 
-export async function deletePatient(id: string) {
-  const res = await api.delete<any>(`/api/patients/${id}`)
+// C5 — patients are archived (soft-delete), not hard-deleted. Permanent
+// delete is a separate, password-gated action for the Archived view.
+export async function archivePatient(id: string) {
+  const res = await api.post<typeof patients.$inferSelect>(`/api/patients/${id}/archive`, {})
+  return res
+}
+
+export async function unarchivePatient(id: string) {
+  const res = await api.post<typeof patients.$inferSelect>(`/api/patients/${id}/unarchive`, {})
+  return res
+}
+
+export async function permanentlyDeletePatient(id: string, password: string) {
+  const res = await api.delete<{ success: boolean }>(`/api/patients/${id}/permanent`, {
+    body: { password },
+  })
   return res
 }

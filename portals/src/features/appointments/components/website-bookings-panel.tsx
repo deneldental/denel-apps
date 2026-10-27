@@ -44,6 +44,7 @@ import {
 import { Skeleton } from '@/shared/components/ui/skeleton'
 import { Textarea } from '@/shared/components/ui/textarea'
 import { useLookup } from '@/shared/hooks/use-lookup'
+import { useSubmitGuard } from '@/shared/hooks/use-submit-guard'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -140,7 +141,10 @@ export function WebsiteBookingsPanel({
   const [convertDate, setConvertDate] = useState('')
   const [convertTime, setConvertTime] = useState('')
   const [convertNotes, setConvertNotes] = useState('')
-  const [converting, setConverting] = useState(false)
+  // [Medium] Used to be a plain useState boolean — useSubmitGuard's own doc
+  // comment explicitly calls that insufficient: a `disabled` button alone
+  // doesn't stop a re-entrant call before React has flushed the state update.
+  const { isSubmitting: converting, submit: submitConvert } = useSubmitGuard()
   // Existing patient a patient-app request belongs to (looked up by patientId).
   const [linkedPatient, setLinkedPatient] = useState<{
     id: string
@@ -293,35 +297,35 @@ export function WebsiteBookingsPanel({
       toast.error('Pick a date')
       return
     }
-    setConverting(true)
-    const res = await api.post(
-      `/api/website-bookings/${convertBooking.id}/convert-to-appointment`,
-      {
-        // Linked → reuse the existing patient (no duplicate). Else create an
-        // ad-hoc patient from name/phone (website bookings).
-        ...(linkedPatient
-          ? { patientId: linkedPatient.id }
-          : { patient: { name: adhocName.trim(), phone: adhocPhone.trim() } }),
-        doctorId: selectedDoctorId,
-        type: convertType,
-        date: convertDate,
-        time: convertTime || undefined,
-        notes: convertNotes.trim() || undefined,
+    await submitConvert(async () => {
+      const res = await api.post(
+        `/api/website-bookings/${convertBooking.id}/convert-to-appointment`,
+        {
+          // Linked → reuse the existing patient (no duplicate). Else create an
+          // ad-hoc patient from name/phone (website bookings).
+          ...(linkedPatient
+            ? { patientId: linkedPatient.id }
+            : { patient: { name: adhocName.trim(), phone: adhocPhone.trim() } }),
+          doctorId: selectedDoctorId,
+          type: convertType,
+          date: convertDate,
+          time: convertTime || undefined,
+          notes: convertNotes.trim() || undefined,
+        }
+      )
+      if (res.success) {
+        toast.success(linkedPatient ? 'Appointment created' : 'Patient + appointment created')
+        setConvertBooking(null)
+        setLinkedPatient(null)
+        load()
+        // The new appointment row needs to surface on the calendar grid
+        // immediately — without this the receptionist sees nothing change
+        // until a manual page refresh.
+        onAppointmentChange?.()
+      } else {
+        toast.error(res.error || 'Failed to create appointment')
       }
-    )
-    setConverting(false)
-    if (res.success) {
-      toast.success(linkedPatient ? 'Appointment created' : 'Patient + appointment created')
-      setConvertBooking(null)
-      setLinkedPatient(null)
-      load()
-      // The new appointment row needs to surface on the calendar grid
-      // immediately — without this the receptionist sees nothing change
-      // until a manual page refresh.
-      onAppointmentChange?.()
-    } else {
-      toast.error(res.error || 'Failed to create appointment')
-    }
+    })
   }
 
   // The Website tab is a worklist of fresh inbound requests, so we only

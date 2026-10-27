@@ -20,8 +20,9 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
+import { actionsFor, isYesterday } from '@/features/appointments/appointment-actions'
 import { SendReminderDialog } from '@/features/appointments/components/appointment-action-dialogs'
-import { AcceptPaymentSheet } from '@/features/payments/components/accept-payment-sheet'
+import { CheckInFlow } from '@/features/appointments/components/check-in-flow'
 import { updateAppointment } from '@/lib/actions/appointments'
 import { getDoctorUnavailability } from '@/lib/actions/doctor-availability'
 import { getDoctors } from '@/lib/actions/doctors'
@@ -117,7 +118,7 @@ export function AppointmentDetailDialog({
   const { rows: appointmentTypesList } = useLookup('appointment-types', {
     enabled: isEditMode && open,
   })
-  const [showCheckInPaymentDialog, setShowCheckInPaymentDialog] = useState(false)
+  const [checkInOpen, setCheckInOpen] = useState(false)
   /** Reason captured when an admin edits a past appointment. */
   const [overrideReason, setOverrideReason] = useState('')
   /** Google Calendar mirror status for this appointment. */
@@ -280,6 +281,10 @@ export function AppointmentDetailDialog({
   // (Edit/Delete buttons in the header + the entire mutation footer disappear).
   const lockedForRole = readOnly || (isPast && !isAdmin)
   const adminCanOverridePast = isPast && isAdmin && !readOnly
+  // Decision D6: a non-admin may still close out YESTERDAY's visit (no-show, or
+  // completed if the patient was here) and nothing else; older is read-only.
+  const closeOutOnly = isPast && !isAdmin && !readOnly && isYesterday(appointmentDate)
+  const actions = actionsFor(appointment.status, { closeOutOnly })
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -438,9 +443,12 @@ export function AppointmentDetailDialog({
 
     setIsLoading(true)
     try {
-      const result = await updateAppointment(appointment.id, {
-        status: 'cancelled',
-      })
+      const result = await updateAppointment(
+        appointment.id,
+        { status: 'cancelled' },
+        false,
+        adminCanOverridePast ? overrideReason.trim() : undefined
+      )
 
       if (result.success) {
         toast.success('Appointment cancelled successfully.')
@@ -455,52 +463,50 @@ export function AppointmentDetailDialog({
     }
   }
 
-  const handleCheckIn = () => {
-    if (!appointment) return
-
-    if (appointment.status !== 'scheduled') {
-      toast.error('Only scheduled appointments can be checked in.')
-      return
-    }
-
-    // Open the check-in payment dialog
-    setShowCheckInPaymentDialog(true)
-  }
-
-  const handleCheckInSuccess = () => {
-    // Close both dialogs
-    setShowCheckInPaymentDialog(false)
-    onOpenChange(false)
-    // Trigger refresh
-    onUpdate?.()
-  }
+  // Check in runs through the shared flow (check-in-flow.tsx): the payment sheet
+  // is told this visit, a one-time payment is taken BY the check-in request, and a
+  // failure after a plan or insurance payment is shown with a retry that cannot
+  // charge again. Which statuses may check in is decided by actionsFor().
+  const handleCheckIn = () => setCheckInOpen(true)
 
   // ── Workflow transitions (Phase 1.5) ────────────────────────────────────────
   async function runTransition(
     action: 'seat' | 'complete' | 'no-show' | 'cancel',
     label: string,
     notes?: string
-  ) {
-    if (!appointment) return
+  ): Promise<boolean> {
+    if (!appointment) return false
+    const payload: { action: string; notes?: string; overrideReason?: string } = { action }
+    if (notes?.trim()) payload.notes = notes.trim()
+    // An admin changing a visit from a previous day must say why; the server
+    // refuses it otherwise and keeps the reason in the audit trail.
+    if (adminCanOverridePast) {
+      if (overrideReason.trim().length < 3) {
+        toast.error('Enter a reason for changing a past appointment first (3+ characters).')
+        return false
+      }
+      payload.overrideReason = overrideReason.trim()
+    }
     setIsLoading(true)
     try {
-      const payload: { action: string; notes?: string } = { action }
-      if (notes?.trim()) payload.notes = notes.trim()
       const res = await api.patch(`/api/appointment-workflow/${appointment.id}/transition`, payload)
       if (res.success) {
         toast.success(label)
         onUpdate?.()
         onOpenChange(false)
-      } else {
-        toast.error((res.error as string) || 'Failed')
+        return true
       }
+      toast.error((res.error as string) || 'Failed')
+      return false
     } finally {
       setIsLoading(false)
     }
   }
 
   async function confirmNoShow() {
-    await runTransition('no-show', 'Marked as no-show', noShowNote)
+    // Keep the dialog (and the note) open when it did not go through.
+    const ok = await runTransition('no-show', 'Marked as no-show', noShowNote)
+    if (!ok) return
     setShowNoShowDialog(false)
     setNoShowNote('')
   }
@@ -538,7 +544,12 @@ export function AppointmentDetailDialog({
 
           {isPast && (
             <div className="rounded-md border border-amber-200 bg-amber-50 dark:bg-amber-950/30 dark:border-amber-900 p-3 text-xs text-amber-900 dark:text-amber-200">
-              {lockedForRole ? (
+              {closeOutOnly ? (
+                <>
+                  <strong>This was yesterday&apos;s appointment.</strong> You can still close it
+                  out; any other change is the admin&apos;s.
+                </>
+              ) : lockedForRole ? (
                 <>This appointment has passed. Details are read-only.</>
               ) : (
                 <>
@@ -569,13 +580,14 @@ export function AppointmentDetailDialog({
             </div>
           )}
 
-          {isEditMode && adminCanOverridePast && (
+          {adminCanOverridePast && (
             <div className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/30 dark:border-amber-900 p-3 space-y-2">
               <Label
                 htmlFor="override-reason"
                 className="text-xs font-medium text-amber-900 dark:text-amber-200"
               >
-                Reason for editing this past appointment <span className="text-destructive">*</span>
+                Reason for changing this past appointment{' '}
+                <span className="text-destructive">*</span>
               </Label>
               <Textarea
                 id="override-reason"
@@ -597,41 +609,43 @@ export function AppointmentDetailDialog({
                   Status-aware: only renders the actions that apply to the
                   current appointment.status. Less-common actions collapse
                   into the "more" menu so the row stays scannable. */}
-              {!lockedForRole && (
+              {(!lockedForRole || closeOutOnly) && (
                 <TooltipProvider delayDuration={120}>
                   <div className="flex items-center justify-end gap-0.5 -mt-1">
-                    <IconAction
-                      icon={<Pencil className="h-4 w-4" />}
-                      label="Edit"
-                      onClick={() => setIsEditMode(true)}
-                      disabled={isLoading}
-                    />
-                    {(appointment.status === 'scheduled' ||
-                      appointment.status === 'confirmed' ||
-                      appointment.status === 'rescheduled') && (
-                      <>
-                        <IconAction
-                          icon={<CheckCircle2 className="h-4 w-4" />}
-                          label="Check in"
-                          tone="success"
-                          onClick={handleCheckIn}
-                          disabled={isLoading}
-                        />
-                        <IconAction
-                          icon={<Send className="h-4 w-4" />}
-                          label="Send reminder"
-                          onClick={() => setShowSendReminderConfirm(true)}
-                          disabled={isLoading}
-                        />
-                        <IconAction
-                          icon={<CalendarClock className="h-4 w-4" />}
-                          label="Reschedule"
-                          onClick={handleReschedule}
-                          disabled={isLoading}
-                        />
-                      </>
+                    {!closeOutOnly && (
+                      <IconAction
+                        icon={<Pencil className="h-4 w-4" />}
+                        label="Edit"
+                        onClick={() => setIsEditMode(true)}
+                        disabled={isLoading}
+                      />
                     )}
-                    {appointment.status === 'checked_in' && (
+                    {actions.checkIn && !isPast && (
+                      <IconAction
+                        icon={<CheckCircle2 className="h-4 w-4" />}
+                        label="Check in"
+                        tone="success"
+                        onClick={handleCheckIn}
+                        disabled={isLoading}
+                      />
+                    )}
+                    {actions.sendReminder && (
+                      <IconAction
+                        icon={<Send className="h-4 w-4" />}
+                        label="Send reminder"
+                        onClick={() => setShowSendReminderConfirm(true)}
+                        disabled={isLoading}
+                      />
+                    )}
+                    {actions.reschedule && (
+                      <IconAction
+                        icon={<CalendarClock className="h-4 w-4" />}
+                        label="Reschedule"
+                        onClick={handleReschedule}
+                        disabled={isLoading}
+                      />
+                    )}
+                    {actions.seat && (
                       <IconAction
                         icon={<Armchair className="h-4 w-4" />}
                         label="Seat patient"
@@ -640,7 +654,7 @@ export function AppointmentDetailDialog({
                         disabled={isLoading}
                       />
                     )}
-                    {appointment.status === 'in_chair' && (
+                    {actions.complete && (
                       <IconAction
                         icon={<CheckCircle2 className="h-4 w-4" />}
                         label="Mark completed"
@@ -653,9 +667,7 @@ export function AppointmentDetailDialog({
                         direct icons — no nested menu, since the receptionist
                         triggers no-show / cancel often enough that hiding
                         them behind a kebab adds a click without value. */}
-                    {(appointment.status === 'scheduled' ||
-                      appointment.status === 'confirmed' ||
-                      appointment.status === 'rescheduled') && (
+                    {actions.noShow && (
                       <IconAction
                         icon={<Flag className="h-4 w-4" />}
                         label="Mark no-show"
@@ -664,10 +676,7 @@ export function AppointmentDetailDialog({
                         disabled={isLoading}
                       />
                     )}
-                    {(appointment.status === 'scheduled' ||
-                      appointment.status === 'confirmed' ||
-                      appointment.status === 'rescheduled' ||
-                      appointment.status === 'checked_in') && (
+                    {actions.cancel && (
                       <IconAction
                         icon={<X className="h-4 w-4" />}
                         label="Cancel appointment"
@@ -1011,13 +1020,17 @@ export function AppointmentDetailDialog({
         )}
       </DialogContent>
 
-      {/* Check-In Payment Dialog — reuses AcceptPaymentSheet so the staff
-          can pick one-time / plan / insurance for the patient on the spot. */}
-      <AcceptPaymentSheet
-        open={showCheckInPaymentDialog}
-        onOpenChange={setShowCheckInPaymentDialog}
-        presetPatientId={appointment.patientId}
-        onSuccess={handleCheckInSuccess}
+      {/* Check in — payment (one-time / plan / insurance) or no payment, then the
+          check-in itself. See check-in-flow.tsx. */}
+      <CheckInFlow
+        appointment={checkInOpen ? appointment : null}
+        onFinished={(outcome) => {
+          setCheckInOpen(false)
+          if (outcome !== 'cancelled') {
+            onUpdate?.()
+            onOpenChange(false)
+          }
+        }}
       />
 
       {/* Send Reminder — shared SMS-template-preview dialog used by both the

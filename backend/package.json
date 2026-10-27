@@ -27,7 +27,8 @@
     "money:snapshot": "tsx src/scripts/money-cutover-check.ts snapshot",
     "money:verify": "tsx src/scripts/money-cutover-check.ts verify",
     "payment-methods:audit": "tsx src/scripts/payment-method-audit.ts",
-    "audit:purge-secrets": "tsx src/scripts/purge-audit-secrets.ts"
+    "audit:purge-secrets": "tsx src/scripts/purge-audit-secrets.ts",
+    "sms:purge-secrets": "tsx src/scripts/purge-sms-secrets.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.893.0",

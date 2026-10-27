@@ -1,14 +1,21 @@
 name: Deploy
 
+# Production is deployed MANUALLY: Actions → Deploy → Run workflow, on `main`.
+# A push to `main` only runs the quality gates; it never reaches production.
+# Staging still deploys automatically on every push to `staging`.
+# A manual run has no diff to read, so it rebuilds and redeploys every app.
 on:
   push:
     branches: [main, staging]
   pull_request:
     branches: [main, staging, dev]
+  workflow_dispatch:
 
+# A manual (production) run gets its own group and is never cancelled: a push to
+# `main` mid-deploy would otherwise cancel it halfway through the SSH step.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || 'auto' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   # ── Detect Changes ────────────────────────────────────────────────────────
@@ -25,12 +32,14 @@ jobs:
       patient: ${{ steps.filter.outputs.patient }}
       reports: ${{ steps.filter.outputs.reports }}
       hr: ${{ steps.filter.outputs.hr }}
-      website: ${{ steps.filter.outputs.website }}
-      backend: ${{ steps.filter.outputs.backend }}
+      website: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.website }}
+      backend: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.backend }}
     steps:
       - uses: actions/checkout@v4
+      # Not run for a manual deploy: there is no diff to read, and every app is built.
       - uses: dorny/paths-filter@v3
         id: filter
+        if: github.event_name != 'workflow_dispatch'
         with:
           filters: |
             portal:
@@ -76,13 +85,16 @@ jobs:
               - 'pnpm-workspace.yaml'
               - 'pnpm-lock.yaml'
       - id: set-matrix
+        env:
+          # No diff on a manual run → build every app.
+          ALL: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           apps=()
-          [[ "${{ steps.filter.outputs.portal }}" == 'true' ]] && apps+=('{"app":"portal","dist":"portals/dist","cf_project":"portal","build_cmd":"pnpm turbo run build --filter=portal"}')
-          [[ "${{ steps.filter.outputs.team }}" == 'true' ]] && apps+=('{"app":"team","dist":"team/dist","cf_project":"team","build_cmd":"pnpm turbo run build --filter=team"}')
-          [[ "${{ steps.filter.outputs.patient }}" == 'true' ]] && apps+=('{"app":"patient","dist":"patient/dist","cf_project":"patient","build_cmd":"pnpm turbo run build --filter=patient"}')
-          [[ "${{ steps.filter.outputs.reports }}" == 'true' ]] && apps+=('{"app":"reports","dist":"reports/dist","cf_project":"reports","build_cmd":"pnpm turbo run build --filter=reports"}')
-          [[ "${{ steps.filter.outputs.hr }}" == 'true' ]] && apps+=('{"app":"hr","dist":"hr/dist","cf_project":"hr","build_cmd":"pnpm turbo run build --filter=hr"}')
+          [[ "$ALL" == 'true' || "${{ steps.filter.outputs.portal }}" == 'true' ]] && apps+=('{"app":"portal","dist":"portals/dist","cf_project":"portal","build_cmd":"pnpm turbo run build --filter=portal"}')
+          [[ "$ALL" == 'true' || "${{ steps.filter.outputs.team }}" == 'true' ]] && apps+=('{"app":"team","dist":"team/dist","cf_project":"team","build_cmd":"pnpm turbo run build --filter=team"}')
+          [[ "$ALL" == 'true' || "${{ steps.filter.outputs.patient }}" == 'true' ]] && apps+=('{"app":"patient","dist":"patient/dist","cf_project":"patient","build_cmd":"pnpm turbo run build --filter=patient"}')
+          [[ "$ALL" == 'true' || "${{ steps.filter.outputs.reports }}" == 'true' ]] && apps+=('{"app":"reports","dist":"reports/dist","cf_project":"reports","build_cmd":"pnpm turbo run build --filter=reports"}')
+          [[ "$ALL" == 'true' || "${{ steps.filter.outputs.hr }}" == 'true' ]] && apps+=('{"app":"hr","dist":"hr/dist","cf_project":"hr","build_cmd":"pnpm turbo run build --filter=hr"}')
           
           if [ ${#apps[@]} -eq 0 ]; then
             echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
@@ -100,7 +112,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
       - uses: pnpm/action-setup@v4
 
@@ -121,15 +133,29 @@ jobs:
 
       # ── API contract guard (D8) ──────────────────────────────────────────────
       # Statically diffs every backend route against every frontend call site
-      # (hr/, portals/, team/) and exits non-zero on an unmatched path or a verb
+      # (portals/, hr/, team/, patient/, reports/) and exits non-zero on an unmatched path or a verb
       # mismatch. This is the class of bug that TypeScript cannot see: the path
       # is a string, the client is generic, and the failure is a runtime 404.
       #
       # Purely static — no secrets, no network, no database — so it runs on
       # EVERY invocation of this job, pull requests included. HARD GATE: never
       # add continue-on-error here; a guard that cannot fail is not a guard.
+      # The audit is STRICT: a `${…}` hole in a call matches a route parameter, never
+      # a literal route, and the patient and reports apps are scanned too (F14).
+      # Findings that are known and deliberate are listed, with a reason, in
+      # scripts/api-contract-allowlist.json; the portal, patient and team apps have
+      # none. The self-test proves the audit itself still catches what it must
+      # (same rule: a hard gate, no continue-on-error).
+      - name: API contract audit — self-test
+        run: node --test scripts/api-contract-audit.test.mjs
+
       - name: API contract audit (backend ↔ frontend)
         run: node scripts/api-contract-audit.mjs
+
+      # Production deploys by hand only (a push to main stops after these gates). The conditions
+      # that make that true are pinned by a test, because a wrong one shows up on the day it ships.
+      - name: Deploy workflow — self-test
+        run: node --test scripts/deploy-workflow.test.mjs
 
       - name: Typecheck — backend
         run: pnpm --filter backend typecheck
@@ -303,7 +329,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
       - uses: pnpm/action-setup@v4
 
@@ -366,7 +392,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
       - uses: pnpm/action-setup@v4
 
@@ -404,11 +430,14 @@ jobs:
 
   # ── Backend production → Hetzner ───────────────────────────────────────────
   # Builds the Docker image, pushes to GHCR, and triggers a pull + restart on
-  # the Hetzner VPS via SSH.
+  # the Hetzner VPS via SSH. MANUAL ONLY: Actions → Deploy → Run workflow, on
+  # `main`. A push to `main` runs the quality gates and stops there. The gates,
+  # the schema-drift check and the lint ratchet all run first on a manual run
+  # too (`needs`), so a manual deploy is never less checked than a push.
   deploy-backend-production:
     name: Backend · Hetzner (production)
     needs: [check, schema-drift, changes]
-    if: github.event_name == 'push' && github.ref_name == 'main'
+    if: github.event_name == 'workflow_dispatch' && github.ref_name == 'main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -508,9 +537,13 @@ jobs:
             # HARD GATE - never restart the container with a broken env. This
             # runs BEFORE .env is replaced, so a failure here leaves the running
             # production container exactly as it was.
-            # PRIVATE_FILE_REF_SECRET: the backend refuses to start without it
-            # (config/env.ts), so checking it here keeps the old container up.
-            for required in DATABASE_URL BETTER_AUTH_SECRET BETTER_AUTH_URL ALLOWED_ORIGINS PRIVATE_FILE_REF_SECRET; do
+            # PRIVATE_FILE_REF_SECRET, PORTAL_URL and PATIENT_PORTAL_URL: the backend
+            # refuses to start without them (config/env.ts), so checking them here
+            # keeps the old container up. The two URLs are the addresses put into
+            # appointment-confirmation SMS, X-ray share links, document-signing
+            # links and the patient-app invitation (F13); they live only on the VPS
+            # (Doppler prd does not hold them), so this is where a missing one shows.
+            for required in DATABASE_URL BETTER_AUTH_SECRET BETTER_AUTH_URL ALLOWED_ORIGINS PRIVATE_FILE_REF_SECRET PORTAL_URL PATIENT_PORTAL_URL; do
               val=$(grep -E "^${required}=" merged.env | tail -n1 | cut -d= -f2-)
               if [ -z "$val" ]; then
                 echo "ERROR: ${required} is empty or missing after merge - aborting, running container untouched"
@@ -570,12 +603,12 @@ jobs:
   # ── Portal / PWA / Reports → Cloudflare Pages ──────────────────────────────
   # Build happens here in CI with Doppler-injected env vars baked into the
   # bundle, then wrangler uploads the prebuilt dist to CF Pages.
-  #   - main push    → production deployment (Doppler prd values)
-  #   - staging push → preview deployment on staging branch (Doppler stg values)
+  #   - manual run on main → production deployment (Doppler prd values), every app
+  #   - staging push       → preview deployment on staging branch (Doppler stg values)
   deploy-frontends:
     name: Cloudflare Pages · ${{ matrix.app }}
     needs: [check, changes]
-    if: github.event_name == 'push' && needs.changes.outputs.frontend_matrix != '{"include":[]}'
+    if: ((github.event_name == 'push' && github.ref_name == 'staging') || (github.event_name == 'workflow_dispatch' && github.ref_name == 'main')) && needs.changes.outputs.frontend_matrix != '{"include":[]}'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -587,7 +620,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
       - uses: pnpm/action-setup@v4
       - name: Install Doppler CLI
         uses: dopplerhq/cli-action@v3
@@ -620,12 +653,12 @@ jobs:
   # @opennextjs/cloudflare produces a Workers+Assets bundle (worker.js + assets/).
   # Workers+Assets is deployed via `wrangler deploy` (not `pages deploy`) so that
   # wrangler.toml is read for compatibility_flags (nodejs_compat for googleapis).
-  #   - main push    → production worker "website"    (Doppler prd values)
-  #   - staging push → staging worker "website-staging" via [env.staging] (Doppler stg values)
+  #   - manual run on main → production worker "website"    (Doppler prd values)
+  #   - staging push       → staging worker "website-staging" via [env.staging] (Doppler stg values)
   deploy-website:
     name: Website · Cloudflare Workers
     needs: [check, changes]
-    if: github.event_name == 'push' && needs.changes.outputs.website == 'true'
+    if: ((github.event_name == 'push' && github.ref_name == 'staging') || (github.event_name == 'workflow_dispatch' && github.ref_name == 'main')) && needs.changes.outputs.website == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -680,7 +713,7 @@ jobs:
       - uses: actions/setup-node@v4
         if: env.PORTAL_URL != ''
         with:
-          node-version: 20
+          node-version: 24
 
       - uses: pnpm/action-setup@v4
         if: env.PORTAL_URL != ''
@@ -781,7 +814,7 @@ jobs:
       - uses: actions/setup-node@v4
         if: env.PWA_URL != ''
         with:
-          node-version: 20
+          node-version: 24
       - uses: pnpm/action-setup@v4
         if: env.PWA_URL != ''
       - name: Install dependencies
@@ -853,7 +886,7 @@ jobs:
       - uses: actions/setup-node@v4
         if: env.REPORTS_URL != ''
         with:
-          node-version: 20
+          node-version: 24
       - uses: pnpm/action-setup@v4
         if: env.REPORTS_URL != ''
       - name: Install dependencies

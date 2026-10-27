@@ -148,6 +148,7 @@ export const queryKeys = {
   database: {
     all: ['database-management'] as const,
     manageableTables: () => ['database-management', 'tables'] as const,
+    importableTables: () => ['database-management', 'importable-tables'] as const,
   },
 
   // ── Audit Logs ────────────────────────────────────────────────────────────────
@@ -347,6 +348,10 @@ export const queryKeys = {
   specialists: {
     all: ['specialists'] as const,
     list: () => ['specialists', 'list'] as const,
+    // Its own key: other screens (invoice composer, kiosk, service doctors) share
+    // `list()` and expect ACTIVE specialists only. Prefix invalidation of
+    // `list()` still refreshes this one.
+    listWithInactive: () => ['specialists', 'list', 'with-inactive'] as const,
     detail: (id: string) => ['specialists', id] as const,
   },
 

@@ -14,11 +14,14 @@ import {
 import { type ComponentType, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
+import { ImportReport } from '@/features/settings/components/import-report'
 import {
   downloadCsv,
   exportTableData,
+  getImportableTables,
   getManageableTables,
   getTableTemplate,
+  type ImportResult,
   importTableData,
   rowsToCsv,
 } from '@/lib/actions/database'
@@ -265,7 +268,11 @@ function DataTab() {
     getManageableTables()
   )
   const tables = tablesQuery.data ?? []
-  const loadingTables = tablesQuery.isLoading
+  const importableQuery = useApiQuery<string[]>(queryKeys.database.importableTables(), () =>
+    getImportableTables()
+  )
+  const importable = importableQuery.data ?? []
+  const loadingTables = tablesQuery.isLoading || importableQuery.isLoading
 
   if (loadingTables) {
     return (
@@ -278,7 +285,7 @@ function DataTab() {
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-      <ImportSection tables={tables} />
+      <ImportSection tables={importable} />
       <ExportSection tables={tables} />
     </div>
   )
@@ -286,10 +293,11 @@ function DataTab() {
 
 // ─── Import ───────────────────────────────────────────────────────────────────
 
-function ImportSection({ tables }: { tables: string[] }) {
+export function ImportSection({ tables }: { tables: string[] }) {
   const [target, setTarget] = useState<string>('')
   const [file, setFile] = useState<File | null>(null)
   const [busy, setBusy] = useState<'idle' | 'template' | 'import'>('idle')
+  const [report, setReport] = useState<ImportResult | null>(null)
 
   async function handleDownloadTemplate() {
     if (!target) return
@@ -313,8 +321,9 @@ function ImportSection({ tables }: { tables: string[] }) {
     try {
       const text = await file.text()
       const res = await importTableData(target, text)
+      setReport(res.success || res.skipped?.length ? res : null)
       if (res.success) {
-        toast.success(`Imported ${res.count ?? '?'} rows into ${humanizeTableName(target)}`)
+        toast.success(`Imported ${res.count ?? 0} rows into ${humanizeTableName(target)}`)
         setFile(null)
         const input = document.getElementById('csv-import-input') as HTMLInputElement | null
         if (input) input.value = ''
@@ -336,7 +345,7 @@ function ImportSection({ tables }: { tables: string[] }) {
           <div>
             <p className="font-semibold text-sm">Import CSV</p>
             <p className="text-xs text-muted-foreground">
-              Bulk-load rows into a table. Download the template first to match the schema.
+              Bulk-load rows into a lookup table. Download the template first to match the schema.
             </p>
           </div>
         </div>
@@ -372,6 +381,8 @@ function ImportSection({ tables }: { tables: string[] }) {
             </p>
           )}
         </div>
+
+        {report && <ImportReport result={report} />}
 
         <div className="flex flex-wrap gap-2 pt-2">
           <Button

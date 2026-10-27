@@ -29,6 +29,7 @@ vi.mock('../../src/lib/audit', () => ({
   createAuditLog: vi.fn(),
   recordDiffAudit: vi.fn(),
 }))
+vi.mock('../../src/lib/archive', () => ({ verifyAdminPassword: vi.fn() }))
 vi.mock('../../src/lib/logger', () => ({
   logError: vi.fn(),
   logger: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
@@ -41,11 +42,13 @@ vi.mock('../../src/lib/constants', () => ({ DEFAULT_SMS_TEMPLATES: {} }))
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
+import { verifyAdminPassword } from '../../src/lib/archive'
 import { checkPermission, getCurrentUser } from '../../src/lib/rbac'
 import { patientsApp } from '../../src/routes/patients'
 
 const mockGetCurrentUser = vi.mocked(getCurrentUser)
 const mockCheckPermission = vi.mocked(checkPermission)
+const mockVerifyAdminPassword = vi.mocked(verifyAdminPassword)
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -86,7 +89,7 @@ const receptionistUser = {
 const validPatientBody = {
   name: 'Ama Mensah',
   phone: '+233241234567',
-  dateOfBirth: '1990-05-15',
+  dob: '1990-05-15',
   gender: 'female',
 }
 
@@ -240,6 +243,53 @@ describe('POST /api/patients', () => {
       expect(body.details).toBeUndefined()
     }
   })
+
+  // [H4] the live schema used to accept `gender: z.string()` (any string),
+  // `email: z.string()` (no format check), and `dob: z.string()` (no
+  // guard against `new Date()` producing an Invalid Date).
+  it('returns 400 for a gender outside male/female/other', async () => {
+    mockGetCurrentUser.mockResolvedValue(adminUser)
+    mockCheckPermission.mockResolvedValue(true)
+    const res = await makeApp().request('/api/patients', {
+      method: 'POST',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ ...validPatientBody, gender: 'banana' }),
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('accepts "other" — the enum documents 3 valid values, not 2', async () => {
+    mockGetCurrentUser.mockResolvedValue(adminUser)
+    mockCheckPermission.mockResolvedValue(true)
+    const res = await makeApp().request('/api/patients', {
+      method: 'POST',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ ...validPatientBody, gender: 'other' }),
+    })
+    expect(res.status).not.toBe(400)
+  })
+
+  it('returns 400 for a malformed email', async () => {
+    mockGetCurrentUser.mockResolvedValue(adminUser)
+    mockCheckPermission.mockResolvedValue(true)
+    const res = await makeApp().request('/api/patients', {
+      method: 'POST',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ ...validPatientBody, email: 'not-an-email' }),
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('returns 400 for a date of birth that does not parse to a real date', async () => {
+    mockGetCurrentUser.mockResolvedValue(adminUser)
+    mockCheckPermission.mockResolvedValue(true)
+    const res = await makeApp().request('/api/patients', {
+      method: 'POST',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ ...validPatientBody, dob: 'not-a-date' }),
+    })
+    expect(res.status).toBe(400)
+  })
 })
 
 // ── PATCH /api/patients/:id (update) ─────────────────────────────────────────
@@ -267,17 +317,40 @@ describe('PATCH /api/patients/:id', () => {
     })
     expect(res.status).toBe(403)
   })
+
+  // [H4] the update schema had the same gaps as create.
+  it('returns 400 for a gender outside male/female/other', async () => {
+    mockGetCurrentUser.mockResolvedValue(adminUser)
+    mockCheckPermission.mockResolvedValue(true)
+    const res = await makeApp().request('/api/patients/pat-abc-123', {
+      method: 'PATCH',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ gender: 'banana' }),
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('returns 400 for a date of birth that does not parse to a real date', async () => {
+    mockGetCurrentUser.mockResolvedValue(adminUser)
+    mockCheckPermission.mockResolvedValue(true)
+    const res = await makeApp().request('/api/patients/pat-abc-123', {
+      method: 'PATCH',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ dob: 'not-a-date' }),
+    })
+    expect(res.status).toBe(400)
+  })
 })
 
-// ── DELETE /api/patients/:id ──────────────────────────────────────────────────
+// ── POST /api/patients/:id/archive ────────────────────────────────────────────
 
-describe('DELETE /api/patients/:id', () => {
+describe('POST /api/patients/:id/archive', () => {
   afterEach(() => vi.clearAllMocks())
 
   it('returns 401 when unauthenticated', async () => {
     mockGetCurrentUser.mockResolvedValue(null)
-    const res = await makeApp().request('/api/patients/pat-abc-123', {
-      method: 'DELETE',
+    const res = await makeApp().request('/api/patients/pat-abc-123/archive', {
+      method: 'POST',
       headers: csrfHeaders(),
     })
     expect(res.status).toBe(401)
@@ -286,11 +359,84 @@ describe('DELETE /api/patients/:id', () => {
   it('returns 403 when lacking PATIENTS:delete permission', async () => {
     mockGetCurrentUser.mockResolvedValue(receptionistUser)
     mockCheckPermission.mockResolvedValue(false)
-    const res = await makeApp().request('/api/patients/pat-abc-123', {
-      method: 'DELETE',
+    const res = await makeApp().request('/api/patients/pat-abc-123/archive', {
+      method: 'POST',
       headers: csrfHeaders(),
     })
     expect(res.status).toBe(403)
+  })
+})
+
+// ── POST /api/patients/:id/unarchive ──────────────────────────────────────────
+
+describe('POST /api/patients/:id/unarchive', () => {
+  afterEach(() => vi.clearAllMocks())
+
+  it('returns 401 when unauthenticated', async () => {
+    mockGetCurrentUser.mockResolvedValue(null)
+    const res = await makeApp().request('/api/patients/pat-abc-123/unarchive', {
+      method: 'POST',
+      headers: csrfHeaders(),
+    })
+    expect(res.status).toBe(401)
+  })
+
+  it('returns 403 when lacking PATIENTS:delete permission', async () => {
+    mockGetCurrentUser.mockResolvedValue(receptionistUser)
+    mockCheckPermission.mockResolvedValue(false)
+    const res = await makeApp().request('/api/patients/pat-abc-123/unarchive', {
+      method: 'POST',
+      headers: csrfHeaders(),
+    })
+    expect(res.status).toBe(403)
+  })
+})
+
+// ── DELETE /api/patients/:id/permanent ────────────────────────────────────────
+
+describe('DELETE /api/patients/:id/permanent', () => {
+  afterEach(() => vi.clearAllMocks())
+
+  it('returns 401 when unauthenticated', async () => {
+    mockGetCurrentUser.mockResolvedValue(null)
+    const res = await makeApp().request('/api/patients/pat-abc-123/permanent', {
+      method: 'DELETE',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ password: 'x' }),
+    })
+    expect(res.status).toBe(401)
+  })
+
+  it('returns 400 when password is missing from the body', async () => {
+    mockGetCurrentUser.mockResolvedValue(adminUser)
+    const res = await makeApp().request('/api/patients/pat-abc-123/permanent', {
+      method: 'DELETE',
+      headers: csrfHeaders(),
+      body: JSON.stringify({}),
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('returns 403 when the caller is not admin', async () => {
+    mockGetCurrentUser.mockResolvedValue(receptionistUser)
+    mockVerifyAdminPassword.mockResolvedValue({ ok: false, reason: 'unauthorized' })
+    const res = await makeApp().request('/api/patients/pat-abc-123/permanent', {
+      method: 'DELETE',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ password: 'whatever' }),
+    })
+    expect(res.status).toBe(403)
+  })
+
+  it('returns 401 when the password is incorrect', async () => {
+    mockGetCurrentUser.mockResolvedValue(adminUser)
+    mockVerifyAdminPassword.mockResolvedValue({ ok: false, reason: 'invalid_password' })
+    const res = await makeApp().request('/api/patients/pat-abc-123/permanent', {
+      method: 'DELETE',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ password: 'wrong' }),
+    })
+    expect(res.status).toBe(401)
   })
 })
 

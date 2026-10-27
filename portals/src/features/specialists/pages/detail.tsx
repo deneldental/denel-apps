@@ -1,22 +1,12 @@
 import { useQueryClient } from '@tanstack/react-query'
-import {
-  ArrowLeft,
-  Banknote,
-  Briefcase,
-  Mail,
-  Pencil,
-  Phone,
-  ShieldCheck,
-  ShieldOff,
-  Stethoscope,
-  UserPlus,
-} from 'lucide-react'
+import { ArrowLeft, Banknote, Briefcase, Mail, Pencil, Phone, Stethoscope } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { CalendarLinkTab } from '@/features/specialists/components/calendar-link-tab'
 import { EditSpecialistSheet } from '@/features/specialists/components/edit-specialist-sheet'
-import { PermissionsTab } from '@/features/staff/components/permissions-tab'
+import { SpecialistAccessStep } from '@/features/specialists/components/specialist-access-step'
+import { SpecialistStatusButton } from '@/features/specialists/components/specialist-status-button'
 import {
   type Commission,
   type CommissionStatus,
@@ -204,7 +194,7 @@ export default function SpecialistDetailPage() {
   // After an edit on this page, refetch the detail AND invalidate the list
   // query so the specialists table reflects the change on back-navigation
   // (the list is a separate React Query cache that `refresh` alone never touches).
-  function _handleSaved() {
+  function handleSaved() {
     refresh()
     queryClient.invalidateQueries({ queryKey: queryKeys.specialists.all })
   }
@@ -255,6 +245,7 @@ export default function SpecialistDetailPage() {
             <span className="font-medium text-foreground">{specialist.name}</span>
           </nav>
         </div>
+        <SpecialistStatusButton specialist={specialist} onChanged={handleSaved} />
       </div>
 
       <div className="flex flex-1 min-h-0">
@@ -264,7 +255,7 @@ export default function SpecialistDetailPage() {
             specialist={specialist}
             open={editOpen}
             onOpenChange={setEditOpen}
-            onSaved={refresh}
+            onSaved={handleSaved}
           />
 
           <Tabs value={activeTab} onValueChange={(v) => setTab(v as SpecialistTab)}>
@@ -305,7 +296,7 @@ export default function SpecialistDetailPage() {
             </TabsContent>
 
             <TabsContent value="access" className="mt-5">
-              <AccessStep specialist={specialist} onChanged={refresh} />
+              <SpecialistAccessStep specialist={specialist} onChanged={handleSaved} />
             </TabsContent>
 
             <TabsContent value="calendar" className="mt-5">
@@ -482,75 +473,6 @@ function BioRow({
 }
 
 // ── Profile section ───────────────────────────────────────────────────────
-
-// ── Access sub-step ─────────────────────────────────────────────────────────
-//
-// Three states, three displays:
-//   • External specialist → no login needed. Show why.
-//   • Internal specialist with a linked user → embed the staff PermissionsTab
-//     so HR gets role + scope + bundle controls + permission matrix inline.
-//   • Internal specialist without a user yet → CTA explaining the wizard
-//     wires this up, with a pointer to the matching staff record if any.
-
-function AccessStep({ specialist, onChanged }: { specialist: Specialist; onChanged: () => void }) {
-  if (specialist.specialistType === 'external') {
-    return (
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base flex items-center gap-2">
-            <ShieldOff className="h-4 w-4" />
-            Access
-          </CardTitle>
-          <CardDescription>
-            External specialists don't sign into the system — they're billed via commission only. No
-            portal or PWA access to manage.
-          </CardDescription>
-        </CardHeader>
-      </Card>
-    )
-  }
-
-  if (!specialist.userId) {
-    return (
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base flex items-center gap-2">
-            <UserPlus className="h-4 w-4" />
-            Access
-          </CardTitle>
-          <CardDescription>
-            This internal specialist has no linked user account, so they can't sign in. Re-create
-            the record via the wizard with a password to mint one, or link an existing staff record
-            from the HR module.
-          </CardDescription>
-        </CardHeader>
-      </Card>
-    )
-  }
-
-  // Internal specialist with a linked user — full permissions surface.
-  return (
-    <div className="space-y-5">
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base flex items-center gap-2">
-            <ShieldCheck className="h-4 w-4" />
-            Access summary
-          </CardTitle>
-          <CardDescription>
-            Manages this specialist's role + scope + per-user bundle grants. The same controls HR
-            uses on the staff detail page.
-          </CardDescription>
-        </CardHeader>
-      </Card>
-      <PermissionsTab
-        userId={specialist.userId}
-        staffName={specialist.name}
-        onChanged={onChanged}
-      />
-    </div>
-  )
-}
 
 function IdentityStep({
   specialist,

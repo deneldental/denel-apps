@@ -4,6 +4,7 @@ import { getDb } from '../db'
 import { complianceCategories } from '../db/schema'
 import { ACTIONS, MODULES } from '../lib/modules'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
+import { denyUnless } from '../lib/route-access'
 import type { HonoEnv } from '../lib/types'
 
 const complianceCategoriesApp = new Hono<HonoEnv>()
@@ -11,6 +12,11 @@ const complianceCategoriesApp = new Hono<HonoEnv>()
 complianceCategoriesApp.get('/', async (c) => {
   const currentUser = await getCurrentUser(c)
   if (!currentUser) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, currentUser.id, {
+    apps: ['portal'],
+    anyOf: [[MODULES.COMPLIANCE, ACTIONS.READ]],
+  })
+  if (denied) return denied
 
   const db = getDb(process.env.DATABASE_URL!)
   try {

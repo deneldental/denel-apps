@@ -3,6 +3,7 @@ import { Hono } from 'hono'
 import { getDb } from '../db'
 import { documentTags } from '../db/schema'
 import { ACTIONS, MODULES } from '../lib/modules'
+import { isUniqueViolation } from '../lib/pg-errors'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import type { HonoEnv } from '../lib/types'
 
@@ -58,8 +59,7 @@ documentTagsApp.post('/', async (c) => {
     if (!tag) return c.json({ error: 'Failed to create document tag' }, 500)
     return c.json({ success: true, data: tag }, 201)
   } catch (err: unknown) {
-    const pgErr = err as { code?: string; message?: string }
-    if (pgErr.code === '23505') return c.json({ error: 'A tag with that name already exists' }, 409)
+    if (isUniqueViolation(err)) return c.json({ error: 'A tag with that name already exists' }, 409)
     return c.json({ error: 'Failed to create document tag' }, 500)
   }
 })

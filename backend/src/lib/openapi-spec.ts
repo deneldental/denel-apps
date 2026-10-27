@@ -505,20 +505,43 @@ export const openapiSpec = {
       post: {
         tags: ['Payments'],
         summary: 'Record payment',
+        description:
+          'Send either `amount` and `method` (one method), or `sources` (one payment split ' +
+          'across several methods, e.g. part cash and part card), not both. Money is in whole ' +
+          'pesewas. A split becomes one payment per method, all sharing one `paymentGroupId`, ' +
+          'recorded together or not at all. The total is worked out from the payments recorded.',
         requestBody: {
           required: true,
           content: {
             'application/json': {
               schema: {
                 type: 'object',
-                required: ['patientId', 'amount', 'method'],
+                required: ['patientId'],
                 properties: {
                   patientId: { type: 'string', format: 'uuid' },
                   invoiceId: { type: 'string', format: 'uuid' },
-                  amount: { type: 'number' },
+                  amount: { type: 'integer', description: 'One-method shape: pesewas.' },
                   method: {
                     type: 'string',
-                    enum: ['cash', 'momo', 'card', 'bank_transfer', 'cheque', 'wallet'],
+                    description:
+                      'One-method shape: a payment method from Settings (or a built-in one).',
+                  },
+                  sources: {
+                    type: 'array',
+                    minItems: 1,
+                    maxItems: 20,
+                    description:
+                      'Split shape. Each method must be one an administrator has active in ' +
+                      'Settings (or a built-in one with no Settings row).',
+                    items: {
+                      type: 'object',
+                      required: ['method', 'amount'],
+                      properties: {
+                        method: { type: 'string' },
+                        amount: { type: 'integer', minimum: 1, description: 'Pesewas.' },
+                        externalReference: { type: 'string' },
+                      },
+                    },
                   },
                   reference: { type: 'string' },
                 },
@@ -527,8 +550,100 @@ export const openapiSpec = {
           },
         },
         responses: {
-          '201': { description: 'Payment recorded' },
-          '400': { description: 'Validation error' },
+          '200': {
+            description:
+              'Payment recorded. `data` is the first payment; `payments` lists every payment ' +
+              'recorded (one per method); `paymentGroupId` is shared by a split and null otherwise.',
+          },
+          '400': { description: 'Validation error (a sentence)' },
+        },
+      },
+    },
+    '/api/payments/{id}/post': {
+      post: {
+        tags: ['Payments'],
+        summary: 'Post a draft payment (writes its journal entry; posting it again is harmless)',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        requestBody: {
+          required: false,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  sendSms: {
+                    type: 'boolean',
+                    description:
+                      'Text the patient a payment confirmation naming what was posted: this payment, or every ' +
+                      'posted payment of its group (send it with the last payment of a split). At most once per ' +
+                      'payment event; a failed text is reported as `smsError` and never fails the posting.',
+                  },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': {
+            description:
+              'The posted payment and its journal entry; `smsError` when the text failed',
+          },
+          '400': { description: 'Not postable (a sentence)' },
+        },
+      },
+    },
+    '/api/worklist/{id}/confirm': {
+      post: {
+        tags: ['Payments'],
+        summary: 'Confirm an estimate: issue it and, optionally, take a payment for it',
+        parameters: [
+          {
+            name: 'id',
+            in: 'path',
+            required: true,
+            description: 'The visit (appointment) id, or the invoice id of a standalone estimate',
+            schema: { type: 'string', format: 'uuid' },
+          },
+        ],
+        requestBody: {
+          required: false,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  payments: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      required: ['method', 'amount'],
+                      properties: {
+                        method: { type: 'string' },
+                        amount: { type: 'integer', description: 'Pesewas' },
+                        externalReference: { type: 'string', nullable: true },
+                      },
+                    },
+                  },
+                  acceptedLineItemIds: { type: 'array', items: { type: 'string', format: 'uuid' } },
+                  sendSms: {
+                    type: 'boolean',
+                    description:
+                      'Text the patient a confirmation of the payment taken, once, for its posted total. A ' +
+                      'confirm with no payment texts nobody; a failed text is reported as `smsError`.',
+                  },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': {
+            description:
+              'The issued invoice and the payment taken; `smsError` when the text failed',
+          },
+          '404': { description: 'No draft estimate for this visit' },
         },
       },
     },
@@ -786,6 +901,8 @@ export const openapiSpec = {
       post: {
         tags: ['Access Management'],
         summary: 'Create user',
+        description:
+          'The password is the administrator’s choice, so the new user must change it at first sign-in (`mustChangePassword`).',
         requestBody: {
           required: true,
           content: {
@@ -817,6 +934,8 @@ export const openapiSpec = {
       patch: {
         tags: ['Access Management'],
         summary: 'Update user',
+        description:
+          'A `password` replaces the credential and ends every session of that user. Unless the caller is changing their own, the user must then choose a new password at next sign-in (`mustChangePassword`).',
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
         requestBody: {
           required: true,
@@ -829,12 +948,17 @@ export const openapiSpec = {
                   phone: { type: 'string' },
                   roleId: { type: 'string' },
                   email: { type: 'string' },
+                  password: { type: 'string' },
                 },
               },
             },
           },
         },
-        responses: { '200': { description: 'Updated user' } },
+        responses: {
+          '200': { description: 'Updated user' },
+          '400': { description: 'Invalid e-mail, or a password the policy refuses' },
+          '404': { description: 'No such user (when a password is sent)' },
+        },
       },
       delete: {
         tags: ['Access Management'],
@@ -1519,8 +1643,44 @@ export const openapiSpec = {
     '/api/payment-plans/overdue': {
       get: {
         tags: ['Finance'],
-        summary: 'Overdue payment plans',
-        responses: { '200': { description: 'Plans with overdueAmount' } },
+        summary: 'Overdue and outstanding payment plans',
+        description:
+          'Both kinds unless ?status narrows it. overdueAmount is the instalments due so far minus the POSTED allocations to the plan.',
+        parameters: [
+          {
+            name: 'status',
+            in: 'query',
+            required: false,
+            schema: { type: 'string', enum: ['overdue', 'outstanding'] },
+          },
+        ],
+        responses: {
+          '200': { description: 'Plans with overdueAmount' },
+          '400': { description: 'status is not overdue or outstanding' },
+        },
+      },
+    },
+    '/api/payment-plans/outstanding': {
+      get: {
+        tags: ['Finance'],
+        summary: 'Outstanding payment plans',
+        responses: { '200': { description: 'Plans marked outstanding, with overdueAmount' } },
+      },
+    },
+    '/api/payment-plans/{id}': {
+      get: {
+        tags: ['Finance'],
+        summary: 'Payment plan detail',
+        description:
+          'The plan, its patient, the master invoice, totals {total, paid, balance} (paid = POSTED allocations to the plan invoices) and the payment history (each payment once; reversed ones shown but not counted; drafts left out).',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        responses: {
+          '200': { description: 'The plan with totals and payment history' },
+          '400': { description: 'id is not a UUID' },
+          '404': { description: 'No such payment plan' },
+        },
       },
     },
     '/api/payment-plans/patient/{patientId}': {
@@ -1717,12 +1877,76 @@ export const openapiSpec = {
                     enum: ['check-in', 'seat', 'complete', 'no-show', 'cancel'],
                   },
                   notes: { type: 'string' },
+                  overrideReason: {
+                    type: 'string',
+                    description:
+                      'Required (3+ chars) when an admin changes a visit from a previous day. Non-admins may only close out YESTERDAY as no-show or complete.',
+                  },
                 },
               },
             },
           },
         },
-        responses: { '200': { description: 'Updated appointment' } },
+        responses: {
+          '200': { description: 'Updated appointment' },
+          '403': { description: 'APPOINTMENT_PAST_LOCKED' },
+          '409': {
+            description:
+              'APPOINTMENT_TERMINAL, or APPOINTMENT_INVALID_TRANSITION for a move the status machine does not allow',
+          },
+        },
+      },
+    },
+    '/api/appointment-workflow/{id}/check-in': {
+      post: {
+        tags: ['Appointments'],
+        summary: 'Check a patient in (payment, status and doctor note in one transaction)',
+        description:
+          'Give exactly one of payment, noPaymentReason or paymentRecordedElsewhere. A repeat for a visit already checked in is a success that takes no payment (alreadyCheckedIn: true).',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  payment: {
+                    type: 'object',
+                    required: ['amount', 'method'],
+                    properties: {
+                      amount: { type: 'number', description: 'Integer cents' },
+                      method: { type: 'string' },
+                      description: { type: 'string' },
+                      treatments: { type: 'array', items: {} },
+                      sendNotification: { type: 'boolean' },
+                    },
+                  },
+                  noPaymentReason: { type: 'string', minLength: 3 },
+                  paymentRecordedElsewhere: { type: 'boolean', enum: [true] },
+                  overrideReason: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': {
+            description:
+              '{ appointment, payment, alreadyCheckedIn } plus smsError if the receipt SMS failed',
+          },
+          '400': {
+            description:
+              'CHECKIN_PAYMENT_MODE_REQUIRED, CHECKIN_PAYMENT_REJECTED or OVERRIDE_REASON_REQUIRED',
+          },
+          '403': {
+            description:
+              'No appointments:update (or payments:create when taking a payment), or APPOINTMENT_PAST_LOCKED',
+          },
+          '409': { description: 'APPOINTMENT_TERMINAL or APPOINTMENT_INVALID_TRANSITION' },
+        },
       },
     },
     '/api/appointment-workflow/{id}/send-confirmation': {
@@ -1820,6 +2044,13 @@ export const openapiSpec = {
                   name: { type: 'string' },
                   amount: { type: 'number' },
                   isActive: { type: 'boolean' },
+                  additionalUnitPrice: {
+                    type: 'integer',
+                    minimum: 0,
+                    nullable: true,
+                    description:
+                      'Pesewas for each unit after the first, applied while the application type has additionalUnitPriceEnabled. 400 when not a whole number of 0 or more.',
+                  },
                 },
               },
             },
@@ -3517,6 +3748,10 @@ export const openapiSpec = {
       post: {
         tags: ['Staff'],
         summary: 'Create specialist',
+        description:
+          'With a `password` (internal specialists) the doctor login and the specialist are ONE write: if any part fails nothing is kept and the same request can be retried. ' +
+          'The e-mail is stored lower-case (Better Auth looks logins up that way). The login must change the admin-set password before doing anything else. ' +
+          '`userId` links an existing login instead: it must exist (400) and not already belong to another specialist (409).',
         requestBody: {
           required: true,
           content: {
@@ -3544,7 +3779,17 @@ export const openapiSpec = {
             },
           },
         },
-        responses: { '201': { description: 'Specialist created' } },
+        responses: {
+          '201': { description: 'Specialist created' },
+          '400': {
+            description:
+              'Missing name, password under 10 characters, e-mail missing or invalid for a login, a commission/withholding rate outside 0–100, or an unknown `userId`',
+          },
+          '409': {
+            description:
+              'The e-mail already has a login (any capitalisation), or `userId` already belongs to another specialist',
+          },
+        },
       },
     },
     '/api/specialists/directory': {
@@ -3568,6 +3813,9 @@ export const openapiSpec = {
       patch: {
         tags: ['Staff'],
         summary: 'Update specialist',
+        description:
+          '`specialistType` cannot be changed (400 `SPECIALIST_TYPE_LOCKED`) — use `POST /api/specialists/{id}/grant-login` to make an external specialist internal. ' +
+          'Setting `isActive` deactivates/reactivates the specialist and suspends/restores their login; deactivating also requires `specialists:delete`.',
         parameters: [
           { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
         ],
@@ -3579,11 +3827,47 @@ export const openapiSpec = {
       },
       delete: {
         tags: ['Staff'],
-        summary: 'Delete specialist',
+        summary: 'Deactivate specialist',
+        description:
+          'Soft-deactivates (the row is kept). Also suspends the linked login and ends its open sessions. Reactivate with `PATCH { isActive: true }`.',
         parameters: [
           { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
         ],
-        responses: { '200': { description: 'Deleted' } },
+        responses: { '200': { description: 'Deactivated specialist' } },
+      },
+    },
+    '/api/specialists/{id}/grant-login': {
+      post: {
+        tags: ['Staff'],
+        summary: 'Grant a portal login to an existing specialist',
+        description:
+          'Requires `specialists:update` and `specialists:create`. Marks the specialist internal and creates a `doctor` login with portal scope. ' +
+          'Creates no HR employment record; if one already exists it is linked to the new login. ' +
+          'Refusals: 404 `NOT_FOUND`, 400 `INACTIVE`, 409 `ALREADY_HAS_LOGIN`, 409 `EMAIL_TAKEN`, 409 `STAFF_ALREADY_LINKED`.',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['email', 'password'],
+                properties: {
+                  email: { type: 'string', format: 'email' },
+                  password: { type: 'string', minLength: 10 },
+                  portalAccess: { type: 'boolean', default: true },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': { description: '{ specialistId, userId, staffRowId, specialist }' },
+          '400': { description: 'Invalid body, or the specialist is inactive' },
+          '409': { description: 'Already has a login, or the email is taken' },
+        },
       },
     },
     '/api/specialists/{id}/services': {

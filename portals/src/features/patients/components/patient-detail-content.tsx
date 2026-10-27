@@ -102,15 +102,26 @@ export function PatientDetailContent({
 
   // Granting patient-app access is an admin-only action, so the tab (and the
   // bio-pane toggle further down) are hidden from every other role.
-  const VALID_TABS = isDoctor
-    ? ['medical', 'documents']
-    : isAdmin
-      ? ['timeline', 'medical', 'documents', 'ledger', 'statements', 'pwa']
-      : ['timeline', 'medical', 'documents', 'ledger', 'statements']
+  const VALID_TABS = (
+    isDoctor
+      ? ['medical', 'documents']
+      : isAdmin
+        ? ['timeline', 'medical', 'documents', 'ledger', 'statements', 'pwa']
+        : ['timeline', 'medical', 'documents', 'ledger', 'statements']
+  ).filter((t) => t !== 'medical' || canViewMedicalRecords)
   const tabParam = searchParams.get('tab') ?? (isDoctor ? 'medical' : 'timeline')
   const activeTab = VALID_TABS.includes(tabParam) ? tabParam : isDoctor ? 'medical' : 'timeline'
 
   const [patient, setPatient] = useState(initialPatient)
+  // Re-sync when the parent hands us a fresh patient object — e.g. after
+  // EditPatientSheet's save invalidates the query cache and detail.tsx's
+  // patientQuery refetches. Without this, the local copy below (needed for
+  // the two optimistic PWA-toggle updates) stayed frozen at whatever was
+  // passed in on first mount, so an edit never appeared anywhere on this
+  // page — bio pane, breadcrumb, or any tab — until a full reload.
+  useEffect(() => {
+    setPatient(initialPatient)
+  }, [initialPatient])
   const [pwaToggling, setPwaToggling] = useState(false)
   const [showEditDialog, setShowEditDialog] = useState(false)
   const [activePlans, setActivePlans] = useState<PatientSummary['paymentPlans']>([])
@@ -190,7 +201,7 @@ export function PatientDetailContent({
           >
             <TabsList>
               {!isDoctor && <TabsTrigger value="timeline">Timeline</TabsTrigger>}
-              <TabsTrigger value="medical">Medical Records</TabsTrigger>
+              {canViewMedicalRecords && <TabsTrigger value="medical">Medical Records</TabsTrigger>}
               <TabsTrigger value="documents">Documents</TabsTrigger>
               {!isDoctor && (
                 <>
@@ -205,13 +216,15 @@ export function PatientDetailContent({
               <PatientTimelineTab patientId={patient.id} />
             </TabsContent>
 
-            <TabsContent value="medical" className="mt-5">
-              <MedicalRecordsSubTabs
-                patientId={patient.id}
-                patientName={patient.name}
-                canEdit={canEdit}
-              />
-            </TabsContent>
+            {canViewMedicalRecords && (
+              <TabsContent value="medical" className="mt-5">
+                <MedicalRecordsSubTabs
+                  patientId={patient.id}
+                  patientName={patient.name}
+                  canEdit={canEdit}
+                />
+              </TabsContent>
+            )}
 
             <TabsContent value="documents" className="mt-5">
               <DocumentsTab patientId={patient.id} canEdit={canEdit} />

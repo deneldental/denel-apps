@@ -4,6 +4,7 @@ import { getAllRoutes } from '@/app/modules/registry'
 import AnalyticsPrintPage from '@/features/analytics/pages/print'
 import AppointmentConfirmPage from '@/features/appointment-confirmation/pages/index'
 import DashboardLayout from '@/features/auth/guards/DashboardLayout'
+import ChangePasswordPage from '@/features/auth/pages/change-password/index'
 import ForgotPasswordPage from '@/features/auth/pages/forgot-password/index'
 import LoginPage from '@/features/auth/pages/login/index'
 import ResetPasswordPage from '@/features/auth/pages/reset-password/index'
@@ -60,6 +61,7 @@ export function AppRouter() {
       <Route path="/auth/login" element={<LoginPage />} />
       <Route path="/auth/forgot-password" element={<ForgotPasswordPage />} />
       <Route path="/auth/reset-password" element={<ResetPasswordPage />} />
+      <Route path="/auth/change-password" element={<ChangePasswordPage />} />
 
       {/* Public appointment confirmation (token-based, no login) */}
       <Route

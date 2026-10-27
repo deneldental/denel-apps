@@ -37,10 +37,11 @@ vi.mock('../../src/lib/logger', () => ({
 
 import { getDb } from '../../src/db'
 import * as schema from '../../src/db/schema'
-import { getCurrentUser } from '../../src/lib/rbac'
+import { checkPermission, getCurrentUser } from '../../src/lib/rbac'
 import { lookupsApp } from '../../src/routes/lookups'
 
 const mockGetCurrentUser = vi.mocked(getCurrentUser)
+const mockCheckPermission = vi.mocked(checkPermission)
 
 function makeApp() {
   const app = new Hono<HonoEnv>()
@@ -75,6 +76,10 @@ describe.skipIf(noDb)('employment-type + department lookups', () => {
     if (!admin) throw new Error('no seeded admin user — run seed:rbac / seed:admin')
     adminUserId = admin.id
     mockGetCurrentUser.mockResolvedValue({ id: adminUserId, email: 'admin@it.local' } as any)
+    // Reading a lookup list now needs a module permission (F23). The permission engine is stubbed
+    // here, and an administrator holds every module, so the stub says yes; who may read what is
+    // proved with the real roles in session-only-endpoints.test.ts.
+    mockCheckPermission.mockResolvedValue(true)
   })
 
   afterAll(async () => {

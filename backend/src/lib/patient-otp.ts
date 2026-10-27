@@ -97,7 +97,9 @@ export async function requestOtp(
 
   const branding = await getBranding().catch(() => null)
   const brandShort = branding?.shortName ?? 'Denel'
-  const result = await sendSMS([{ phone, message: smsBody(code, purpose, brandShort), patientId }])
+  const result = await sendSMS([
+    { phone, message: smsBody(code, purpose, brandShort), patientId, sensitive: true },
+  ])
 
   if (!result.success) {
     return { ok: false, error: 'Failed to send SMS. Please try again or contact the clinic.' }
@@ -212,7 +214,9 @@ export async function requestOtpByPhone(
 
   const branding = await getBranding().catch(() => null)
   const brandShort = branding?.shortName ?? 'Denel'
-  const result = await sendSMS([{ phone, message: smsBody(code, purpose, brandShort) }])
+  const result = await sendSMS([
+    { phone, message: smsBody(code, purpose, brandShort), sensitive: true },
+  ])
 
   if (!result.success) {
     return { ok: false, error: 'Failed to send SMS. Please try again or contact the clinic.' }

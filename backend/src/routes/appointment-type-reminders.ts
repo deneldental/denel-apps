@@ -12,6 +12,9 @@ import type { HonoEnv } from '../lib/types'
 const appointmentTypeRemindersApp = new Hono<HonoEnv>()
 const MODULE = MODULES.APPOINTMENTS // Tie this to scheduling/appointments module permissions
 
+/** `default` (the reminders every type falls back to) or the id of an appointment type. */
+const TYPE_PARAM = /^(default|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i
+
 // GET /api/appointment-type-reminders/:appointmentTypeId
 appointmentTypeRemindersApp.get('/:appointmentTypeId', async (c) => {
   try {
@@ -23,6 +26,10 @@ appointmentTypeRemindersApp.get('/:appointmentTypeId', async (c) => {
     }
 
     const appointmentTypeId = c.req.param('appointmentTypeId')
+    // The column is a uuid: anything else used to reach the database and come back as a 500.
+    if (!TYPE_PARAM.test(appointmentTypeId)) {
+      return c.json({ error: 'Invalid appointment type id' }, 400)
+    }
     const db = getDb(env.DATABASE_URL)
 
     const condition =
@@ -38,13 +45,11 @@ appointmentTypeRemindersApp.get('/:appointmentTypeId', async (c) => {
     })
 
     return c.json({ success: true, data: reminders })
-  } catch (error: any) {
-    console.error('APPOINTMENT_TYPE_REMINDERS_ERROR_GET', error)
+  } catch (error: unknown) {
+    // The detail goes to the log. The browser used to be sent the database's own message and the
+    // server's stack trace (file paths and line numbers) with every failure.
     logError(error, { route: 'appointment-type-reminders.get', userId: 'unknown' })
-    return c.json(
-      { error: error.message || 'Failed to fetch appointment type reminders', stack: error.stack },
-      500
-    )
+    return c.json({ error: 'Failed to fetch appointment type reminders' }, 500)
   }
 })
 
@@ -69,6 +74,7 @@ appointmentTypeRemindersApp.put('/:appointmentTypeId', async (c) => {
   }
 
   const typeParam = c.req.param('appointmentTypeId')
+  if (!TYPE_PARAM.test(typeParam)) return c.json({ error: 'Invalid appointment type id' }, 400)
   const isDefault = typeParam === 'default'
   const appointmentTypeId = isDefault ? null : typeParam
 

@@ -1,38 +1,27 @@
-﻿import { and, asc, eq, sql } from 'drizzle-orm'
+﻿import { and, asc, eq } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { z } from 'zod'
-import { getDb } from '../db'
-import {
-  account,
-  serviceDoctors,
-  services,
-  specialists,
-  staff,
-  user,
-  userScopes,
-} from '../db/schema'
+import { type DB, getDb } from '../db'
+import { serviceDoctors, services, specialists, user } from '../db/schema'
 import { recordDiffAudit } from '../lib/audit'
-import { isValidSpecialty, onboardDoctor } from '../lib/doctor-onboarding'
+import {
+  assertRate,
+  createDoctorLogin,
+  GrantLoginError,
+  grantDoctorLogin,
+  isEmailTaken,
+  isValidSpecialty,
+  onboardDoctor,
+} from '../lib/doctor-onboarding'
+import { syncDoctorSpecialty } from '../lib/doctor-specialty'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
-import { hashPassword } from '../lib/password'
+import { normalizeEmail } from '../lib/normalize-email'
+import { isUniqueViolation } from '../lib/pg-errors'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
+import { setSpecialistActive } from '../lib/specialist-status'
+import { nextStaffId } from '../lib/staff-id'
 import type { HonoEnv } from '../lib/types'
-
-/**
- * Next sequential Staff ID (FDM-S0001). Mirrors staff-core's generator — MAX
- * rather than COUNT so it stays correct after deletions. Called inside the
- * onboarding transaction so two concurrent creates can't claim the same number.
- */
-async function generateSpecialistStaffId(tx: any): Promise<string> {
-  const [result] = await tx
-    .select({
-      maxNum: sql<number>`max(cast(regexp_replace("staffId", '[^0-9]', '', 'g') as int))`,
-    })
-    .from(staff)
-  const next = (result?.maxNum ?? 0) + 1
-  return `FDM-S${String(next).padStart(4, '0')}`
-}
 
 /**
  * The HR doctor-onboarding contract.
@@ -56,6 +45,13 @@ const DoctorOnboardSchema = z.object({
   employmentType: z.string().trim().max(50).optional(),
   /** Internal only — creates sign-in credentials when present. */
   password: z.string().min(10, 'Password must be at least 10 characters').optional(),
+  portalAccess: z.boolean().optional(),
+})
+
+/** Granting a login to an existing specialist. The email is lowercased server-side. */
+const GrantLoginSchema = z.object({
+  email: z.string().trim().email('Enter a valid email address'),
+  password: z.string().min(10, 'Password must be at least 10 characters'),
   portalAccess: z.boolean().optional(),
 })
 
@@ -99,6 +95,12 @@ const SpecialistPatchSchema = z.object({
   payoutAccountDetails: z.record(z.string(), z.unknown()).nullish(),
   isActive: z.boolean().optional(),
 })
+
+/** The address this specialist signs in with, or null when they have no login. */
+async function loginEmailOf(db: DB, userId: string): Promise<string | null> {
+  const [row] = await db.select({ email: user.email }).from(user).where(eq(user.id, userId))
+  return row?.email ?? null
+}
 
 const specialistsApp = new Hono<HonoEnv>()
 const MODULE = MODULES.SPECIALISTS
@@ -207,10 +209,27 @@ specialistsApp.get('/:id', async (c) => {
 
   const { id } = c.req.param()
   const db = getDb(process.env.DATABASE_URL!)
-  const row = await db.query.specialists.findFirst({ where: eq(specialists.id, id) })
+  const row = await db.query.specialists.findFirst({
+    where: eq(specialists.id, id),
+    with: { user: { columns: { email: true } } },
+  })
   if (!row) return c.json({ error: 'Not found' }, 404)
-  return c.json({ success: true, data: row })
+  // The address this specialist SIGNS IN with, which is not the same thing as the contact address
+  // on the billing record and cannot be changed from here (F48). Null when they have no login.
+  const { user: login, ...specialist } = row
+  return c.json({ success: true, data: { ...specialist, signInEmail: login?.email ?? null } })
 })
+
+/** A request the create route refuses with a clear message instead of a bare 500. */
+class CreateRefusal extends Error {
+  constructor(
+    message: string,
+    readonly status: 400 | 409
+  ) {
+    super(message)
+    this.name = 'CreateRefusal'
+  }
+}
 
 specialistsApp.post('/', async (c) => {
   const authUser = await getCurrentUser(c)
@@ -224,89 +243,113 @@ specialistsApp.post('/', async (c) => {
 
   const specialistType: 'internal' | 'external' =
     body.specialistType === 'internal' ? 'internal' : 'external'
+  const isInternal = specialistType === 'internal'
+
+  // One form of the address, stored on the login AND on the billing record: Better
+  // Auth looks accounts up by the lower-cased address, so anything else can never
+  // sign in (F21).
+  const contactEmail =
+    typeof body.contactEmail === 'string' && body.contactEmail.trim()
+      ? normalizeEmail(body.contactEmail)
+      : null
 
   // PR-17 — optional inline user-account create. When the Add wizard sends
   // a password (internal specialist who needs PWA/Portal access), we mint
   // the auth user here, set their scope toggles, and link via userId. The
   // password is intentionally never persisted on the specialist row.
-  let linkedUserId: string | null =
-    specialistType === 'internal' && body.userId ? body.userId : null
+  const linkExistingUserId = isInternal && body.userId ? body.userId : null
+  const wantsLogin = isInternal && !linkExistingUserId && !!body.password
 
-  if (specialistType === 'internal' && !linkedUserId && body.password) {
+  if (wantsLogin) {
     if (typeof body.password !== 'string' || body.password.length < 10) {
       return c.json({ error: 'Password must be at least 10 characters' }, 400)
     }
-    if (!body.contactEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.contactEmail)) {
+    if (!contactEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail)) {
       return c.json({ error: 'Email is required to create a user account' }, 400)
     }
-    const newUserId = crypto.randomUUID()
-    const now = new Date()
-    await db.insert(user).values({
-      id: newUserId,
-      name: body.name,
-      email: body.contactEmail,
-      phone: body.contactPhone || null,
-      emailVerified: true,
-      // An internal specialist IS a doctor — the doctors row is auto-provisioned
-      // from this specialist on the next GET /api/doctors. Creating the login
-      // with a null role produced an account that could sign in and do nothing:
-      // no roleId means zero resolved permissions and an empty nav, until an
-      // admin remembered to assign the role separately in Access Management.
-      role: 'doctor',
-      roleId: 'doctor',
-      banned: false,
-      createdAt: now,
-      updatedAt: now,
-    })
-    const hashed = await hashPassword(body.password)
-    await db.insert(account).values({
-      id: crypto.randomUUID(),
-      accountId: newUserId,
-      providerId: 'credential',
-      userId: newUserId,
-      password: hashed,
-      createdAt: now,
-      updatedAt: now,
-    })
-    // Portal only. No 'pwa' row is written here any more.
-    //
-    // user_scopes is an OVERRIDE layer — checkScope returns a per-user row's
-    // value before it ever consults the role's scopes. Writing a pwa row from
-    // this flow therefore bypassed the role policy entirely: doctors hold
-    // ['portal'] and do no work from the Team app, but a pwaAccess flag here
-    // silently granted it, one onboarding at a time. Team access for a doctor
-    // is now not expressible from this endpoint at all.
-    await db.insert(userScopes).values([
-      {
-        userId: newUserId,
-        interfaceScope: 'portal',
-        granted: !!body.portalAccess,
-        grantedById: authUser.id,
-        createdAt: now,
-        updatedAt: now,
-      },
-    ])
-    linkedUserId = newUserId
   }
 
-  const [row] = await db
-    .insert(specialists)
-    .values({
-      name: body.name,
-      specialty: body.specialty ?? null,
-      profileImage: body.profileImage ?? null,
-      contactEmail: body.contactEmail ?? null,
-      contactPhone: body.contactPhone ?? null,
-      tin: body.tin ?? null,
-      specialistType,
-      userId: linkedUserId,
-      defaultCommissionRate: Number(body.defaultCommissionRate ?? 0),
-      withholdingTaxRate: Number(body.withholdingTaxRate ?? 0),
-      payoutMethod: body.payoutMethod ?? null,
-      payoutAccountDetails: body.payoutAccountDetails ?? null,
-      isActive: body.isActive ?? true,
+  let row: typeof specialists.$inferSelect
+  try {
+    // Percentages, bounded: a rate above 999.99 overflows the column AFTER the login
+    // was written, which used to leave the login behind with no specialist (F12).
+    const commissionRate = assertRate(body.defaultCommissionRate, 'Commission rate')
+    const withholdingRate = assertRate(body.withholdingTaxRate, 'Withholding tax rate')
+
+    // The login and the specialist are ONE write. If anything after the first insert
+    // fails, no user, credential or scope row survives, and a retry with the same
+    // address works instead of answering 409 forever (F12).
+    row = await db.transaction(async (tx) => {
+      let linkedUserId: string | null = null
+
+      if (linkExistingUserId !== null) {
+        if (typeof linkExistingUserId !== 'string') {
+          throw new CreateRefusal('userId must be a string', 400)
+        }
+        // Locked, so two requests cannot both claim the same login.
+        const [target] = await tx
+          .select({ id: user.id })
+          .from(user)
+          .where(eq(user.id, linkExistingUserId))
+          .for('update')
+        if (!target) throw new CreateRefusal('No user with that userId', 400)
+        const [already] = await tx
+          .select({ id: specialists.id })
+          .from(specialists)
+          .where(eq(specialists.userId, linkExistingUserId))
+          .limit(1)
+        if (already) {
+          throw new CreateRefusal('That user is already linked to another specialist', 409)
+        }
+        linkedUserId = linkExistingUserId
+      } else if (wantsLogin) {
+        // An address already held by another account — a staff member's login, say —
+        // is a clean 409, not the unique index's bare 500. Compared lower-cased
+        // because that is how Better Auth looks accounts up.
+        if (await isEmailTaken(tx, contactEmail as string)) {
+          throw new CreateRefusal('Email already exists in the system', 409)
+        }
+        linkedUserId = await createDoctorLogin(tx, {
+          name: body.name,
+          email: contactEmail as string,
+          phone: body.contactPhone,
+          password: body.password,
+          portalAccess: !!body.portalAccess,
+          grantedById: authUser.id,
+        })
+      }
+
+      const [created] = await tx
+        .insert(specialists)
+        .values({
+          name: body.name,
+          specialty: body.specialty ?? null,
+          profileImage: body.profileImage ?? null,
+          contactEmail,
+          contactPhone: body.contactPhone ?? null,
+          tin: body.tin ?? null,
+          specialistType,
+          userId: linkedUserId,
+          defaultCommissionRate: commissionRate,
+          withholdingTaxRate: withholdingRate,
+          payoutMethod: body.payoutMethod ?? null,
+          payoutAccountDetails: body.payoutAccountDetails ?? null,
+          isActive: body.isActive ?? true,
+        })
+        .returning()
+      return created
     })
-    .returning()
+  } catch (error) {
+    if (error instanceof CreateRefusal) return c.json({ error: error.message }, error.status)
+    // Someone registered this address between the lookup and the insert.
+    if (isUniqueViolation(error, 'user_email_unique')) {
+      return c.json({ error: 'Email already exists in the system' }, 409)
+    }
+    const message = error instanceof Error ? error.message : ''
+    if (/percentage between/.test(message)) return c.json({ error: message }, 400)
+    logError(error, { context: '[specialists] create' })
+    return c.json({ error: 'Failed to create specialist' }, 500)
+  }
 
   await recordDiffAudit(db, {
     userId: authUser.id,
@@ -332,9 +375,9 @@ specialistsApp.post('/', async (c) => {
  * payslip, no attendance, no Team app.
  *
  * Everything runs in ONE transaction. A half-created doctor is genuinely bad
- * (a staff row invoices can't bill against, or a specialist payroll can't pay),
- * and the compensating-delete approach used by POST /api/staff leaks orphans
- * when a later step fails.
+ * (a staff row invoices can't bill against, or a specialist payroll can't pay).
+ * POST /api/staff and the registration approval work the same way now; both used
+ * to undo a failure by hand and leaked a staff row with no login.
  *
  * External doctors get a specialist only — they aren't employed.
  */
@@ -364,82 +407,52 @@ specialistsApp.post('/onboard', async (c) => {
       )
     }
 
+    // The address in the one form it is stored and compared in (F21).
+    const contactEmail = body.contactEmail ? normalizeEmail(body.contactEmail) : null
+
     // Email uniqueness is checked up-front rather than left to the unique
     // index, so a collision is a clean 409 instead of a rolled-back transaction.
-    if (body.contactEmail) {
-      const existing = await db.query.user.findFirst({
-        where: eq(user.email, body.contactEmail),
-        columns: { id: true },
-      })
-      if (existing) return c.json({ error: 'Email already exists in the system' }, 409)
+    // Compared lower-cased: "Henry@…" and "henry@…" are one person.
+    if (contactEmail && (await isEmailTaken(db, contactEmail))) {
+      return c.json({ error: 'Email already exists in the system' }, 409)
     }
 
-    if (isInternal && body.password && !body.contactEmail) {
+    if (isInternal && body.password && !contactEmail) {
       return c.json({ error: 'An email is required to create sign-in credentials.' }, 400)
     }
 
-    const now = new Date()
     const result = await db.transaction(async (tx) => {
       let linkedUserId: string | null = null
 
       // Internal doctors sign in (portal for clinical work, Team app for
       // payslips). External ones don't — they're a billing record only.
-      if (isInternal && body.password && body.contactEmail) {
-        linkedUserId = crypto.randomUUID()
-        await tx.insert(user).values({
-          id: linkedUserId,
+      if (isInternal && body.password && contactEmail) {
+        // Guarded by `isInternal` above, so this login always belongs to a
+        // practising doctor: createDoctorLogin gives it the doctor role, inside the
+        // same transaction as the specialist and staff rows (an account with no
+        // role signs in to an empty portal), and the PORTAL scope only — an
+        // unconditional Team-app override here once defeated the doctor role's
+        // portal-only policy for every doctor onboarded through HR.
+        linkedUserId = await createDoctorLogin(tx, {
           name: body.name,
-          email: body.contactEmail,
-          phone: body.contactPhone || null,
-          emailVerified: true,
-          // Guarded by `isInternal` above, so this login always belongs to a
-          // practising doctor. Assigning the role here — inside the same
-          // transaction as the specialist and staff rows — is what makes the
-          // onboarding complete. Previously it created an account with no role,
-          // so the doctor could sign in to an empty portal until someone
-          // separately assigned "doctor" in Access Management.
-          role: 'doctor',
-          roleId: 'doctor',
-          banned: false,
-          createdAt: now,
-          updatedAt: now,
+          email: contactEmail,
+          phone: body.contactPhone,
+          password: body.password,
+          portalAccess: body.portalAccess ?? true,
+          grantedById: authUser.id,
         })
-        await tx.insert(account).values({
-          id: crypto.randomUUID(),
-          accountId: linkedUserId,
-          providerId: 'credential',
-          userId: linkedUserId,
-          password: await hashPassword(body.password),
-          createdAt: now,
-          updatedAt: now,
-        })
-        // Portal only. This previously wrote `pwa: granted: true` unconditionally
-        // — not behind a toggle — so every doctor onboarded through HR received
-        // a per-user override granting Team access. Since checkScope consults
-        // per-user rows BEFORE role scopes, that silently defeated the doctor
-        // role's ['portal']-only policy for every doctor in the clinic.
-        await tx.insert(userScopes).values([
-          {
-            userId: linkedUserId,
-            interfaceScope: 'portal',
-            granted: body.portalAccess ?? true,
-            grantedById: authUser.id,
-            createdAt: now,
-            updatedAt: now,
-          },
-        ])
       }
 
-      // Staff IDs are sequential, so generate inside the tx — a concurrent
-      // create would otherwise be able to claim the same number.
-      const staffId = isInternal ? await generateSpecialistStaffId(tx) : undefined
+      // Staff IDs are sequential: chosen inside the transaction, behind the lock that makes a
+      // concurrent create wait (lib/staff-id.ts).
+      const staffId = isInternal ? await nextStaffId(tx) : undefined
 
       // Nests as a SAVEPOINT inside this transaction.
       return onboardDoctor(tx as unknown as Parameters<typeof onboardDoctor>[0], {
         specialistType: body.specialistType,
         name: body.name,
         specialty: body.specialty ?? null,
-        contactEmail: body.contactEmail ?? null,
+        contactEmail,
         contactPhone: body.contactPhone ?? null,
         tin: body.tin ?? null,
         profileImage: body.profileImage ?? null,
@@ -467,11 +480,71 @@ specialistsApp.post('/onboard', async (c) => {
 
     return c.json({ success: true, data: result })
   } catch (error) {
+    // Someone registered this address between the lookup above and the insert.
+    if (isUniqueViolation(error, 'user_email_unique')) {
+      return c.json({ error: 'Email already exists in the system' }, 409)
+    }
     logError(error, { context: '[specialists] onboard' })
     const message = error instanceof Error ? error.message : 'Failed to onboard doctor'
     // The rate guards in onboardDoctor throw plain Errors with usable copy.
     if (/percentage between/.test(message)) return c.json({ error: message }, 400)
     return c.json({ error: 'Failed to onboard doctor' }, 500)
+  }
+})
+
+/**
+ * Give an existing specialist a portal login (external → internal, or an
+ * internal one that never got a password). See grantDoctorLogin for why this is
+ * its own action rather than part of PATCH.
+ */
+specialistsApp.post('/:id/grant-login', async (c) => {
+  const authUser = await getCurrentUser(c)
+  if (!authUser) return c.json({ error: 'Not authenticated' }, 401)
+  // Minting credentials and an employment record is the create-side
+  // privilege; it also edits an existing record, so both are required.
+  if (
+    !(await checkPermission(c, authUser.id, MODULE as string, ACTIONS.UPDATE as string)) ||
+    !(await checkPermission(c, authUser.id, MODULE as string, ACTIONS.CREATE as string))
+  )
+    return c.json({ error: 'Unauthorized' }, 403)
+
+  const { id } = c.req.param()
+  if (!z.string().uuid().safeParse(id).success) return c.json({ error: 'Not found' }, 404)
+
+  const parsed = GrantLoginSchema.safeParse(await c.req.json().catch(() => ({})))
+  if (!parsed.success) {
+    const first = parsed.error.issues[0]
+    return c.json({ error: `${first?.path.join('.') || 'payload'}: ${first?.message}` }, 400)
+  }
+
+  const db = getDb(process.env.DATABASE_URL!)
+  try {
+    const before = await db.query.specialists.findFirst({ where: eq(specialists.id, id) })
+    const result = await grantDoctorLogin(db, {
+      specialistId: id,
+      ...parsed.data,
+      grantedById: authUser.id,
+    })
+
+    const after = await db.query.specialists.findFirst({ where: eq(specialists.id, id) })
+    // The password is never part of what's recorded.
+    await recordDiffAudit(db, {
+      userId: authUser.id,
+      action: 'update',
+      module: MODULE as string,
+      entityId: id,
+      entityName: after?.name ?? before?.name ?? id,
+      before: before ?? null,
+      after: after ?? null,
+      reason: 'Granted portal login',
+    })
+    return c.json({ success: true, data: { ...result, specialist: after } })
+  } catch (error) {
+    if (error instanceof GrantLoginError) {
+      return c.json({ error: error.message, code: error.code }, error.status)
+    }
+    logError(error, { context: '[specialists] grant-login' })
+    return c.json({ error: 'Failed to grant login' }, 500)
   }
 })
 
@@ -492,10 +565,59 @@ specialistsApp.patch('/:id', async (c) => {
   const before = await db.query.specialists.findFirst({ where: eq(specialists.id, id) })
   if (!before) return c.json({ error: 'Not found' }, 404)
 
+  // The contact address is stored in the one form addresses are compared in (F21). For a
+  // specialist who HAS a login it is the address they sign in with, which this screen cannot
+  // change: writing a different one here left the billing record saying one thing and the login
+  // another, with nothing to show the admin they had not fixed the login (F48). Only the login's
+  // own address is accepted.
+  let contactEmailPatch: string | null | undefined
+  if (body.contactEmail !== undefined) {
+    contactEmailPatch = body.contactEmail?.trim() ? normalizeEmail(body.contactEmail) : null
+    const loginEmail = before.userId ? await loginEmailOf(db, before.userId) : null
+    if (loginEmail && contactEmailPatch !== normalizeEmail(loginEmail)) {
+      return c.json(
+        {
+          error: `This specialist signs in with ${loginEmail}. Their contact address follows it and can't be changed here.`,
+          code: 'SIGN_IN_EMAIL_LOCKED',
+        },
+        400
+      )
+    }
+  }
+
+  // Internal vs external is not a label. Internal means an employment record
+  // and a login; flipping the column here changed the label and created
+  // neither, leaving a specialist that claimed to be internal and couldn't sign
+  // in. Becoming internal goes through POST /:id/grant-login, which makes both.
+  if (body.specialistType !== undefined && body.specialistType !== before.specialistType) {
+    return c.json(
+      {
+        error:
+          'Specialist type cannot be changed by editing. To make an external specialist internal, use "Grant portal login" on their Access tab.',
+        code: 'SPECIALIST_TYPE_LOCKED',
+      },
+      400
+    )
+  }
+
+  // Activation is not a plain column edit: it suspends/restores the login too,
+  // and deactivating is the delete-side privilege. Handle it here so PATCH can't
+  // be used to dodge either.
+  const { isActive, ...fields } = body
+  if (isActive !== undefined && isActive !== before.isActive) {
+    if (
+      !isActive &&
+      !(await checkPermission(c, user.id, MODULE as string, ACTIONS.DELETE as string))
+    )
+      return c.json({ error: 'Unauthorized' }, 403)
+    await setSpecialistActive(db, id, isActive)
+  }
+
   const [updated] = await db
     .update(specialists)
     .set({
-      ...body,
+      ...fields,
+      ...(contactEmailPatch !== undefined ? { contactEmail: contactEmailPatch } : {}),
       defaultCommissionRate:
         body.defaultCommissionRate !== undefined ? Number(body.defaultCommissionRate) : undefined,
       withholdingTaxRate:
@@ -504,6 +626,11 @@ specialistsApp.patch('/:id', async (c) => {
     })
     .where(eq(specialists.id, id))
     .returning()
+
+  // The doctor row appointments point at shows the specialist's specialty; keep it in step (F47).
+  if (body.specialty !== undefined && (body.specialty ?? null) !== (before.specialty ?? null)) {
+    await syncDoctorSpecialty(db, id)
+  }
 
   await recordDiffAudit(db, {
     userId: user.id,
@@ -526,15 +653,25 @@ specialistsApp.delete('/:id', async (c) => {
     return c.json({ error: 'Unauthorized' }, 403)
 
   const { id } = c.req.param()
+  if (!z.string().uuid().safeParse(id).success) return c.json({ error: 'Not found' }, 404)
   const db = getDb(process.env.DATABASE_URL!)
 
-  const [updated] = await db
-    .update(specialists)
-    .set({ isActive: false, updatedAt: new Date() })
-    .where(eq(specialists.id, id))
-    .returning()
+  // Deactivating also suspends the linked login and ends its sessions — see
+  // lib/specialist-status.ts for why the flag alone is not enough.
+  const result = await setSpecialistActive(db, id, false)
+  if (!result) return c.json({ error: 'Not found' }, 404)
 
-  if (!updated) return c.json({ error: 'Not found' }, 404)
+  const updated = await db.query.specialists.findFirst({ where: eq(specialists.id, id) })
+  await recordDiffAudit(db, {
+    userId: user.id,
+    action: 'update',
+    module: MODULE as string,
+    entityId: id,
+    entityName: updated?.name ?? id,
+    before: null,
+    after: { isActive: false, loginSuspended: result.loginChanged },
+    reason: 'Deactivated specialist',
+  })
   return c.json({ success: true, data: updated })
 })
 

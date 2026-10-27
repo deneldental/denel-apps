@@ -30,7 +30,6 @@ type Form = {
   contactEmail: string
   contactPhone: string
   tin: string
-  specialistType: 'internal' | 'external'
   defaultCommissionRate: string
   withholdingTaxRate: string
 }
@@ -42,7 +41,6 @@ function toForm(s: Specialist): Form {
     contactEmail: s.contactEmail ?? '',
     contactPhone: s.contactPhone ?? '',
     tin: s.tin ?? '',
-    specialistType: s.specialistType === 'external' ? 'external' : 'internal',
     defaultCommissionRate: String(s.defaultCommissionRate ?? 0),
     withholdingTaxRate: String(s.withholdingTaxRate ?? 0),
   }
@@ -56,6 +54,8 @@ function toForm(s: Specialist): Form {
  *   • the login — a specialist's user account, role and scopes are managed in
  *     Access Management, so this sheet can't quietly change who can sign in;
  *   • active/inactive — deactivating is a separate, consequential action;
+ *   • the type — internal vs external isn't a label: becoming internal means a
+ *     login, which only "Grant portal login" creates;
  *   • payout account details — a structured blob with its own editor.
  *
  * Commission and withholding are percentages; the backend rejects anything
@@ -85,6 +85,12 @@ export function EditSpecialistSheet({
 
   const set = <K extends keyof Form>(k: K, v: Form[K]) => setForm((f) => ({ ...f, [k]: v }))
 
+  // A specialist with a login signs in with one address, and this screen cannot change it: the
+  // field shows that address as it is rather than offering an edit that would leave the login
+  // untouched (F48). The server refuses a different one too.
+  const hasLogin = !!specialist.userId
+  const signInEmail = specialist.signInEmail ?? specialist.contactEmail ?? ''
+
   // No shared query-key group exists for the specialties lookup — local
   // literal, module-scoped.
   const { data: specialties = [] } = useApiQuery(
@@ -95,7 +101,7 @@ export function EditSpecialistSheet({
 
   function validate(): string | null {
     if (!form.name.trim()) return 'Name is required.'
-    if (form.contactEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.contactEmail))
+    if (!hasLogin && form.contactEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.contactEmail))
       return 'That email address looks invalid.'
     for (const [label, v] of [
       ['Commission rate', form.defaultCommissionRate],
@@ -118,10 +124,10 @@ export function EditSpecialistSheet({
     const res = await updateSpecialist(specialist.id, {
       name: form.name.trim(),
       specialty: form.specialty === UNSET ? null : form.specialty,
-      contactEmail: form.contactEmail.trim() || null,
+      // Not sent for someone with a login: it follows the address they sign in with.
+      ...(hasLogin ? {} : { contactEmail: form.contactEmail.trim() || null }),
       contactPhone: form.contactPhone.trim() || null,
       tin: form.tin.trim() || null,
-      specialistType: form.specialistType,
       defaultCommissionRate:
         form.defaultCommissionRate === '' ? 0 : Number(form.defaultCommissionRate),
       withholdingTaxRate: form.withholdingTaxRate === '' ? 0 : Number(form.withholdingTaxRate),
@@ -173,30 +179,37 @@ export function EditSpecialistSheet({
           </div>
 
           <div className="space-y-1.5">
-            <Label htmlFor="ed-type">Type</Label>
-            <Select
-              value={form.specialistType}
-              onValueChange={(v) => set('specialistType', v as Form['specialistType'])}
-            >
-              <SelectTrigger id="ed-type">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="internal">Internal — works for the clinic</SelectItem>
-                <SelectItem value="external">External — visiting provider</SelectItem>
-              </SelectContent>
-            </Select>
+            <Label>Type</Label>
+            <p className="text-sm" data-testid="specialist-type">
+              {specialist.specialistType === 'internal'
+                ? 'Internal — works for the clinic'
+                : 'External — visiting provider'}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {specialist.specialistType === 'internal'
+                ? 'The type is fixed once set.'
+                : 'To give an external specialist a portal login, use "Grant portal login" on the Access tab. That is what makes them internal.'}
+            </p>
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-1.5">
-              <Label htmlFor="ed-email">Email</Label>
-              <Input
-                id="ed-email"
-                type="email"
-                value={form.contactEmail}
-                onChange={(e) => set('contactEmail', e.target.value)}
-              />
+              <Label htmlFor="ed-email">{hasLogin ? 'Sign-in email' : 'Email'}</Label>
+              {hasLogin ? (
+                <>
+                  <Input id="ed-email" type="email" value={signInEmail} readOnly disabled />
+                  <p className="text-xs text-muted-foreground">
+                    This is the address they sign in with. It can't be changed from here.
+                  </p>
+                </>
+              ) : (
+                <Input
+                  id="ed-email"
+                  type="email"
+                  value={form.contactEmail}
+                  onChange={(e) => set('contactEmail', e.target.value)}
+                />
+              )}
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="ed-phone">Phone</Label>

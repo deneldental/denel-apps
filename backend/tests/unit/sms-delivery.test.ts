@@ -45,6 +45,8 @@ const BASE_ENV: Record<string, string | undefined> = {
   APP_ENV: undefined,
   TRUSTED_IP_MODE: undefined,
   PRIVATE_FILE_REF_SECRET: undefined,
+  PORTAL_URL: undefined,
+  PATIENT_PORTAL_URL: undefined,
   SMS_REDIRECT_PHONE: undefined,
   SMS_STUB_FILE: undefined,
   HUBTEL_CLIENT_ID: undefined,
@@ -56,6 +58,8 @@ const PRODUCTION = {
   APP_ENV: 'production',
   TRUSTED_IP_MODE: 'off',
   PRIVATE_FILE_REF_SECRET: 'test-file-ref-secret-at-least-32-characters',
+  PORTAL_URL: 'https://portal.deneldental.com',
+  PATIENT_PORTAL_URL: 'https://app.deneldental.com',
 }
 
 const CARD: HubtelCard = {

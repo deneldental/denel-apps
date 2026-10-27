@@ -58,11 +58,14 @@ export function MonthView({
 
   const monthStart = startOfMonth(date)
   const monthEnd = endOfMonth(date)
-  const startDate = startOfWeek(monthStart)
-  const endDate = endOfWeek(monthEnd)
+  // [Medium] Was Sunday-start (date-fns default) while the sidebar's
+  // week-strip uses Monday-start (weekStartsOn: 1) — two different
+  // definitions of "this week" visible on the same page.
+  const startDate = startOfWeek(monthStart, { weekStartsOn: 1 })
+  const endDate = endOfWeek(monthEnd, { weekStartsOn: 1 })
 
   const calendarDays = eachDayOfInterval({ start: startDate, end: endDate })
-  const weekDays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+  const weekDays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
   const [daySheetOpen, setDaySheetOpen] = useState(false)
   const [daySheetDate, setDaySheetDate] = useState<Date | null>(null)

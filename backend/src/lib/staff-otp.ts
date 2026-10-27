@@ -108,7 +108,9 @@ export async function requestStaffOtp(
     try {
       const branding = await getBranding().catch(() => null)
       const brandShort = branding?.shortName ?? 'Denel'
-      const result = await sendSMS([{ phone, message: smsBody(code, purpose, brandShort) }])
+      const result = await sendSMS([
+        { phone, message: smsBody(code, purpose, brandShort), sensitive: true },
+      ])
       if (!result.success) {
         logError(new Error('OTP SMS dispatch failed'), {
           context: '[staff-otp] sendSMS',

@@ -1,4 +1,5 @@
-import { and, asc, count, desc, eq, inArray, or } from 'drizzle-orm'
+import { Money } from '@denel/utils'
+import { and, asc, count, desc, eq, inArray, isNull, or } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { z } from 'zod'
 import { getDb } from '../db'
@@ -19,19 +20,26 @@ import { errMessage } from '../lib/error-message'
 import { recalculatePlanBalances } from '../lib/ledger-utils'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
+import { sendPaymentConfirmationSms } from '../lib/payment-confirmation-sms'
+import { sendPaymentReceiptSms } from '../lib/payment-receipt-sms'
 import {
   applyCreditToInvoice,
   type CreatePaymentInput,
   createDraftPayment,
   getPatientsWithCredit,
+  type LegacyPaymentSource,
   postPayment,
   postRefund,
   recordLegacyPayment,
   reversePayment,
 } from '../lib/payment-service'
+import {
+  type ParsedPaymentSource,
+  PaymentInputError,
+  parsePaymentSources,
+} from '../lib/payment-sources'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
-import { sendSMS } from '../lib/sms'
-import { resolveSmsTemplate } from '../lib/sms-templates'
+import { buildTreatmentFallbackAllocation } from '../lib/receipt-allocations'
 import type { HonoEnv } from '../lib/types'
 
 const paymentsApp = new Hono<HonoEnv>()
@@ -268,12 +276,22 @@ paymentsApp.get('/:id/receipt', async (c) => {
     // Sibling payments in the same split (if any). The receipt represents the
     // whole group, not just the clicked row, so wallet+cash split shows as
     // "Payment Method 1: wallet 500 | Payment Method 2: cash 200".
+    // A group is one patient's payment; an older row of another patient in it is not this receipt's.
     const siblingPayments = payment.paymentGroupId
       ? await db
           .select()
           .from(payments)
-          .where(eq(payments.paymentGroupId, payment.paymentGroupId))
-          .orderBy(asc(payments.createdAt))
+          .where(
+            and(
+              eq(payments.paymentGroupId, payment.paymentGroupId),
+              payment.patientId
+                ? eq(payments.patientId, payment.patientId)
+                : isNull(payments.patientId)
+            )
+          )
+          // A split is recorded in one transaction, so its rows share a creation time: the payment
+          // number (taken in order) is what keeps Method 1 before Method 2.
+          .orderBy(asc(payments.createdAt), asc(payments.paymentNumber))
       : [payment]
 
     // Patient (for cardholder name).
@@ -363,15 +381,23 @@ paymentsApp.get('/:id/receipt', async (c) => {
       }
     }
     const allocations = [...aggByInvoice.values()]
-    const unallocatedAmount = siblingPayments.reduce(
-      (s, p) => s + Number(p.unallocatedAmount ?? 0),
-      0
-    )
+    // A reversed payment is no longer money the patient has paid, nor credit they hold: the
+    // receipt counts the payments still in force and reports the rest as reversed.
+    const inForce = siblingPayments.filter((p) => p.status !== 'reversed')
+    const reversedAmount = siblingPayments
+      .filter((p) => p.status === 'reversed')
+      .reduce((s, p) => s + Number(p.amount), 0)
+    const unallocatedAmount = inForce.reduce((s, p) => s + Number(p.unallocatedAmount ?? 0), 0)
 
     // "Service" label = aggregated treatment names across all allocated
     // invoices. Falls back to legacy `payment.treatments` JSONB, then free-
     // text description for older / non-allocated payments.
-    const legacyTreatments = Array.isArray(payment.treatments) ? payment.treatments : []
+    // A split stores what it was for once, on its first payment: take it from whichever payment of
+    // the group carries it.
+    const itemised = siblingPayments.find(
+      (p) => Array.isArray(p.treatments) && p.treatments.length > 0
+    )
+    const legacyTreatments = Array.isArray(itemised?.treatments) ? itemised.treatments : []
     const allTreatmentNames = allocations.flatMap((a) => a.treatments)
     const paymentFor =
       allTreatmentNames.length > 0
@@ -384,13 +410,16 @@ paymentsApp.get('/:id/receipt', async (c) => {
       ? new Date(appointment.date).toLocaleString()
       : undefined
 
-    const totalPaid = siblingPayments.reduce((s, p) => s + Number(p.amount), 0)
+    const totalPaid = inForce.reduce((s, p) => s + Number(p.amount), 0)
     const methods = siblingPayments.map((p) => ({
       method: p.method,
       amount: Number(p.amount),
       reference: p.externalReference ?? null,
       paymentNumber: p.paymentNumber ?? null,
+      status: p.status,
     }))
+    const receiptStatus =
+      reversedAmount === 0 ? payment.status : inForce.length === 0 ? 'reversed' : 'partly_reversed'
     // Reference shown on the slip = the invoice number(s) this payment
     // settled, plus the underlying payment numbers for audit. The frontend
     // can pick which to display.
@@ -449,12 +478,25 @@ paymentsApp.get('/:id/receipt', async (c) => {
       }
     }
 
+    // A one-time payment pays no invoice, so it has no invoice lines to itemise. Its items live on
+    // the payment itself; list them without inventing an invoice. `invoiceNumbers`, `totalAmount`
+    // and `balance` above come from the real allocations only.
+    const receiptAllocations =
+      allocations.length > 0
+        ? allocations
+        : (() => {
+            const fallback = buildTreatmentFallbackAllocation(legacyTreatments, totalPaid)
+            return fallback ? [fallback] : allocations
+          })()
+
     return c.json({
       success: true,
       data: {
         patientName: patient?.name ?? 'Unknown Patient',
         appointmentDate,
         amountPaid: totalPaid,
+        status: receiptStatus,
+        ...(reversedAmount > 0 ? { reversedAmount } : {}),
         totalAmount,
         balance,
         // Legacy single-method field kept for back-compat; new UI reads `methods`.
@@ -465,7 +507,7 @@ paymentsApp.get('/:id/receipt', async (c) => {
         paymentNumber: payment.paymentNumber ?? null,
         paymentNumbers,
         invoiceNumbers,
-        allocations,
+        allocations: receiptAllocations,
         unallocatedAmount,
         clinicName,
         clinicPhone,
@@ -479,6 +521,30 @@ paymentsApp.get('/:id/receipt', async (c) => {
     return c.json({ error: 'Failed to fetch payment receipt' }, 500)
   }
 })
+
+/**
+ * A payment may name the visit it is for — a walk-in, which is already checked in
+ * (F33), or a plan payment at check-in. Naming only links it; nothing is checked in.
+ * The visit must exist and be this patient's: an unknown id reached the foreign key (a
+ * raw 500, or the SQL in the error text on the draft route), and another patient's
+ * visit was linked without complaint (F33, F41). Returns the problem, or null.
+ */
+async function visitProblem(
+  db: ReturnType<typeof getDb>,
+  appointmentId: unknown,
+  patientId: unknown
+): Promise<string | null> {
+  if (appointmentId == null || appointmentId === '') return null
+  if (!z.string().uuid().safeParse(appointmentId).success) return 'Invalid appointmentId'
+  const [visit] = await db
+    .select({ patientId: appointments.patientId })
+    .from(appointments)
+    .where(eq(appointments.id, appointmentId as string))
+    .limit(1)
+  if (!visit) return 'That visit does not exist'
+  if (visit.patientId !== patientId) return 'That visit belongs to another patient'
+  return null
+}
 
 paymentsApp.post('/', async (c) => {
   const user = await getCurrentUser(c)
@@ -497,17 +563,41 @@ paymentsApp.post('/', async (c) => {
     // the Phase-3 service so every payment writes a balanced JE. The request
     // and response shapes stay backward-compatible for the existing portal
     // dialogs; R6 migrates those dialogs to the explicit /draft + /:id/post flow.
+    //
+    // G03: the body is either the one-method shape (`amount` + `method`) or `sources`, a list of
+    // `{ method, amount }` that splits one payment across several methods (e.g. part cash, part
+    // card). The list replaces the pair, so sending both is a mistake, not a choice for us to make.
     if (!data.patientId) return c.json({ error: 'patientId is required' }, 400)
-    if (data.amount === undefined || Number(data.amount) <= 0)
-      return c.json({ error: 'amount must be a positive number' }, 400)
-    if (!data.method) return c.json({ error: 'method is required' }, 400)
+    let sources: ParsedPaymentSource[] | undefined
+    if (data.sources !== undefined && data.sources !== null) {
+      if (data.amount !== undefined || data.method !== undefined) {
+        return c.json(
+          { error: 'send the methods as sources, or one amount and method, not both' },
+          400
+        )
+      }
+      const parsed = parsePaymentSources(data.sources)
+      if ('error' in parsed) return c.json({ error: parsed.error }, 400)
+      sources = parsed.sources
+    } else {
+      if (data.amount === undefined || Number(data.amount) <= 0)
+        return c.json({ error: 'amount must be a positive number' }, 400)
+      if (!data.method) return c.json({ error: 'method is required' }, 400)
+    }
 
-    const { payment: newItem, targetInvoiceId } = await recordLegacyPayment(
+    // F33: a named visit must exist and be this patient's (see visitProblem).
+    const visitError = await visitProblem(db, data.appointmentId, data.patientId)
+    if (visitError) return c.json({ error: visitError }, 400)
+
+    const { payments: postedPayments, targetInvoiceId } = await recordLegacyPayment(
       db,
       {
         patientId: data.patientId,
-        amount: data.amount,
-        method: data.method,
+        // Methods are admin-defined lookup slugs, so they are cast at this boundary; a split's
+        // methods are checked against the lookup by the service.
+        ...(sources
+          ? { sources: sources as LegacyPaymentSource[] }
+          : { amount: data.amount, method: data.method }),
         paymentDate: data.paymentDate ? new Date(data.paymentDate) : undefined,
         description: data.description ?? null,
         appointmentId: data.appointmentId ?? null,
@@ -520,6 +610,15 @@ paymentsApp.post('/', async (c) => {
       },
       user.id
     )
+
+    // `data` is the first payment, as the one-method shape's answer always was; a split also
+    // answers with every payment and the group they share (null for a single payment).
+    const newItem = postedPayments[0].payment
+    const paymentGroupId = newItem.paymentGroupId ?? null
+    // What was recorded, not what the client said: this number drives the text and the audit entry.
+    const totalAmount = postedPayments
+      .reduce((sum, p) => sum.add(Money.from(p.payment.amount)), Money.zero())
+      .toDbValue()
 
     // SMS balance: for a plan / invoice payment, the outstanding figure is the
     // target invoice's balance after this posting.
@@ -543,57 +642,40 @@ paymentsApp.post('/', async (c) => {
       module: 'payments',
       entityId: newItem.id,
       entityName: patient ? `Payment for ${patient.name}` : 'Payment',
-      changes: data,
+      changes: {
+        ...data,
+        total: totalAmount,
+        paymentGroupId,
+        paymentIds: postedPayments.map((p) => p.payment.id),
+      },
     })
 
-    if (data.sendNotification && data.patientId) {
-      if (patient && (patient.phone || (patient.isChild && patient.guardianPhone))) {
-        // Both are integer CENTS; the SMS shows cedis.
-        const amountGHS = (Number(data.amount) / 100).toFixed(2)
-        const balanceGHS = balance !== null ? (Number(balance) / 100).toFixed(2) : '0.00'
-
-        const descriptionText = data.description || ''
-        const treatmentTypes = descriptionText.split(' - ')[0] || 'Service Payment'
-
-        let message = ''
-        if (data.paymentPlanId) {
-          const template = await resolveSmsTemplate(
-            db,
-            'payment:with_balance',
-            process.env.PAYMENT_PLAN_SMS ||
-              'Dear {Patientname}, thank you for your payment of GHS {amount} for {treatmenttypes}. Your current balance is GHS {balance}. Thank you!'
-          )
-          message = template
-            .replace(/{Patientname}/g, patient.name)
-            .replace(/{amount}/g, amountGHS)
-            .replace(/{treatmenttypes}/g, treatmentTypes)
-            .replace(/{balance}/g, balanceGHS)
-        } else {
-          const template = await resolveSmsTemplate(
-            db,
-            'payment:confirmation',
-            process.env.PAYMENT_SMS ||
-              'Dear {Patientname}, thank you for your payment of GHS {amount} for {treatmenttypes}. Thank you!'
-          )
-          message = template
-            .replace(/{Patientname}/g, patient.name)
-            .replace(/{amount}/g, amountGHS)
-            .replace(/{treatmenttypes}/g, treatmentTypes)
-        }
-
-        const contactPhone =
-          patient.isChild && patient.guardianPhone ? patient.guardianPhone : patient.phone!
-        await sendSMS(
-          [{ phone: contactPhone, message, patientId: patient.id }],
-          undefined,
-          'bulk',
-          user.id
-        )
-      }
+    // The payment is committed by now. A receipt text that fails must NOT turn
+    // that into an error: the cashier would charge again. The helper never
+    // throws; its failure rides along as `smsError` (F31). A split is texted once, for its total.
+    let smsError: string | undefined
+    if (data.sendNotification && data.patientId && patient) {
+      const sms = await sendPaymentReceiptSms(db, {
+        patient,
+        amount: totalAmount,
+        balance,
+        description: data.description,
+        paymentPlanId: data.paymentPlanId,
+        userId: user.id,
+      })
+      smsError = sms.error
     }
 
-    return c.json({ success: true, data: newItem })
+    return c.json({
+      success: true,
+      data: newItem,
+      payments: postedPayments.map((p) => p.payment),
+      paymentGroupId,
+      ...(smsError ? { smsError } : {}),
+    })
   } catch (error: unknown) {
+    // A refusal the sender can fix (a bad list of methods, an unknown method) is shown as written.
+    if (error instanceof PaymentInputError) return c.json({ error: error.message }, 400)
     logError(error, { context: 'Error creating payment' })
     return c.json({ error: 'Failed to create payment' }, 500)
   }
@@ -724,6 +806,9 @@ paymentsApp.post('/draft', async (c) => {
       allocations: body.allocations,
       paymentGroupId: body.paymentGroupId ?? null,
     }
+    // F41: the same rule as POST / — a named visit must exist and be this patient's.
+    const visitError = await visitProblem(db, body.appointmentId, body.patientId)
+    if (visitError) return c.json({ error: visitError }, 400)
     const result = await createDraftPayment(db, input, user.id)
     return c.json({ success: true, data: result.payment })
   } catch (err) {
@@ -733,6 +818,8 @@ paymentsApp.post('/draft', async (c) => {
 })
 
 // POST /api/payments/:id/post — transition draft → posted (writes JE)
+// Body (optional): { sendSms?: boolean } — text the patient a payment confirmation (G08). Send it
+// with the LAST payment of a group: the text names the posted total of the whole group.
 paymentsApp.post('/:id/post', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
@@ -740,6 +827,8 @@ paymentsApp.post('/:id/post', async (c) => {
     return c.json({ error: 'Unauthorized' }, 403)
 
   const { id } = c.req.param()
+  // The body is optional and may be any JSON (or none): read it after the posting, so it must not throw.
+  const body = (await c.req.json().catch(() => null)) as { sendSms?: unknown } | null
   const db = getDb(process.env.DATABASE_URL!)
   try {
     const result = await postPayment(db, id, user.id)
@@ -753,7 +842,13 @@ paymentsApp.post('/:id/post', async (c) => {
       after: { status: result.payment.status, journalEntryId: result.journalEntry.id },
       reason: null,
     })
-    return c.json({ success: true, data: result })
+    // The posting is committed. The text cannot undo it: it never throws, its amount is what was
+    // posted, it goes out at most once per event, and a failure rides along as `smsError` (F31).
+    let smsError: string | undefined
+    if (body?.sendSms === true) {
+      smsError = (await sendPaymentConfirmationSms(db, { paymentId: id, userId: user.id })).error
+    }
+    return c.json({ success: true, data: result, ...(smsError ? { smsError } : {}) })
   } catch (err) {
     logError(err, { context: 'postPayment', paymentId: id })
     return c.json({ error: errMessage(err, 'Failed to post payment') }, 400)

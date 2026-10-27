@@ -66,6 +66,42 @@ export async function createAppointment(
   return res
 }
 
+/** A one-time payment taken as part of the check-in request. Amounts are integer cents. */
+export type CheckInPaymentPayload = {
+  amount: number
+  method: string
+  description?: string
+  treatments?: unknown[]
+  sendNotification?: boolean
+}
+
+/**
+ * Exactly one of the three: take a one-time payment, check in without payment
+ * (with a reason), or check in because the payment was recorded separately (plan
+ * or insurance). `overrideReason` is an admin's reason for a past visit.
+ */
+export type CheckInRequest = (
+  | { payment: CheckInPaymentPayload }
+  | { noPaymentReason: string }
+  | { paymentRecordedElsewhere: true }
+) & { overrideReason?: string }
+
+export type CheckInData = {
+  appointment: Record<string, unknown>
+  payment: { id: string } | null
+  /** True when the visit was already checked in: nothing was changed or charged. */
+  alreadyCheckedIn: boolean
+}
+
+/**
+ * Check a patient in. One server request: the payment (if any), the status change
+ * and the doctor's note either all happen or none do, and repeating it can never
+ * take a second payment.
+ */
+export async function checkInAppointment(id: string, body: CheckInRequest) {
+  return api.post<CheckInData>(`/api/appointment-workflow/${id}/check-in`, body)
+}
+
 export async function updateAppointment(
   id: string,
   data: Partial<typeof appointments.$inferInsert>,

@@ -14,11 +14,17 @@
  *                        window and lastRunAt is from a previous day.
  */
 
-import { isWithinQuietHours } from '@denel/utils'
-import { and, eq, gte, lte, or } from 'drizzle-orm'
+import { CLINIC_TIME_ZONE, isWithinQuietHours } from '@denel/utils'
+import { and, eq, gte, inArray, lte, or } from 'drizzle-orm'
 import { env } from '../config/env'
 import { getDb } from '../db'
-import { appointments, appointmentTypeReminders, patients, scheduledReminders } from '../db/schema'
+import {
+  appointments,
+  appointmentTypeReminderSends,
+  appointmentTypeReminders,
+  patients,
+  scheduledReminders,
+} from '../db/schema'
 import {
   excludesAppointmentTypeNames,
   matchesAppointmentTypeName,
@@ -152,7 +158,7 @@ async function processReminder(
 
 // ── before_appointment (Appointment Types) ──────────────────────────────────
 
-async function processAppointmentTypeReminders(
+export async function processAppointmentTypeReminders(
   db: ReturnType<typeof getDb>,
   now: Date
 ): Promise<void> {
@@ -166,9 +172,9 @@ async function processAppointmentTypeReminders(
 
   if (policies.length === 0) return
 
-  // To avoid duplicate sends within the same 15 minute window, we assume idempotency
-  // based on the window. However, this could double-fire if the scheduler is rerun manually within 15 mins.
-  // The system relies on the strict 15 minute offset matching.
+  // H3 — duplicate sends are prevented by `appointment_type_reminder_sends`
+  // (one row per appointment+policy actually sent), not by assuming the
+  // scheduler never runs twice against the same window. See below.
 
   // Policies are keyed by `appointment_types.id`, but `appointments.type` stores
   // the type NAME — see appointment-type-matching.ts. Translate once for the
@@ -221,7 +227,26 @@ async function processAppointmentTypeReminders(
 
     if (upcoming.length === 0) continue
 
-    const recipients = upcoming
+    // H3 — skip any appointment this exact policy has already sent to. This
+    // is what makes a manual re-run, or two overlapping ticks, safe: without
+    // it, every appointment still inside the window gets a second SMS.
+    const alreadySent = await db
+      .select({ appointmentId: appointmentTypeReminderSends.appointmentId })
+      .from(appointmentTypeReminderSends)
+      .where(
+        and(
+          eq(appointmentTypeReminderSends.policyId, policy.id),
+          inArray(
+            appointmentTypeReminderSends.appointmentId,
+            upcoming.map((r) => r.appointmentId)
+          )
+        )
+      )
+    const alreadySentIds = new Set(alreadySent.map((r) => r.appointmentId))
+    const candidates = upcoming.filter((r) => !alreadySentIds.has(r.appointmentId))
+    if (candidates.length === 0) continue
+
+    const recipients = candidates
       .filter((r) => r.patientPhone)
       .map((r) => ({
         phone: r.patientPhone!,
@@ -231,13 +256,16 @@ async function processAppointmentTypeReminders(
             weekday: 'short',
             day: 'numeric',
             month: 'short',
+            timeZone: CLINIC_TIME_ZONE,
           }),
           appointmentTime: r.appointmentDate.toLocaleTimeString('en-GH', {
             hour: '2-digit',
             minute: '2-digit',
+            timeZone: CLINIC_TIME_ZONE,
           }),
         }),
         patientId: r.patientId,
+        appointmentId: r.appointmentId,
       }))
 
     if (recipients.length === 0) continue
@@ -250,6 +278,16 @@ async function processAppointmentTypeReminders(
       )
       continue
     }
+
+    // Record exactly the appointments actually sent to, so a later tick or a
+    // manual re-run skips them. `onConflictDoNothing` makes this safe even if
+    // two scheduler runs raced past the `alreadySent` check above at the same
+    // instant — the unique index is the real guarantee, this query is just
+    // the fast path.
+    await db
+      .insert(appointmentTypeReminderSends)
+      .values(recipients.map((r) => ({ appointmentId: r.appointmentId, policyId: policy.id })))
+      .onConflictDoNothing()
 
     logger.info(
       { policyId: policy.id, sentCount: recipients.length },
@@ -298,8 +336,13 @@ async function handleOnDate(
           weekday: 'short',
           day: 'numeric',
           month: 'short',
+          timeZone: CLINIC_TIME_ZONE,
         }),
-        time: scheduledAt.toLocaleTimeString('en-GH', { hour: '2-digit', minute: '2-digit' }),
+        time: scheduledAt.toLocaleTimeString('en-GH', {
+          hour: '2-digit',
+          minute: '2-digit',
+          timeZone: CLINIC_TIME_ZONE,
+        }),
         clinicName: branding?.name ?? 'Denel Dental',
       })
       const smsResult = await sendSMS(

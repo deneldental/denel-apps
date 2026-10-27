@@ -46,11 +46,13 @@ vi.mock('../../src/lib/validate-date', () => ({
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
+import { getDb } from '../../src/db'
 import { checkPermission, getCurrentUser } from '../../src/lib/rbac'
 import { appointmentsApp } from '../../src/routes/appointments'
 
 const mockGetCurrentUser = vi.mocked(getCurrentUser)
 const mockCheckPermission = vi.mocked(checkPermission)
+const mockGetDb = vi.mocked(getDb)
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -326,6 +328,66 @@ describe('PATCH /api/appointments/:id', () => {
       body: JSON.stringify({ data: { status: 'checked_in' }, sendSMS: false }),
     })
     expect(res.status).not.toBe(400)
+  })
+
+  // C3 — a terminal appointment (completed/cancelled/no_show) used to accept
+  // any further status change with no guard at all. Pin the fix: rejecting a
+  // status change with 409 before the past-appointment lock or block-time
+  // check ever run.
+  function findFirstReturning(row: Record<string, unknown>) {
+    mockGetDb.mockReturnValue({
+      query: { appointments: { findFirst: vi.fn().mockResolvedValue(row) } },
+    } as unknown as ReturnType<typeof getDb>)
+  }
+
+  it.each([
+    'completed',
+    'cancelled',
+    'no_show',
+  ])('returns 409 when trying to change status away from a terminal %s appointment', async (terminalStatus) => {
+    mockGetCurrentUser.mockResolvedValue(adminUser)
+    mockCheckPermission.mockResolvedValue(true)
+    findFirstReturning({
+      id: 'appt-001',
+      status: terminalStatus,
+      date: new Date('2020-01-01'), // irrelevant here — the terminal check runs first
+    })
+    const res = await makeApp().request('/api/appointments/appt-001', {
+      method: 'PATCH',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ data: { status: 'checked_in' }, sendSMS: false }),
+    })
+    expect(res.status).toBe(409)
+    const body = (await res.json()) as { code: string }
+    expect(body.code).toBe('APPOINTMENT_TERMINAL')
+  })
+
+  it('does not block a non-status edit to a terminal appointment', async () => {
+    mockGetCurrentUser.mockResolvedValue(adminUser)
+    mockCheckPermission.mockResolvedValue(true)
+    findFirstReturning({
+      id: 'appt-001',
+      status: 'completed',
+      date: new Date(), // today — avoids the separate past-appointment lock
+    })
+    const res = await makeApp().request('/api/appointments/appt-001', {
+      method: 'PATCH',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ data: { notes: 'fixed a typo' }, sendSMS: false }),
+    })
+    expect(res.status).not.toBe(409)
+  })
+
+  it('still allows a real transition between two non-terminal statuses', async () => {
+    mockGetCurrentUser.mockResolvedValue(adminUser)
+    mockCheckPermission.mockResolvedValue(true)
+    findFirstReturning({ id: 'appt-001', status: 'scheduled', date: new Date() })
+    const res = await makeApp().request('/api/appointments/appt-001', {
+      method: 'PATCH',
+      headers: csrfHeaders(),
+      body: JSON.stringify({ data: { status: 'checked_in' }, sendSMS: false }),
+    })
+    expect(res.status).not.toBe(409)
   })
 })
 

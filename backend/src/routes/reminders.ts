@@ -22,6 +22,9 @@ remindersApp.get('/payment/cooldown-status', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
 
+  if (!(await checkPermission(c, user.id, MODULES.SMS as string, ACTIONS.READ as string)))
+    return c.json({ error: 'Unauthorized' }, 403)
+
   const phonesParam = c.req.query('phones') ?? ''
   const phones = phonesParam
     .split(',')

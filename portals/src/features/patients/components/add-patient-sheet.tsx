@@ -41,6 +41,7 @@ import { useFormDirtyGuard } from '@/shared/hooks/use-form-dirty-guard'
 import { useInsuranceCompanies } from '@/shared/hooks/use-insurance-companies'
 import { useSubmitGuard } from '@/shared/hooks/use-submit-guard'
 import { surfaceApiError } from '@/shared/lib/api-error'
+import { localDateISO } from '@/shared/lib/dates'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -78,7 +79,8 @@ export function AddPatientSheet({ onCreated, trigger }: AddPatientSheetProps) {
   // backend from isChild; treatment-derived tags apply later).
   const [tagIds, setTagIds] = useState<string[]>([])
   const [tagCatalog, setTagCatalog] = useState<PatientTag[]>([])
-  const { companies: insuranceCompanies } = useInsuranceCompanies(open)
+  const { companies: insuranceCompanies, isLoading: insuranceCompaniesLoading } =
+    useInsuranceCompanies(open)
   const [insuranceProvider, setInsuranceProvider] = useState('')
   const [insurancePolicyNumber, setInsurancePolicyNumber] = useState('')
 
@@ -111,11 +113,17 @@ export function AddPatientSheet({ onCreated, trigger }: AddPatientSheetProps) {
     },
   })
 
+  // [Medium] Math.abs() used to flip a future DOB's negative time-since-epoch
+  // into a plausible-looking positive age instead of flagging the mistake —
+  // a future date silently previewed as if it were a real age. A future date
+  // now returns null (blank preview) instead of a wrong number. `max` on the
+  // date inputs below additionally stops most future dates from ever being
+  // picked in the first place, matching add-patient-dialog.tsx's convention.
   const calculateAge = (dobString: string) => {
     if (!dobString) return null
     const dob = new Date(dobString)
-    const age = new Date(Date.now() - dob.getTime())
-    return Math.abs(age.getUTCFullYear() - 1970)
+    const ageYears = new Date(Date.now() - dob.getTime()).getUTCFullYear() - 1970
+    return ageYears < 0 ? null : ageYears
   }
 
   function reset() {
@@ -373,6 +381,7 @@ export function AddPatientSheet({ onCreated, trigger }: AddPatientSheetProps) {
                           <Input
                             id="child-dob"
                             type="date"
+                            max={localDateISO()}
                             value={childDob}
                             onChange={(e) => setChildDob(e.target.value)}
                             required
@@ -425,6 +434,9 @@ export function AddPatientSheet({ onCreated, trigger }: AddPatientSheetProps) {
                                 <Select
                                   value={insuranceProvider}
                                   onValueChange={setInsuranceProvider}
+                                  disabled={
+                                    !insuranceCompaniesLoading && insuranceCompanies.length === 0
+                                  }
                                 >
                                   <SelectTrigger>
                                     <SelectValue placeholder="Select provider" />
@@ -437,6 +449,14 @@ export function AddPatientSheet({ onCreated, trigger }: AddPatientSheetProps) {
                                     ))}
                                   </SelectContent>
                                 </Select>
+                                {/* [Medium] The dropdown used to just open empty with no
+                                    explanation while marked required. */}
+                                {!insuranceCompaniesLoading && insuranceCompanies.length === 0 && (
+                                  <p className="text-xs text-muted-foreground">
+                                    No insurance providers configured yet — add one in Settings →
+                                    Insurance.
+                                  </p>
+                                )}
                               </div>
                               <div className="space-y-1.5">
                                 <Label>
@@ -528,6 +548,7 @@ export function AddPatientSheet({ onCreated, trigger }: AddPatientSheetProps) {
                         id="dob"
                         name="dob"
                         type="date"
+                        max={localDateISO()}
                         value={adultDob}
                         onChange={(e) => setAdultDob(e.target.value)}
                         required
@@ -570,7 +591,13 @@ export function AddPatientSheet({ onCreated, trigger }: AddPatientSheetProps) {
                             <Label>
                               Insurance Provider <span className="text-destructive">*</span>
                             </Label>
-                            <Select value={insuranceProvider} onValueChange={setInsuranceProvider}>
+                            <Select
+                              value={insuranceProvider}
+                              onValueChange={setInsuranceProvider}
+                              disabled={
+                                !insuranceCompaniesLoading && insuranceCompanies.length === 0
+                              }
+                            >
                               <SelectTrigger>
                                 <SelectValue placeholder="Select provider" />
                               </SelectTrigger>
@@ -582,6 +609,12 @@ export function AddPatientSheet({ onCreated, trigger }: AddPatientSheetProps) {
                                 ))}
                               </SelectContent>
                             </Select>
+                            {!insuranceCompaniesLoading && insuranceCompanies.length === 0 && (
+                              <p className="text-xs text-muted-foreground">
+                                No insurance providers configured yet — add one in Settings →
+                                Insurance.
+                              </p>
+                            )}
                           </div>
                           <div className="space-y-1.5">
                             <Label>

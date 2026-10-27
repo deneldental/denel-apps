@@ -7,13 +7,14 @@ import { getPatientsPage, type PatientTagCount } from '@/lib/actions/patients'
 import { useLoading } from '@/lib/loading-context'
 import { useApiQuery } from '@/lib/query'
 import { queryKeys } from '@/lib/query-keys'
+import { Tabs, TabsList, TabsTrigger } from '@/shared/components/ui/tabs'
 import { usePermissions } from '@/shared/hooks/use-permissions'
 
 const DEFAULT_PAGE_SIZE = 25
 
 export default function PatientsPage() {
   const queryClient = useQueryClient()
-  const { hasPermission, isLoading: permissionsLoading } = usePermissions()
+  const { hasPermission, isAdmin, isLoading: permissionsLoading } = usePermissions()
   const isClinicalUser =
     hasPermission('medical_records', 'read') && !hasPermission('appointments', 'create')
   const canCreate = hasPermission('patients', 'create')
@@ -32,6 +33,16 @@ export default function PatientsPage() {
   }, [searchParams])
   const _tagKey = tagIds.join(',')
 
+  // C5 — Active/Archived view, mirrored in the URL (`?view=archived`).
+  const view: 'active' | 'archived' =
+    searchParams.get('view') === 'archived' ? 'archived' : 'active'
+  function handleViewChange(next: string) {
+    const params = new URLSearchParams(searchParams)
+    if (next === 'archived') params.set('view', 'archived')
+    else params.delete('view')
+    setSearchParams(params)
+  }
+
   // Debounce search to avoid hammering the server while the admin types.
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search.trim()), 300)
@@ -46,13 +57,14 @@ export default function PatientsPage() {
       return
     }
     setPageIndex(0)
-  }, [debouncedSearch, _tagKey])
+  }, [debouncedSearch, _tagKey, view])
 
   const filters = {
     limit: pageSize,
     offset: pageIndex * pageSize,
     q: debouncedSearch || undefined,
     tagIds: tagIds.length > 0 ? tagIds : undefined,
+    archived: view === 'archived',
   }
 
   // Wrap `getPatientsPage`'s `{ data, total, tagCounts }` shape into a single
@@ -93,6 +105,16 @@ export default function PatientsPage() {
     queryClient.invalidateQueries({ queryKey: queryKeys.patients.all })
   }
 
+  // [Medium] Archiving/restoring/permanently-deleting a patient used to leave
+  // them visible in the list until a manual reload — the row action called
+  // the API directly, bypassing useApiMutation's cache invalidation, and this
+  // page never wired a reload callback either. Every cached patients page
+  // (both Active and Archived views) is invalidated so the row disappears
+  // from wherever it's currently being viewed.
+  function handlePatientListChanged() {
+    queryClient.invalidateQueries({ queryKey: queryKeys.patients.all })
+  }
+
   const pageCount = useMemo(
     () => Math.max(1, Math.ceil(total / Math.max(1, pageSize))),
     [total, pageSize]
@@ -112,8 +134,16 @@ export default function PatientsPage() {
         {canCreate && <AddPatientSheet onCreated={handlePatientCreated} />}
       </div>
 
+      <Tabs value={view} onValueChange={handleViewChange}>
+        <TabsList>
+          <TabsTrigger value="active">Active</TabsTrigger>
+          <TabsTrigger value="archived">Archived</TabsTrigger>
+        </TabsList>
+      </Tabs>
+
       <PatientTable
         data={rows}
+        onReload={handlePatientListChanged}
         manualPagination
         pageIndex={pageIndex}
         pageSize={pageSize}
@@ -130,6 +160,8 @@ export default function PatientsPage() {
         tagIds={tagIds}
         onTagIdsChange={handleTagIdsChange}
         tagCounts={tagCounts}
+        view={view}
+        isAdmin={isAdmin}
       />
     </div>
   )

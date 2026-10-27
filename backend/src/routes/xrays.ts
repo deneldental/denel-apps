@@ -14,6 +14,7 @@ import { patients, xrayRecords, xrayShareAccessLog, xrayShareLinks, xrayTypes } 
 import { createAuditLog } from '../lib/audit'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
+import { portalLink } from '../lib/public-urls'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import type { HonoEnv } from '../lib/types'
 import { autoChargeXray, getXrayDailySummary } from '../lib/xray-charge-service'
@@ -369,8 +370,8 @@ xraysApp.post('/share', async (c) => {
     },
   })
 
-  const baseUrl = process.env.PORTAL_URL ?? 'https://app.deneldental.com'
-  const shareUrl = `${baseUrl}/xray-share/${linkToken}`
+  // /xray-share/:token is a page of the clinic portal (not of the patient app).
+  const shareUrl = portalLink(`/xray-share/${linkToken}`)
 
   return c.json({
     success: true,

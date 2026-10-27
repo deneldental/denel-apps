@@ -1,24 +1,19 @@
-import { Loader2, Trash2 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Loader2 } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
-import { getServiceMatrix, getServices, type ServiceMatrix } from '@/lib/actions/services'
 import { createEstimate, createStandaloneEstimate } from '@/lib/actions/worklist'
-import type { ApiResponse } from '@/lib/api-client'
-import { api } from '@/lib/api-client'
-import { useApiQuery } from '@/lib/query'
-import { queryKeys } from '@/lib/query-keys'
 import { PatientPicker } from '@/shared/components/patient-picker'
+import {
+  computeServiceLinesTotal,
+  previewServiceLine,
+  type ServiceLine,
+  ServiceLinesEditor,
+  serviceLinesNeedSurchargeConfirm,
+  useServiceCatalog,
+} from '@/shared/components/service-lines-editor'
 import { Button } from '@/shared/components/ui/button'
 import { DeleteConfirmationDialog } from '@/shared/components/ui/delete-confirmation-dialog'
-import { Input } from '@/shared/components/ui/input'
 import { Label } from '@/shared/components/ui/label'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/shared/components/ui/select'
 import {
   Sheet,
   SheetContent,
@@ -30,110 +25,10 @@ import { Textarea } from '@/shared/components/ui/textarea'
 import { inputToCents } from '@/shared/utils/currency'
 import { ghs } from './shared'
 
-/**
- * Local key for the "load an existing draft estimate for editing" compound
- * fetch (invoice + a getServiceMatrix call per line). Not the canonical
- * invoice-detail resource — it resolves a component-specific shape — so it
- * does not reuse `queryKeys.invoices.detail`.
- */
-const estimateEditKey = (estimateInvoiceId: string) =>
-  ['activity', 'estimate-edit', estimateInvoiceId] as const
-
-type ServiceOption = {
-  id: string
-  name: string
-  amount: number
-  category: string
-  discountEligible?: boolean
-}
-
-interface EstimateLine {
-  key: string
-  serviceId: string
-  name: string
-  baseAmount: number
-  matrix: ServiceMatrix | null
-  variantName: string // '' = none
-  toothClassId: string // '' = Any
-  quantity: number
-  discountEligible: boolean
-  surchargeType: 'none' | 'percent' | 'amount'
-  surchargeValue: number
-  discountType: 'none' | 'percent' | 'amount'
-  discountValue: number
-  discountReason: string
-}
-
-const ANY = '__any__'
-
-/** A surcharge more than doubling the line — likely a fat-fingered value
- *  (500 instead of 50, 500% instead of 50%) rather than an intentional one. */
-const SURCHARGE_CONFIRM_RATIO = 1
-
-/** Client-side mirror of the backend matrix resolver — for the live preview.
- *  Order mirrors `computeLine` on the backend: surcharge applies to the
- *  catalog subtotal first, then discount nets against the surcharged gross. */
-function preview(line: EstimateLine): {
-  unitPrice: number
-  quantity: number
-  surchargeAmount: number
-  discountAmount: number
-  needsConfirm: boolean
-} {
-  const m = line.matrix
-
-  let unitPrice: number
-  let qty: number
-  if (!m || m.cells.length === 0) {
-    unitPrice = line.baseAmount
-    qty = line.quantity
-  } else {
-    const active = m.cells.filter((c) => c.isActive)
-    const v = line.variantName || null
-    const t = line.toothClassId || null
-    const cell =
-      active.find((c) => (c.variantName ?? null) === v && (c.toothClassId ?? null) === t) ??
-      active.find((c) => (c.variantName ?? null) === v && c.toothClassId == null) ??
-      active.find((c) => c.variantName == null && (c.toothClassId ?? null) === t) ??
-      active.find((c) => c.variantName == null && c.toothClassId == null) ??
-      null
-    unitPrice = cell ? Number(cell.price) : line.baseAmount
-    const scope = m.scope
-    qty = line.quantity
-    if (!scope || scope.quantityMode === 'single') qty = 1
-    else if (scope.maxQuantity != null && qty > scope.maxQuantity) qty = scope.maxQuantity
-    if (qty < 1) qty = 1
-  }
-
-  const subtotal = unitPrice * qty
-  const surchargeAmount =
-    line.surchargeType === 'percent'
-      ? Math.round((subtotal * line.surchargeValue) / 100)
-      : line.surchargeType === 'amount'
-        ? inputToCents(line.surchargeValue)
-        : 0
-  const gross = subtotal + surchargeAmount
-  const discountAmount =
-    line.discountType === 'percent'
-      ? Math.round((gross * line.discountValue) / 100)
-      : line.discountType === 'amount'
-        ? Math.min(inputToCents(line.discountValue), gross)
-        : 0
-
-  return {
-    unitPrice,
-    quantity: qty,
-    surchargeAmount,
-    discountAmount,
-    needsConfirm: subtotal > 0 && surchargeAmount > subtotal * SURCHARGE_CONFIRM_RATIO,
-  }
-}
-
 interface Props {
   appointmentId?: string
   patientId?: string
   patientName?: string
-  estimateInvoiceId?: string | null
   planId?: string
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -149,13 +44,12 @@ export function CreateEstimateSheet({
   appointmentId,
   patientId,
   patientName,
-  estimateInvoiceId,
   planId,
   open,
   onOpenChange,
   onCreated,
 }: Props) {
-  const [lines, setLines] = useState<EstimateLine[]>([])
+  const [lines, setLines] = useState<ServiceLine[]>([])
   const [note, setNote] = useState('')
   const [visitFrequency, setVisitFrequency] = useState<'single' | 'multiple'>('single')
   const [saving, setSaving] = useState(false)
@@ -167,116 +61,16 @@ export function CreateEstimateSheet({
     }
   }, [open, patientId])
 
-  const servicesQuery = useApiQuery(
-    queryKeys.services.list({ activeOnly: true }),
-    () => getServices({ activeOnly: true }),
-    { enabled: open }
-  )
-  const services = useMemo(() => {
-    const rows = (servicesQuery.data as ServiceOption[] | undefined) ?? []
-    return rows
-      .filter((s) => s.category !== 'insurance')
-      .sort((a, b) => a.name.localeCompare(b.name))
-  }, [servicesQuery.data])
-
-  // Loads an existing draft estimate for editing: fetch the invoice, then
-  // resolve the pricing matrix for each of its lines.
-  const editQuery = useApiQuery(
-    estimateEditKey(estimateInvoiceId ?? ''),
-    async (): Promise<
-      ApiResponse<{ lines: EstimateLine[]; visitFrequency: 'single' | 'multiple' }>
-    > => {
-      const res = await api.get<any>(`/api/invoices/${estimateInvoiceId}`)
-      if (!res.success || !res.data?.lines) {
-        return { success: false, error: res.error || 'Failed to load estimate' }
-      }
-      const invLines = res.data.lines
-      const loadedLines = await Promise.all(
-        invLines.map(async (l: any, i: number) => {
-          const mRes = await getServiceMatrix(l.serviceId)
-          return {
-            key: `${l.serviceId}-${i}`,
-            serviceId: l.serviceId,
-            name: l.description || '',
-            baseAmount: Number(l.unitPrice) || 0,
-            matrix: mRes.success ? (mRes.data ?? null) : null,
-            variantName: l.variantName || '',
-            toothClassId: l.toothClassId || '',
-            quantity: Number(l.quantity) || 1,
-            discountEligible: true, // Legacy lines might not have it, default true
-            discountType: 'none' as const,
-            discountValue: 0,
-            discountReason: '',
-          }
-        })
-      )
-      return {
-        success: true,
-        // The note field is currently mapped to invoice.description conceptually, or could be empty
-        // depending on how it was saved.
-        data: { lines: loadedLines, visitFrequency: res.data.visitFrequency || 'single' },
-      }
-    },
-    { enabled: open && !!estimateInvoiceId }
-  )
+  const services = useServiceCatalog(open)
 
   useEffect(() => {
     if (!open) {
       setLines([])
       setNote('')
-      return
     }
-    if (estimateInvoiceId && editQuery.data) {
-      setLines(editQuery.data.lines)
-      setVisitFrequency(editQuery.data.visitFrequency)
-    }
-  }, [open, estimateInvoiceId, editQuery.data])
+  }, [open])
 
-  const addService = useCallback(
-    async (serviceId: string) => {
-      const svc = services.find((s) => s.id === serviceId)
-      if (!svc || lines.some((l) => l.serviceId === serviceId)) return
-      const key = `${serviceId}-${lines.length}`
-      setLines((prev) => [
-        ...prev,
-        {
-          key,
-          serviceId,
-          name: svc.name,
-          baseAmount: Number(svc.amount) || 0,
-          matrix: null,
-          variantName: '',
-          toothClassId: '',
-          quantity: 1,
-          discountEligible: svc.discountEligible ?? false,
-          surchargeType: 'none',
-          surchargeValue: 0,
-          discountType: 'none',
-          discountValue: 0,
-          discountReason: '',
-        },
-      ])
-      const res = await getServiceMatrix(serviceId)
-      if (res.success && res.data) {
-        setLines((prev) =>
-          prev.map((l) => (l.serviceId === serviceId ? { ...l, matrix: res.data ?? null } : l))
-        )
-      }
-    },
-    [services, lines]
-  )
-
-  const setLine = (key: string, patch: Partial<EstimateLine>) =>
-    setLines((prev) => prev.map((l) => (l.key === key ? { ...l, ...patch } : l)))
-
-  const total = useMemo(
-    () =>
-      lines.reduce((sum, l) => {
-        const p = preview(l)
-        return sum + Math.max(0, p.unitPrice * p.quantity + p.surchargeAmount - p.discountAmount)
-      }, 0),
-    [lines]
-  )
+  const total = useMemo(() => computeServiceLinesTotal(lines), [lines])
 
   const [confirmSurchargeOpen, setConfirmSurchargeOpen] = useState(false)
 
@@ -285,7 +79,7 @@ export function CreateEstimateSheet({
       toast.error('Add at least one service')
       return
     }
-    if (lines.some((l) => preview(l).needsConfirm)) {
+    if (serviceLinesNeedSurchargeConfirm(lines)) {
       setConfirmSurchargeOpen(true)
       return
     }
@@ -309,7 +103,7 @@ export function CreateEstimateSheet({
       serviceId: l.serviceId,
       variantName: l.variantName || null,
       toothClassId: l.toothClassId || null,
-      quantity: preview(l).quantity,
+      quantity: previewServiceLine(l).quantity,
       surcharge:
         l.surchargeType !== 'none' && l.surchargeValue > 0
           ? {
@@ -372,241 +166,7 @@ export function CreateEstimateSheet({
             </div>
           )}
 
-          <div className="space-y-1.5">
-            <Label>Add service</Label>
-            <Select value="" onValueChange={addService}>
-              <SelectTrigger>
-                <SelectValue placeholder="Add a service from the catalog…" />
-              </SelectTrigger>
-              <SelectContent>
-                {services.map((s) => (
-                  <SelectItem
-                    key={s.id}
-                    value={s.id}
-                    disabled={lines.some((l) => l.serviceId === s.id)}
-                  >
-                    {s.name} · {ghs(s.amount)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          {lines.length === 0 ? (
-            <p className="rounded-md border border-dashed py-6 text-center text-sm text-muted-foreground">
-              No services added yet.
-            </p>
-          ) : (
-            <div className="space-y-2">
-              {lines.map((line) => {
-                const p = preview(line)
-                const m = line.matrix
-                const hasVariants = (m?.variants.length ?? 0) > 0
-                const hasClass = m?.cells.some((c) => c.toothClassId) ?? false
-                const multiQty = m?.scope?.quantityMode === 'multi'
-                return (
-                  <div key={line.key} className="rounded-lg border p-3">
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="min-w-0">
-                        <p className="truncate font-medium">{line.name}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {ghs(p.unitPrice)} × {p.quantity} = {ghs(p.unitPrice * p.quantity)}
-                          {p.surchargeAmount > 0 && (
-                            <span
-                              className={
-                                p.needsConfirm
-                                  ? 'ml-1 font-medium text-destructive'
-                                  : 'ml-1 text-blue-600'
-                              }
-                            >
-                              · surcharge: +{ghs(p.surchargeAmount)}
-                            </span>
-                          )}
-                          {p.discountAmount > 0 && (
-                            <span className="ml-1 text-orange-600">
-                              · discount: -{ghs(p.discountAmount)}
-                            </span>
-                          )}
-                        </p>
-                      </div>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-8 w-8 shrink-0"
-                        onClick={() => setLines((prev) => prev.filter((l) => l.key !== line.key))}
-                        aria-label="Remove"
-                      >
-                        <Trash2 className="h-4 w-4 text-destructive" />
-                      </Button>
-                    </div>
-
-                    {(hasVariants || hasClass || multiQty) && (
-                      <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
-                        {hasVariants && (
-                          <div className="space-y-1">
-                            <Label className="text-[11px]">Variant</Label>
-                            <Select
-                              value={line.variantName || ANY}
-                              onValueChange={(v) =>
-                                setLine(line.key, { variantName: v === ANY ? '' : v })
-                              }
-                            >
-                              <SelectTrigger className="h-8">
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value={ANY}>Default</SelectItem>
-                                {m?.variants.map((v) => (
-                                  <SelectItem key={v} value={v}>
-                                    {v}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                          </div>
-                        )}
-                        {hasClass && (
-                          <div className="space-y-1">
-                            <Label className="text-[11px]">Tooth class</Label>
-                            <Select
-                              value={line.toothClassId || ANY}
-                              onValueChange={(v) =>
-                                setLine(line.key, { toothClassId: v === ANY ? '' : v })
-                              }
-                            >
-                              <SelectTrigger className="h-8">
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value={ANY}>Any</SelectItem>
-                                {m?.toothClasses.map((tc) => (
-                                  <SelectItem key={tc.id} value={tc.id}>
-                                    {tc.displayName}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                          </div>
-                        )}
-                        {multiQty && (
-                          <div className="space-y-1">
-                            <Label className="text-[11px]">
-                              Qty{m?.scope?.maxQuantity ? ` (max ${m.scope.maxQuantity})` : ''}
-                            </Label>
-                            <Input
-                              type="number"
-                              min="1"
-                              max={m?.scope?.maxQuantity ?? undefined}
-                              value={line.quantity}
-                              onChange={(e) =>
-                                setLine(line.key, {
-                                  quantity: Math.max(1, Number(e.target.value) || 1),
-                                })
-                              }
-                              className="h-8"
-                            />
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    <div className="mt-2 grid grid-cols-3 gap-2 sm:grid-cols-4 rounded bg-muted/30 p-2">
-                      <div className="space-y-1">
-                        <Label className="text-[11px]">Surcharge Type</Label>
-                        <Select
-                          value={line.surchargeType}
-                          onValueChange={(v: 'none' | 'percent' | 'amount') =>
-                            setLine(line.key, {
-                              surchargeType: v,
-                              surchargeValue: v === 'none' ? 0 : line.surchargeValue,
-                            })
-                          }
-                        >
-                          <SelectTrigger className="h-8">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="none">None</SelectItem>
-                            <SelectItem value="percent">Percent (%)</SelectItem>
-                            <SelectItem value="amount">Amount (GHS)</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      {line.surchargeType !== 'none' && (
-                        <div className="space-y-1 sm:col-span-3">
-                          <Label className="text-[11px]">Value</Label>
-                          <Input
-                            type="number"
-                            min="0"
-                            value={line.surchargeValue}
-                            onChange={(e) =>
-                              setLine(line.key, {
-                                surchargeValue: Math.max(0, Number(e.target.value) || 0),
-                              })
-                            }
-                            className="h-8"
-                          />
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="mt-2 grid grid-cols-3 gap-2 sm:grid-cols-4 rounded bg-muted/30 p-2">
-                      <div className="space-y-1">
-                        <Label className="text-[11px]">Discount Type</Label>
-                        <Select
-                          value={line.discountType}
-                          onValueChange={(v: 'none' | 'percent' | 'amount') =>
-                            setLine(line.key, {
-                              discountType: v,
-                              discountValue: v === 'none' ? 0 : line.discountValue,
-                            })
-                          }
-                        >
-                          <SelectTrigger className="h-8">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="none">None</SelectItem>
-                            <SelectItem value="percent">Percent (%)</SelectItem>
-                            <SelectItem value="amount">Amount (GHS)</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      {line.discountType !== 'none' && (
-                        <>
-                          <div className="space-y-1">
-                            <Label className="text-[11px]">Value</Label>
-                            <Input
-                              type="number"
-                              min="0"
-                              value={line.discountValue}
-                              onChange={(e) =>
-                                setLine(line.key, {
-                                  discountValue: Math.max(0, Number(e.target.value) || 0),
-                                })
-                              }
-                              className="h-8"
-                            />
-                          </div>
-                          <div className="space-y-1 sm:col-span-2">
-                            <Label className="text-[11px]">Reason (optional)</Label>
-                            <Input
-                              value={line.discountReason}
-                              onChange={(e) =>
-                                setLine(line.key, { discountReason: e.target.value })
-                              }
-                              className="h-8"
-                              placeholder="e.g. VIP"
-                            />
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-          )}
+          <ServiceLinesEditor services={services} lines={lines} setLines={setLines} />
 
           <div className="space-y-1.5">
             <Label>Note (optional)</Label>

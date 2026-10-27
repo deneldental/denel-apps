@@ -1,4 +1,4 @@
-import { api } from '@/lib/api-client'
+import { type ApiResponse, api } from '@/lib/api-client'
 import type { paymentPlans } from '@/lib/db/schema'
 
 export async function getPaymentPlanByPatientId(patientId: string) {
@@ -107,19 +107,84 @@ export async function getArchivedPaymentPlansByPatient(patientId: string) {
   return api.get<any[]>(`/api/payment-plans/patient/${patientId}/archived`)
 }
 
-export async function getOverduePaymentPlans() {
-  const res = await api.get<any[]>('/api/payment-plans/overdue')
+/**
+ * Plans marked overdue AND outstanding (the dashboard card and the reminders page want both).
+ * Pass `status` to get one kind only; the Payments page's Overdue tab does.
+ */
+export async function getOverduePaymentPlans(status?: 'overdue' | 'outstanding') {
+  const res = await api.get<any[]>(
+    status ? `/api/payment-plans/overdue?status=${status}` : '/api/payment-plans/overdue'
+  )
   return res.data || []
 }
 
 export async function getOutstandingPaymentPlans() {
-  const res = await api.get<any[]>('/api/payment-plans/overdue')
+  const res = await api.get<any[]>('/api/payment-plans/outstanding')
   return res.data || []
 }
 
-export async function getPaymentPlanDetails(id: string) {
-  const res = await api.get<any>(`/api/payment-plans/${id}`)
-  return res.data
+/** One payment in a plan's history. Amounts are integer cents. */
+export interface PaymentPlanHistoryPayment {
+  id: string
+  paymentNumber: string | null
+  paymentDate: string | null
+  createdAt: string
+  method: string
+  /** 'posted' counts toward what has been received; 'reversed' is shown for the record. */
+  status: 'posted' | 'reversed'
+  /** The whole payment. */
+  amount: number
+  /** The part of it applied to this plan's invoices. */
+  appliedToPlan: number
+  description: string | null
+  paymentGroupId: string | null
+}
+
+/** `GET /api/payment-plans/:id`. Amounts are integer cents. */
+export interface PaymentPlanDetail {
+  id: string
+  planNumber: string | null
+  patientId: string
+  type: string
+  scheduleType: string | null
+  status: string
+  archived: boolean
+  startDate: string
+  endDate: string | null
+  notes: string | null
+  originalAmount: number
+  discountAmount: number
+  totalAmount: number
+  amountPerInstallment: number | null
+  numberOfInstallments: number | null
+  paymentFrequency: string | null
+  installmentPeriod: string | null
+  createdAt: string
+  patient: {
+    id: string
+    name: string
+    phone: string | null
+    email: string | null
+    patientId: string | null
+    isChild: boolean
+    guardianPhone: string | null
+  }
+  /** The master invoice, or null for an old plan that only has per-installment invoices. */
+  invoice: {
+    id: string
+    invoiceNumber: string
+    status: string
+    total: number
+    paidAmount: number
+    balance: number
+  } | null
+  /** `paid` is the sum of POSTED allocations to the plan's invoices; `balance` what the master invoice still owes. */
+  totals: { total: number; paid: number; balance: number }
+  payments: PaymentPlanHistoryPayment[]
+}
+
+export async function getPaymentPlanDetails(id: string): Promise<ApiResponse<PaymentPlanDetail>> {
+  return api.get<PaymentPlanDetail>(`/api/payment-plans/${id}`)
 }
 
 export async function updatePaymentAmount(paymentId: string, newAmount: number) {

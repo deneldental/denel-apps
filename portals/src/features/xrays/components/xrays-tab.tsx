@@ -98,6 +98,7 @@ export function XraysTab({ patientId, canEdit = true }: Props) {
     setUploading(true)
     try {
       const up = await uploadFile(selectedFile, {
+        storageCategory: 'patient_records',
         folder: 'xrays',
         subfolder: patientId,
         profile: 'image',

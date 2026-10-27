@@ -19,7 +19,23 @@ import {
 interface AcceptPaymentSheetProps {
   open: boolean
   onOpenChange: (open: boolean) => void
-  onSuccess?: () => void
+  /**
+   * Fires when a payment form finishes. `checkedIn` is true when the payment was
+   * taken by a check-in request (a one-time payment at check-in), which already
+   * checked the patient in; otherwise the caller still has the check-in to do.
+   */
+  onSuccess?: (info?: { checkedIn?: boolean }) => void
+  /**
+   * The visit this payment is for, at check-in. Passed to the payment forms so any
+   * payment taken names its visit.
+   */
+  appointmentId?: string
+  /**
+   * A visit that is already checked in (a walk-in). Any payment taken NAMES it, but no
+   * check-in is attempted: the check-in request would refuse a visit that is already
+   * checked in and take no money (F33). Do not combine with `appointmentId`.
+   */
+  linkAppointmentId?: string
   /** When provided, the patient is locked to this id — the payment form renders
    *  a read-only patient readout instead of its picker. Used from the Today-tab
    *  check-in flow, where the patient is already known. */
@@ -60,6 +76,8 @@ export function AcceptPaymentSheet({
   open,
   onOpenChange,
   onSuccess,
+  appointmentId,
+  linkAppointmentId,
   presetPatientId,
   showNoPaymentOption = false,
   onNoPayment,
@@ -93,10 +111,10 @@ export function AcceptPaymentSheet({
     setPaymentType(null)
   }
 
-  const handleChildSuccess = () => {
+  const handleChildSuccess = (info?: { checkedIn?: boolean }) => {
     setStage('select-type')
     setPaymentType(null)
-    onSuccess?.()
+    onSuccess?.(info)
   }
 
   // Stage 2 — delegate to the payment forms. Each is a sheet of its own, so the
@@ -108,9 +126,11 @@ export function AcceptPaymentSheet({
         <PlanPaymentSheet
           open={open}
           onOpenChange={onOpenChange}
-          onSuccess={handleChildSuccess}
+          onSuccess={() => handleChildSuccess()}
           onBack={handleBackToTypes}
           presetPatientId={presetPatientId}
+          // The plan form only ever names the visit on its payments; it never checks in.
+          appointmentId={appointmentId ?? linkAppointmentId}
         />
       )
     }
@@ -119,7 +139,7 @@ export function AcceptPaymentSheet({
         <InsuranceClaimSheet
           open={open}
           onOpenChange={onOpenChange}
-          onSuccess={handleChildSuccess}
+          onSuccess={() => handleChildSuccess()}
           onBack={handleBackToTypes}
           presetPatientId={presetPatientId}
         />
@@ -132,6 +152,8 @@ export function AcceptPaymentSheet({
         onSuccess={handleChildSuccess}
         onBack={handleBackToTypes}
         presetPatientId={presetPatientId}
+        appointmentId={appointmentId}
+        linkAppointmentId={linkAppointmentId}
       />
     )
   }

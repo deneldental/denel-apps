@@ -5,6 +5,7 @@ import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
 import { CreateEstimateSheet } from '@/features/activity/components/create-estimate-sheet'
 import { api } from '@/lib/api-client'
+import { useCan } from '@/lib/permissions-context'
 import { cn } from '@/lib/utils'
 import {
   AlertDialog,
@@ -158,6 +159,8 @@ const PLAN_STATUS_BORDER: Record<string, string> = {
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function ClinicalTreatmentsTab() {
+  // F38: offer "New Estimate" only where the server will accept it.
+  const canCreateEstimate = useCan('estimates', 'create')
   const [tab, setTab] = useState<EntityTab>('estimates')
   const [filters, setFilters] = useState<Record<EntityTab, TabState>>({
     estimates: { ...DEFAULT_TAB_STATE },
@@ -437,10 +440,12 @@ export function ClinicalTreatmentsTab() {
         )}
 
         <div className="flex-1" />
-        <Button size="sm" className="h-8 gap-1.5" onClick={() => setPickerOpen(true)}>
-          <Plus className="h-3.5 w-3.5" />
-          New Estimate
-        </Button>
+        {canCreateEstimate && (
+          <Button size="sm" className="h-8 gap-1.5" onClick={() => setPickerOpen(true)}>
+            <Plus className="h-3.5 w-3.5" />
+            New Estimate
+          </Button>
+        )}
       </div>
 
       {/* Table */}

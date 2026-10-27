@@ -48,6 +48,8 @@ export interface ApproveAdminFields {
   salaryBand?: string
   role?: string
   scopes?: string[]
+  /** Required when the role signs in to the portal or HR app (e-mail + password). */
+  initialPassword?: string
 }
 
 /** Generate a one-time 24h invite link. Returns { path } to prefix with the Team origin. */

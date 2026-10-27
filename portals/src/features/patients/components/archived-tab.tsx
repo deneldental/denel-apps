@@ -48,6 +48,13 @@ import { formatCurrencyCompact } from '@/shared/utils/currency'
 interface ArchivedTabProps {
   patientId: string
   isAdmin: boolean
+  // [Medium] Restoring (or permanently deleting) an archived invoice/plan
+  // used to only invalidate this tab's own query — the sibling Ledger tab
+  // and its Outstanding Balance kept showing stale figures until a manual
+  // reload. The reverse direction (archiving, from patient-ledger-tab.tsx's
+  // own mutations) already called the ledger's refetch; this brings restore
+  // and permanent-delete in line with it.
+  onRefresh?: () => void | Promise<void>
 }
 
 type ArchivedPlan = {
@@ -83,7 +90,7 @@ type Row =
 type DeleteTarget = { kind: 'invoice' | 'plan'; id: string; label: string }
 type TypeFilter = 'all' | 'invoice' | 'plan'
 
-export function ArchivedTab({ patientId, isAdmin }: ArchivedTabProps) {
+export function ArchivedTab({ patientId, isAdmin, onRefresh }: ArchivedTabProps) {
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('all')
 
@@ -114,18 +121,20 @@ export function ArchivedTab({ patientId, isAdmin }: ArchivedTabProps) {
 
   const unarchiveInvoiceMutation = useApiMutation((id: string) => unarchiveInvoice(id), {
     invalidates: [ARCHIVED_KEY],
+    onSuccess: () => onRefresh?.(),
   })
   const unarchivePlanMutation = useApiMutation((id: string) => unarchivePaymentPlan(id), {
     invalidates: [ARCHIVED_KEY],
+    onSuccess: () => onRefresh?.(),
   })
   const deleteInvoiceMutation = useApiMutation(
     (vars: { id: string; password: string }) => permanentlyDeleteInvoice(vars.id, vars.password),
-    { invalidates: [ARCHIVED_KEY] }
+    { invalidates: [ARCHIVED_KEY], onSuccess: () => onRefresh?.() }
   )
   const deletePlanMutation = useApiMutation(
     (vars: { id: string; password: string }) =>
       permanentlyDeletePaymentPlan(vars.id, vars.password),
-    { invalidates: [ARCHIVED_KEY] }
+    { invalidates: [ARCHIVED_KEY], onSuccess: () => onRefresh?.() }
   )
 
   // Build one unified row list from both sources, then filter by type. Sorted

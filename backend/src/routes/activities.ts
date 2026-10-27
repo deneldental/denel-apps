@@ -14,14 +14,36 @@ import {
 } from '../lib/activity-completions-service'
 import { ACTIONS, MODULES } from '../lib/modules'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
+import { type AccessRule, denyUnless } from '../lib/route-access'
 import type { HonoEnv } from '../lib/types'
 
 export const activitiesApp = new Hono<HonoEnv>()
+
+// The worklist is the front desk's and the clinic's: whoever works appointments, patients or the
+// reminders. Not the Team app, not the HR app.
+const WORKLIST_READ: AccessRule = {
+  apps: ['portal'],
+  anyOf: [
+    [MODULES.APPOINTMENTS, ACTIONS.READ],
+    [MODULES.PATIENTS, ACTIONS.READ],
+    [MODULES.MESSAGING, ACTIONS.READ],
+  ],
+}
+const WORKLIST_WRITE: AccessRule = {
+  apps: ['portal'],
+  anyOf: [
+    [MODULES.APPOINTMENTS, ACTIONS.UPDATE],
+    [MODULES.PATIENTS, ACTIONS.UPDATE],
+    [MODULES.MESSAGING, ACTIONS.UPDATE],
+  ],
+}
 
 // POST /complete — mark an activity item done (idempotent per item)
 activitiesApp.post('/complete', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, WORKLIST_WRITE)
+  if (denied) return denied
   const body = (await c.req.json().catch(() => ({}))) as {
     activityType?: string
     refId?: string
@@ -44,6 +66,8 @@ activitiesApp.post('/complete', async (c) => {
 activitiesApp.get('/completed', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, WORKLIST_READ)
+  if (denied) return denied
   const db = getDb(process.env.DATABASE_URL!)
   const result = await listCompletions(db, {
     limit: Number.parseInt(c.req.query('limit') || '25', 10),

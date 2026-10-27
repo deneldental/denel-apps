@@ -1,5 +1,0 @@
-{
-  "summary": "Comprehensive audit of all lookup fields across the entire Framada Portals application and backend, detailing 22 generic lookups, 11 dedicated route lookups, and 25+ hardcoded UI select fields, accompanied by the design and specification of a unified master lookups.csv schema for one-go bulk import and export.",
-  "updatedAt": "2026-09-13T02:24:44.325130700Z",
-  "userFacing": true
-}

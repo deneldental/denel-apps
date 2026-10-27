@@ -35,7 +35,7 @@ export default function PaymentsPage() {
       {
         queryKey: queryKeys.paymentPlans.overdue(),
         queryFn: async () => {
-          const r = await getOverduePaymentPlans()
+          const r = await getOverduePaymentPlans('overdue')
           return Array.isArray(r) ? r : []
         },
       },

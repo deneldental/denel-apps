@@ -178,6 +178,12 @@ export const user = pgTable('user', {
   // verification unless the device has a valid trust cookie. Set at staff
   // provisioning time.
   twoFactorEnabled: boolean('twoFactorEnabled').default(false).notNull(),
+  // F20 / D8 — set when an admin writes a password for this person; cleared when they
+  // change it themselves. The portal and HR app send a flagged session to the
+  // change-password screen and the backend refuses everything else until then
+  // (rbac/middleware/enforcePasswordChange). Default false: nobody is locked out by the
+  // migration that added it.
+  mustChangePassword: boolean('mustChangePassword').default(false).notNull(),
   createdAt: timestamp('createdAt').notNull(),
   updatedAt: timestamp('updatedAt').notNull(),
 })

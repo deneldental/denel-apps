@@ -93,8 +93,6 @@ const ALLOWED: Record<string, string> = {
     'ghsCompact() explicitly divides cents by 100 for display-only variance card',
 
   // ── cents -> cedis for a text input (plain decimal, no grouping) ───────────
-  'portals/src/features/activity/components/confirm-estimate-sheet.tsx':
-    'seeds a payment input: (cents / 100).toFixed(2)',
   'portals/src/features/appointments/components/check-in-payment-dialog.tsx':
     'validation message quoting the outstanding balance: (cents / 100).toFixed(2)',
   'portals/src/features/credit-notes/components/issue-credit-note-dialog.tsx':

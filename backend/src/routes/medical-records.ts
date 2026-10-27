@@ -13,8 +13,10 @@ import {
 import { createAuditLog, recordDiffAudit } from '../lib/audit'
 import { resolveDoctorIdForUser } from '../lib/doctor-identity'
 import { logError } from '../lib/logger'
+import { ACTIONS, MODULES } from '../lib/modules'
 import { ensurePendingMedicalRecord } from '../lib/pending-medical-record-service'
-import { getCurrentUser } from '../lib/rbac'
+import { checkPermission, getCurrentUser } from '../lib/rbac'
+import { denyUnless } from '../lib/route-access'
 import type { HonoEnv } from '../lib/types'
 
 // ── Zod schemas for medical record write handlers ─────────────────────────────
@@ -56,7 +58,13 @@ const UpdateMedicalRecordSchema = z.object({
 
 const medicalRecordsApp = new Hono<HonoEnv>()
 
-// Helper to check if doctor or admin
+// Delete-only now (see DELETE /:id below) — every other handler in this file
+// went through the RBAC engine via checkPermission() instead. Kept as a
+// hardcoded role check for delete specifically because `medical_records:delete`
+// isn't a grantable permission on ANY bundle today, not even the doctor's own
+// (bundle_clinical_doctor stops at read/create/update) — swapping it to
+// checkPermission would silently take delete away from doctors, a real
+// behaviour change nobody asked for. See project-docs/patient-records-and-scheduling-audit.md C6.
 async function isDoctorOrAdmin(db: any, userId: string): Promise<boolean> {
   const user = await db.query.user.findFirst({
     where: eq(userSchema.id, userId),
@@ -69,8 +77,10 @@ medicalRecordsApp.get('/', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
 
+  if (!(await checkPermission(c, user.id, MODULES.MEDICAL_RECORDS, ACTIONS.READ)))
+    return c.json({ error: 'Unauthorized' }, 403)
+
   const db = getDb(process.env.DATABASE_URL!)
-  if (!(await isDoctorOrAdmin(db, user.id))) return c.json({ error: 'Unauthorized' }, 403)
 
   try {
     const page = Math.max(1, Number.parseInt(c.req.query('page') ?? '1', 10) || 1)
@@ -100,9 +110,10 @@ medicalRecordsApp.post('/', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
 
-  const db = getDb(process.env.DATABASE_URL!)
-  if (!(await isDoctorOrAdmin(db, user.id))) return c.json({ error: 'Unauthorized' }, 403)
+  if (!(await checkPermission(c, user.id, MODULES.MEDICAL_RECORDS, ACTIONS.CREATE)))
+    return c.json({ error: 'Unauthorized' }, 403)
 
+  const db = getDb(process.env.DATABASE_URL!)
   c.set('skipAudit', true)
   try {
     const parsed = CreateMedicalRecordSchema.safeParse(await c.req.json())
@@ -215,9 +226,10 @@ medicalRecordsApp.get('/pending', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
 
-  const db = getDb(process.env.DATABASE_URL!)
-  if (!(await isDoctorOrAdmin(db, user.id))) return c.json({ error: 'Unauthorized' }, 403)
+  if (!(await checkPermission(c, user.id, MODULES.MEDICAL_RECORDS, ACTIONS.READ)))
+    return c.json({ error: 'Unauthorized' }, 403)
 
+  const db = getDb(process.env.DATABASE_URL!)
   try {
     const doctorId = c.req.query('doctorId')
     let targetDoctorId = doctorId
@@ -246,12 +258,18 @@ medicalRecordsApp.get('/pending', async (c) => {
 })
 
 // POST /pending — queue a pending medical record when a patient is checked in
-// (walk-in or scheduled). Auth-only, NOT isDoctorOrAdmin: the front desk checks
-// patients in, so receptionists must be able to create these. Idempotent via the
-// service fn, so a retried/duplicated check-in won't double-queue.
+// (walk-in or scheduled). Needs `appointments:update` (checking a patient in is an appointment
+// action), NOT isDoctorOrAdmin: the front desk checks patients in, so receptionists must be able to
+// create these, and the Team app has no part in it. Idempotent via the service fn, so a
+// retried/duplicated check-in won't double-queue.
 medicalRecordsApp.post('/pending', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, user.id, {
+    apps: ['portal'],
+    anyOf: [[MODULES.APPOINTMENTS, ACTIONS.UPDATE]],
+  })
+  if (denied) return denied
 
   const db = getDb(process.env.DATABASE_URL!)
   try {
@@ -270,9 +288,10 @@ medicalRecordsApp.get('/:id', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
 
-  const db = getDb(process.env.DATABASE_URL!)
-  if (!(await isDoctorOrAdmin(db, user.id))) return c.json({ error: 'Unauthorized' }, 403)
+  if (!(await checkPermission(c, user.id, MODULES.MEDICAL_RECORDS, ACTIONS.READ)))
+    return c.json({ error: 'Unauthorized' }, 403)
 
+  const db = getDb(process.env.DATABASE_URL!)
   const id = c.req.param('id')
   try {
     const record = await db.query.medicalRecords.findFirst({
@@ -291,9 +310,10 @@ medicalRecordsApp.get('/patient/:patientId', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
 
-  const db = getDb(process.env.DATABASE_URL!)
-  if (!(await isDoctorOrAdmin(db, user.id))) return c.json({ error: 'Unauthorized' }, 403)
+  if (!(await checkPermission(c, user.id, MODULES.MEDICAL_RECORDS, ACTIONS.READ)))
+    return c.json({ error: 'Unauthorized' }, 403)
 
+  const db = getDb(process.env.DATABASE_URL!)
   const patientId = c.req.param('patientId')
   try {
     const records = await db.query.medicalRecords.findMany({
@@ -311,9 +331,10 @@ medicalRecordsApp.post('/pending/:id/complete', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
 
-  const db = getDb(process.env.DATABASE_URL!)
-  if (!(await isDoctorOrAdmin(db, user.id))) return c.json({ error: 'Unauthorized' }, 403)
+  if (!(await checkPermission(c, user.id, MODULES.MEDICAL_RECORDS, ACTIONS.UPDATE)))
+    return c.json({ error: 'Unauthorized' }, 403)
 
+  const db = getDb(process.env.DATABASE_URL!)
   const id = c.req.param('id')
   try {
     c.set('skipAudit', true)
@@ -348,9 +369,10 @@ medicalRecordsApp.patch('/:id', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
 
-  const db = getDb(process.env.DATABASE_URL!)
-  if (!(await isDoctorOrAdmin(db, user.id))) return c.json({ error: 'Unauthorized' }, 403)
+  if (!(await checkPermission(c, user.id, MODULES.MEDICAL_RECORDS, ACTIONS.UPDATE)))
+    return c.json({ error: 'Unauthorized' }, 403)
 
+  const db = getDb(process.env.DATABASE_URL!)
   const id = c.req.param('id')
   try {
     const parsed = UpdateMedicalRecordSchema.safeParse(await c.req.json())

@@ -1,12 +1,4 @@
-import {
-  type Dispatch,
-  type SetStateAction,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react'
+import { type Dispatch, type SetStateAction, useCallback, useMemo, useRef, useState } from 'react'
 import { api } from '@/lib/api-client'
 import { useApiMutation, useApiQuery } from '@/lib/query'
 import { queryKeys } from '@/lib/query-keys'
@@ -88,10 +80,17 @@ export function useKvSetting<T>(
     return fromStored ? fromStored(query.data) : mergeStored(d, query.data)
   }, [query.data])
 
+  // Re-seed the draft whenever a new stored value arrives — during render, not in an
+  // effect. An effect committed one render with `loading: false` and `canSave: true`
+  // while the draft still held the defaults, so a save in that render would have
+  // written the defaults over the stored value (F43). Setting state during render
+  // makes React discard that render and redo it before anything is committed.
   const [value, setValue] = useState<T>(defaults)
-  useEffect(() => {
-    if (loaded !== undefined) setValue(loaded)
-  }, [loaded])
+  const [seededFrom, setSeededFrom] = useState<T | undefined>(undefined)
+  if (loaded !== undefined && loaded !== seededFrom) {
+    setSeededFrom(loaded)
+    setValue(loaded)
+  }
 
   const mutation = useApiMutation<void, T>(
     (next) => api.put<void>(`/api/settings/kv/${key}`, { value: next }),

@@ -1,3 +1,4 @@
+import { canDelegateRoleChange } from '@denel/rbac'
 import { and, count, desc, eq, gt, inArray, isNull, like, ne, or, sql } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { getDb } from '../db'
@@ -23,16 +24,79 @@ import type { HonoEnv } from '../lib/types'
 import { resolveUserPermissions } from '../rbac/engine/BundleResolver'
 import { PermissionEngine } from '../rbac/engine/PermissionEngine'
 
-// Valid RBAC roles a staff member can hold. Mirrors the allowlist that used
-// to live inside POST /api/staff before role-assignment moved here.
+// Valid RBAC roles a staff member can hold THROUGH THIS GENERIC ENDPOINT.
+// Mirrors the allowlist that used to live inside POST /api/staff before
+// role-assignment moved here.
+//
+// 'doctor' is deliberately EXCLUDED. It requires a linked `specialists` row
+// (specialty/licence/commission/withholding-tax fields, and the FK target
+// `appointments.doctorId` actually reads) — only the dedicated Portal →
+// Specialists → Add specialist flow creates that row
+// (backend/src/lib/doctor-onboarding.ts, backend/src/routes/specialists.ts).
+// This endpoint only ever writes user.role/roleId, so assigning it here
+// previously produced an account with full clinical permissions that was
+// invisible to the appointment-booking system (GET /api/doctors reads
+// `specialists`, never `user.roleId`) — see project-docs/rbac-doctor-role-desync.md.
+//
+// 'external_trainer' used to be excluded for the same reason. Nothing couples it to a
+// specialist record — it opens the HR app's training authoring and nothing clinical — and
+// excluding it left NO screen able to create one (F52), so an administrator may assign it.
 const VALID_STAFF_ROLES = new Set([
   'admin',
-  'doctor',
   'receptionist',
   'lab_technician',
-  'external_trainer',
+  'hr_admin',
   'staff',
+  'external_trainer',
 ])
+
+/** Roles that exist but must never be set through this endpoint — see above. */
+const SPECIALIST_ONLY_ROLES = new Set(['doctor'])
+
+function invalidRoleMessage(): string {
+  return (
+    `Invalid role. Must be one of: ${[...VALID_STAFF_ROLES].join(', ')} or null. ` +
+    `'doctor' can't be assigned here — it needs a linked specialist record, ` +
+    `created from Portal → Specialists → Add specialist.`
+  )
+}
+
+/**
+ * Who may change a role (decision D15).
+ *
+ *   full       — holds `access_management:update` (administrators): any assignable role, any
+ *                target.
+ *   delegated  — holds `staff:update` but not the above (HR administrators, who run the Add
+ *                Staff wizard): only the everyday roles, and only for people who hold one of
+ *                them or none. Without that second limit "set them to Receptionist" would
+ *                demote an administrator.
+ *
+ * The role list is @denel/rbac's, shared with the HR screens that decide what to offer.
+ */
+type RoleAuthority = 'full' | 'delegated' | null
+
+async function roleAuthority(
+  c: Parameters<typeof checkPermission>[0],
+  userId: string
+): Promise<RoleAuthority> {
+  if (await checkPermission(c, userId, MODULE, ACTIONS.UPDATE)) return 'full'
+  if (await checkPermission(c, userId, MODULES.STAFF as string, ACTIONS.UPDATE)) return 'delegated'
+  return null
+}
+
+/** May a delegated caller move this person to `nextRole`? */
+function delegatedMayChange(
+  target: { roleId: string | null; role: string | null },
+  nextRole: string | null
+): boolean {
+  // `role` is Better Auth's own column; 'admin' there makes someone an administrator even
+  // if `roleId` was never set.
+  return target.role !== 'admin' && canDelegateRoleChange(target.roleId, nextRole)
+}
+
+const DELEGATED_REFUSAL =
+  'Only an administrator can do that. HR administrators can assign Staff, Receptionist and Lab ' +
+  'Technician, and only to people who hold one of those roles or none.'
 
 export const accessManagementApp = new Hono<HonoEnv>()
 
@@ -338,18 +402,24 @@ accessManagementApp.post('/staff/:userId/offboard', async (c) => {
 // record's HR-style role label. HR's POST/PATCH /api/staff intentionally
 // cannot touch role — this is the only writer.
 //
-// Body: { role: 'admin' | 'doctor' | 'receptionist' | 'lab_technician'
-//                | 'external_trainer' | 'staff' | null }
+// Body: { role: 'admin' | 'receptionist' | 'lab_technician' | 'hr_admin'
+//                | 'staff' | 'external_trainer' | null }
+//
+// Administrators may assign any of these; an HR administrator only the everyday three
+// (see `roleAuthority`).
 accessManagementApp.patch('/staff/:userId/role', async (c) => {
   const authUser = await getCurrentUser(c)
   if (!authUser) return c.json({ error: 'Not authenticated' }, 401)
-  if (!(await checkPermission(c, authUser.id, MODULE, ACTIONS.UPDATE)))
-    return c.json({ error: 'Unauthorized' }, 403)
+  const authority = await roleAuthority(c, authUser.id)
+  if (!authority) return c.json({ error: 'Unauthorized' }, 403)
 
   const targetUserId = c.req.param('userId')
   const body = (await c.req.json()) as { role?: string | null }
   const nextRole = body.role === undefined ? null : body.role
 
+  if (nextRole !== null && SPECIALIST_ONLY_ROLES.has(nextRole)) {
+    return c.json({ error: invalidRoleMessage() }, 400)
+  }
   if (nextRole !== null && !VALID_STAFF_ROLES.has(nextRole)) {
     return c.json(
       { error: `Invalid role. Must be one of: ${[...VALID_STAFF_ROLES].join(', ')} or null` },
@@ -365,6 +435,10 @@ accessManagementApp.patch('/staff/:userId/role', async (c) => {
       columns: { id: true, name: true, role: true, roleId: true },
     })
     if (!targetUser) return c.json({ error: 'User not found' }, 404)
+
+    if (authority === 'delegated' && !delegatedMayChange(targetUser, nextRole)) {
+      return c.json({ error: DELEGATED_REFUSAL, code: 'ROLE_REQUIRES_ADMINISTRATOR' }, 403)
+    }
 
     // Self-lockout guard: an admin cannot downgrade themselves if no other
     // admin would remain. Prevents the last admin from accidentally locking
@@ -429,8 +503,8 @@ accessManagementApp.patch('/staff/:userId/role', async (c) => {
 accessManagementApp.post('/staff/bulk-role', async (c) => {
   const authUser = await getCurrentUser(c)
   if (!authUser) return c.json({ error: 'Not authenticated' }, 401)
-  if (!(await checkPermission(c, authUser.id, MODULE, ACTIONS.UPDATE)))
-    return c.json({ error: 'Unauthorized' }, 403)
+  const authority = await roleAuthority(c, authUser.id)
+  if (!authority) return c.json({ error: 'Unauthorized' }, 403)
 
   const body = (await c.req.json().catch(() => ({}))) as {
     userIds?: string[]
@@ -443,6 +517,9 @@ accessManagementApp.post('/staff/bulk-role', async (c) => {
 
   if (userIds.length === 0) return c.json({ error: 'userIds[] is required' }, 400)
   if (userIds.length > 100) return c.json({ error: 'bulk operation capped at 100 users' }, 400)
+  if (nextRole !== null && SPECIALIST_ONLY_ROLES.has(nextRole)) {
+    return c.json({ error: invalidRoleMessage() }, 400)
+  }
   if (nextRole !== null && !VALID_STAFF_ROLES.has(nextRole)) {
     return c.json(
       { error: `Invalid role. Must be one of: ${[...VALID_STAFF_ROLES].join(', ')} or null` },
@@ -463,6 +540,12 @@ accessManagementApp.post('/staff/bulk-role', async (c) => {
       .from(user)
       .where(inArray(user.id, userIds))
     if (targets.length === 0) return c.json({ error: 'No matching users' }, 404)
+
+    // One person out of reach refuses the whole request: a partial bulk change is worse
+    // than none.
+    if (authority === 'delegated' && !targets.every((t) => delegatedMayChange(t, nextRole))) {
+      return c.json({ error: DELEGATED_REFUSAL, code: 'ROLE_REQUIRES_ADMINISTRATOR' }, 403)
+    }
 
     const now = new Date()
     await db.transaction(async (tx) => {

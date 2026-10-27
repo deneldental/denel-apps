@@ -83,6 +83,8 @@ export async function createService(data: {
   scopeId?: string | null
   priceMin?: number | null
   priceMax?: number | null
+  /** Pesewas for each unit after the first (G01); used only while the type is billed in steps. */
+  additionalUnitPrice?: number | null
   // Pricing refinements (R1) — stacked taxes + variants/price-range flags.
   taxIds?: string[]
   variantsEnabled?: boolean
@@ -215,6 +217,9 @@ export interface ApplicationScope {
   displayName: string
   quantityMode: 'single' | 'multi'
   maxQuantity: number | null
+  /** First-unit / additional-unit tariff: a service of this type costs its price for the first unit
+   *  and its own `additionalUnitPrice` for each further one. Only for a type billed per unit. */
+  additionalUnitPriceEnabled: boolean
   /** 'none' (no variants) | 'plain' (variants, no class) | 'tooth_class'. */
   variantType: 'none' | 'plain' | 'tooth_class'
   sortOrder: number
@@ -265,6 +270,9 @@ export interface ServiceMatrix {
     scopeId: string | null
     priceMin: number | null
     priceMax: number | null
+    /** Pesewas for each unit after the first, when the type is billed in steps (see
+     *  `ApplicationScope.additionalUnitPriceEnabled`). Null → every unit costs the unit price. */
+    additionalUnitPrice: number | null
     variantsEnabled: boolean
     priceRangeEnabled: boolean
     taxIds: string[]
@@ -279,6 +287,8 @@ export interface ResolvedPrice {
   serviceId: string
   name: string
   unitPrice: number
+  /** Pesewas for each unit after the first, when this service is billed in steps; else null. */
+  additionalUnitPrice: number | null
   quantity: number
   priceMin: number | null
   priceMax: number | null
@@ -311,6 +321,7 @@ export const createApplicationScope = (data: {
   quantityMode?: 'single' | 'multi'
   variantType?: 'none' | 'plain' | 'tooth_class'
   maxQuantity?: number | null
+  additionalUnitPriceEnabled?: boolean
   sortOrder?: number
 }) => api.post<ApplicationScope>('/api/services/scopes', data)
 
@@ -321,6 +332,7 @@ export const updateApplicationScope = (
     quantityMode?: 'single' | 'multi'
     variantType?: 'none' | 'plain' | 'tooth_class'
     maxQuantity?: number | null
+    additionalUnitPriceEnabled?: boolean
     sortOrder?: number
     isActive?: boolean
   }

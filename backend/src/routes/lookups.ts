@@ -35,8 +35,11 @@ import {
   treatmentTypes,
   units,
 } from '../db/schema'
+import { LOOKUP_READ_RULES } from '../lib/lookup-access'
 import { ACTIONS, MODULES } from '../lib/modules'
+import { isUniqueViolation } from '../lib/pg-errors'
 import { checkPermission, getCurrentUser, isAdmin } from '../lib/rbac'
+import { denyUnless } from '../lib/route-access'
 import type { HonoEnv } from '../lib/types'
 
 const lookupsApp = new Hono<HonoEnv>()
@@ -72,6 +75,13 @@ const tables: Record<string, any> = {
   // Clinical specialisation (migration 0179) — was free text on specialists.
   specialties: specialties,
   'compliance-tags': complianceTags,
+}
+
+// Reading a lookup list needs the modules whose screens use it (lib/lookup-access.ts). A type
+// without a rule would be readable by nobody, so refuse to load rather than discover it in production.
+export const LOOKUP_TYPES = Object.keys(tables)
+for (const type of LOOKUP_TYPES) {
+  if (!LOOKUP_READ_RULES[type]) throw new Error(`lookups: no read rule for the "${type}" type`)
 }
 
 const HR_LOOKUP_TYPES = new Set([
@@ -304,6 +314,8 @@ lookupsApp.get('/:type', async (c) => {
   const type = c.req.param('type')
   const table = tables[type]
   if (!table) return c.json({ error: 'Invalid lookup type' }, 400)
+  const denied = await denyUnless(c, user.id, LOOKUP_READ_RULES[type])
+  if (denied) return denied
 
   const db = getDb(process.env.DATABASE_URL!)
 
@@ -327,6 +339,8 @@ lookupsApp.get('/:type/all', async (c) => {
   const type = c.req.param('type')
   const table = tables[type]
   if (!table) return c.json({ error: 'Invalid lookup type' }, 400)
+  const denied = await denyUnless(c, user.id, LOOKUP_READ_RULES[type])
+  if (denied) return denied
 
   const db = getDb(process.env.DATABASE_URL!)
 
@@ -401,7 +415,7 @@ lookupsApp.post('/:type', async (c) => {
 
     return c.json({ success: true, data: newItem })
   } catch (error: unknown) {
-    if (error && typeof error === 'object' && 'code' in error && error.code === '23505') {
+    if (isUniqueViolation(error)) {
       return c.json({ error: 'Already exists' }, 400)
     }
     return c.json({ error: 'Failed' }, 500)

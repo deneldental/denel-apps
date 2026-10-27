@@ -1,15 +1,16 @@
 ﻿import { eq } from 'drizzle-orm'
 import { Hono } from 'hono'
-import { getAuth } from '../auth'
 import { getDb } from '../db'
 import { account, user as userSchema, userScopes } from '../db/schema'
-import { revokeAllSessionsForUser } from '../lib/account-sessions'
+import { setUserPassword } from '../lib/account-sessions'
 import { createAuditLog } from '../lib/audit'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
 import { hashPassword } from '../lib/password'
+import { requirePasswordChange } from '../lib/password-change'
 import { checkPasswordPolicy } from '../lib/password-policy'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
+import { denyUnless } from '../lib/route-access'
 import type { HonoEnv } from '../lib/types'
 
 const usersApp = new Hono<HonoEnv>()
@@ -33,6 +34,11 @@ usersApp.get('/', async (c) => {
 usersApp.get('/roles', async (c) => {
   const currentUser = await getCurrentUser(c)
   if (!currentUser) return c.json({ error: 'Not authenticated' }, 401)
+  const denied = await denyUnless(c, currentUser.id, {
+    apps: ['portal'],
+    anyOf: [[MODULES.USERS, ACTIONS.READ]],
+  })
+  if (denied) return denied
 
   try {
     const db = getDb(process.env.DATABASE_URL!)
@@ -82,7 +88,6 @@ usersApp.patch('/:id', async (c) => {
   const targetUserId = c.req.param('id')
   const body = await c.req.json()
   const db = getDb(process.env.DATABASE_URL!)
-  const auth = getAuth(c)
 
   try {
     const updates: any = {}
@@ -113,15 +118,15 @@ usersApp.patch('/:id', async (c) => {
       if (!policy.ok) {
         return c.json({ error: policy.error }, 400)
       }
-      // Use Better Auth Admin API to write the credential...
-      await auth.api.setUserPassword({
-        body: { userId: targetUserId, newPassword: body.password },
-      })
-      // ...then revoke, because it does not. `/admin/set-user-password` calls
-      // `internalAdapter.updatePassword` and nothing else — no session delete —
-      // so without this an admin-set password left every existing session of
-      // that user alive, which is the whole point of setting it.
-      await revokeAllSessionsForUser(db, targetUserId)
+      if (!targetUser) return c.json({ error: 'User not found' }, 404)
+      // Written and revoked as one operation by our own helper. This used to call
+      // Better Auth's `auth.api.setUserPassword({ body })` with no headers, and that
+      // endpoint requires an admin SESSION, so every attempt threw UNAUTHORIZED and
+      // answered 500 "Failed" (F44) — after the other fields had already been saved.
+      await setUserPassword(db, targetUserId, body.password)
+      // The admin chose it, so the person must replace it (F20) — unless the admin is
+      // setting their own, which is just a password change.
+      if (targetUserId !== currentUser.id) await requirePasswordChange(db, targetUserId)
     }
 
     c.set('skipAudit', true)
@@ -203,6 +208,8 @@ usersApp.post('/', async (c) => {
         phone: body.phone || null,
         roleId: body.roleId || null,
         emailVerified: true,
+        // The admin chose this password: the person replaces it first (F20).
+        mustChangePassword: true,
         createdAt: now,
         updatedAt: now,
       })

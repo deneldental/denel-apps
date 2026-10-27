@@ -13,21 +13,21 @@ import {
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
+import { actionsFor, canCheckIn } from '@/features/appointments/appointment-actions'
 import { AddAppointmentSheet } from '@/features/appointments/components/add-appointment-sheet'
 import { AddWalkInSheet } from '@/features/appointments/components/add-walk-in-sheet'
 import {
-  NoPaymentCheckInDialog,
   RescheduleAppointmentDialog,
   SendReminderDialog,
 } from '@/features/appointments/components/appointment-action-dialogs'
 import { BlockTimeSheet } from '@/features/appointments/components/block-time-sheet'
+import { CheckInFlow } from '@/features/appointments/components/check-in-flow'
 import {
   type WebsiteBooking,
   WebsiteBookingsPanel,
 } from '@/features/appointments/components/website-bookings-panel'
-import { AcceptPaymentSheet } from '@/features/payments/components/accept-payment-sheet'
-import { updateAppointment } from '@/lib/actions/appointments'
 import { api } from '@/lib/api-client'
+import { useCan } from '@/lib/permissions-context'
 import { useApiQuery } from '@/lib/query'
 import { Avatar, AvatarFallback, AvatarImage } from '@/shared/components/ui/avatar'
 import { Badge } from '@/shared/components/ui/badge'
@@ -150,6 +150,7 @@ export function UpcomingAppointmentsColumn({
   isClinicalUser,
   className,
 }: Props) {
+  const canBlockTime = useCan('appointments', 'create')
   const [internalDate, setInternalDate] = useState<Date>(startOfDay(new Date()))
   const selectedDate = controlledDate ?? internalDate
   const setSelectedDate = (d: Date) => {
@@ -215,8 +216,10 @@ export function UpcomingAppointmentsColumn({
             </>
           )}
           {/* Doctors may block their own time — the sheet locks the doctor field
-              to them when currentDoctorId is known. */}
-          {activeTab === 'blocked' && (
+              to them when currentDoctorId is known. H5 — this had no permission
+              check at all; the backend requires appointments:create
+              (`POST /api/doctors/unavailability`). */}
+          {activeTab === 'blocked' && canBlockTime && (
             <BlockTimeSheet
               currentDoctorId={currentDoctorId}
               currentDoctorName={currentDoctorName}
@@ -260,6 +263,7 @@ export function UpcomingAppointmentsColumn({
           selectedDate={selectedDate}
           setSelectedDate={setSelectedDate}
           onAppointmentClick={onAppointmentClick}
+          isClinicalUser={isClinicalUser}
           onReload={() => {
             onReload?.()
             bookingsQuery.refetch()
@@ -328,12 +332,14 @@ function TodayTab({
   selectedDate,
   setSelectedDate,
   onAppointmentClick,
+  isClinicalUser,
   onReload,
 }: {
   appointments: AppointmentLike[]
   selectedDate: Date
   setSelectedDate: (d: Date) => void
   onAppointmentClick?: (a: AppointmentLike) => void
+  isClinicalUser?: boolean
   onReload: () => void
 }) {
   const weekStart = useMemo(() => startOfWeek(selectedDate, { weekStartsOn: 1 }), [selectedDate])
@@ -348,8 +354,12 @@ function TodayTab({
   //   • drops terminal-status rows (cancelled / no_show / completed) — those
   //     are history, viewable on the calendar grid for context but never
   //     actionable here.
-  //   • drops past-time items on today's view — same reasoning, plus stale
-  //     items push real upcoming work below the fold.
+  //   • drops past-time items on today's view once the patient has arrived —
+  //     they are in the clinic flow, and stale items push real upcoming work
+  //     below the fold. A visit whose time has passed but who has NOT arrived
+  //     stays: that is a late patient, and the receptionist still has to check
+  //     them in (or mark them a no-show). Dropping them hid exactly the people
+  //     who needed attention.
   // Past/historical inspection still happens on the calendar by clicking the
   // appointment dot → detail dialog.
   const dayAppointments = useMemo(() => {
@@ -363,7 +373,7 @@ function TodayTab({
       })
       .filter((a) => {
         if (!isTodaySelected) return true
-        return new Date(a.date).getTime() >= now
+        return new Date(a.date).getTime() >= now || canCheckIn(a.status)
       })
       .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
   }, [appointments, selectedDate, today])
@@ -373,17 +383,9 @@ function TodayTab({
   const [cancelAppt, setCancelAppt] = useState<AppointmentLike | null>(null)
   const [rescheduleAppt, setRescheduleAppt] = useState<AppointmentLike | null>(null)
   const [reminderAppt, setReminderAppt] = useState<AppointmentLike | null>(null)
-  const [noPaymentAppt, setNoPaymentAppt] = useState<AppointmentLike | null>(null)
   const [noShowNote, setNoShowNote] = useState('')
   const [cancelNote, setCancelNote] = useState('')
   const [processing, setProcessing] = useState<string | null>(null)
-
-  async function handleCheckInSuccess() {
-    if (!checkInAppt) return
-    await updateAppointment(checkInAppt.id, { status: 'checked_in' })
-    setCheckInAppt(null)
-    onReload()
-  }
 
   async function confirmNoShow() {
     if (!noShowAppt) return
@@ -512,6 +514,7 @@ function TodayTab({
                 key={a.id}
                 appointment={a}
                 isBusy={processing === a.id}
+                isClinicalUser={isClinicalUser}
                 onView={() => onAppointmentClick?.(a)}
                 onCheckIn={() => setCheckInAppt(a)}
                 onCancel={() => setCancelAppt(a)}
@@ -524,35 +527,13 @@ function TodayTab({
         )}
       </ScrollArea>
 
-      {/* Check-in via AcceptPaymentSheet — receptionist picks the payment
-          type (one-time / plan / insurance); `presetPatientId` locks the form
-          to the appointment's patient, so it shows a read-only patient readout
-          instead of its picker. */}
-      <AcceptPaymentSheet
-        open={!!checkInAppt}
-        onOpenChange={(v) => {
-          if (!v) setCheckInAppt(null)
-        }}
-        presetPatientId={checkInAppt?.patientId}
-        onSuccess={handleCheckInSuccess}
-        showNoPaymentOption
-        onNoPayment={() => {
-          // Move the in-flight check-in appointment over to the no-payment
-          // flow. AcceptPaymentSheet has already closed itself.
-          setNoPaymentAppt(checkInAppt)
+      {/* Check in — payment (one-time / plan / insurance) or no payment, then the
+          check-in itself. The flow is told THIS visit, so a payment names it, and
+          it reports a failed check-in instead of closing as if it had worked. */}
+      <CheckInFlow
+        appointment={checkInAppt}
+        onFinished={() => {
           setCheckInAppt(null)
-        }}
-      />
-
-      {/* No-payment check-in — reason capture + status flip. */}
-      <NoPaymentCheckInDialog
-        open={!!noPaymentAppt}
-        onOpenChange={(v) => {
-          if (!v) setNoPaymentAppt(null)
-        }}
-        appointment={noPaymentAppt}
-        onCheckedIn={() => {
-          setNoPaymentAppt(null)
           onReload()
         }}
       />
@@ -680,6 +661,7 @@ function TodayTab({
 function AppointmentCard({
   appointment,
   isBusy,
+  isClinicalUser,
   onView,
   onCheckIn,
   onCancel,
@@ -689,6 +671,10 @@ function AppointmentCard({
 }: {
   appointment: AppointmentLike
   isBusy: boolean
+  // H5 — the Appointment Detail Dialog already hides these same actions
+  // (readOnly={isClinicalUser}) for a clinical-only role; this card exposed
+  // Check-in/Reschedule/Send reminder/Mark no-show/Cancel with zero gating.
+  isClinicalUser?: boolean
   onView: () => void
   onCheckIn: () => void
   onCancel: () => void
@@ -701,7 +687,8 @@ function AppointmentCard({
   const patientName = appointment.patient?.name ?? 'Unknown patient'
   const doctorName = appointment.doctor?.user?.name ?? 'Unassigned'
   const status = (appointment.status ?? 'scheduled') as string
-  const isTerminal = TERMINAL_STATUSES.has(status)
+  const actions = actionsFor(status)
+  const hasMenu = actions.reschedule || actions.sendReminder || actions.noShow || actions.cancel
   const tone = STATUS_TONE[status] ?? 'text-muted-foreground'
 
   return (
@@ -733,54 +720,71 @@ function AppointmentCard({
         </div>
       </button>
 
-      {!isTerminal && (
-        <div className="mt-1.5 flex items-center justify-between gap-2 px-1">
-          <Button
-            size="sm"
-            className="h-7 flex-1 gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white"
-            disabled={isBusy}
-            onClick={onCheckIn}
-          >
-            {isBusy ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <UserCheck className="h-3 w-3" />
-            )}
-            Check In
-          </Button>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="outline"
-                size="icon"
-                className="h-7 w-7"
-                disabled={isBusy}
-                aria-label="More options"
-              >
-                <MoreHorizontal className="h-4 w-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem onSelect={onReschedule}>
-                <CalendarIcon className="mr-2 h-4 w-4" />
-                Reschedule
-              </DropdownMenuItem>
-              <DropdownMenuItem onSelect={onSendReminder}>
-                <Bell className="mr-2 h-4 w-4" />
-                Send reminder
-              </DropdownMenuItem>
-              <DropdownMenuItem onSelect={onNoShow} className="text-amber-600 focus:text-amber-600">
-                <Slash className="mr-2 h-4 w-4" />
-                Mark no-show
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                onSelect={onCancel}
-                className="text-destructive focus:text-destructive"
-              >
-                Cancel appointment
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+      {!isClinicalUser && (actions.checkIn || hasMenu) && (
+        <div
+          className={`mt-1.5 flex items-center gap-2 px-1 ${actions.checkIn ? 'justify-between' : 'justify-end'}`}
+        >
+          {actions.checkIn && (
+            <Button
+              size="sm"
+              className="h-7 flex-1 gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white"
+              disabled={isBusy}
+              onClick={onCheckIn}
+            >
+              {isBusy ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <UserCheck className="h-3 w-3" />
+              )}
+              Check In
+            </Button>
+          )}
+          {hasMenu && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="h-7 w-7"
+                  disabled={isBusy}
+                  aria-label="More options"
+                >
+                  <MoreHorizontal className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                {actions.reschedule && (
+                  <DropdownMenuItem onSelect={onReschedule}>
+                    <CalendarIcon className="mr-2 h-4 w-4" />
+                    Reschedule
+                  </DropdownMenuItem>
+                )}
+                {actions.sendReminder && (
+                  <DropdownMenuItem onSelect={onSendReminder}>
+                    <Bell className="mr-2 h-4 w-4" />
+                    Send reminder
+                  </DropdownMenuItem>
+                )}
+                {actions.noShow && (
+                  <DropdownMenuItem
+                    onSelect={onNoShow}
+                    className="text-amber-600 focus:text-amber-600"
+                  >
+                    <Slash className="mr-2 h-4 w-4" />
+                    Mark no-show
+                  </DropdownMenuItem>
+                )}
+                {actions.cancel && (
+                  <DropdownMenuItem
+                    onSelect={onCancel}
+                    className="text-destructive focus:text-destructive"
+                  >
+                    Cancel appointment
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
         </div>
       )}
     </div>

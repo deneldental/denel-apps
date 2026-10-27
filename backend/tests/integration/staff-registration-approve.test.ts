@@ -34,6 +34,7 @@ vi.mock('../../src/lib/branding', () => ({ getBranding: vi.fn(async () => ({ nam
 
 import { getDb } from '../../src/db'
 import * as schema from '../../src/db/schema'
+import { verifyPassword } from '../../src/lib/password'
 import { checkPermission, getCurrentUser } from '../../src/lib/rbac'
 import { PermissionEngine } from '../../src/rbac/engine/PermissionEngine'
 import { staffRegistrationApp } from '../../src/routes/staff-registration'
@@ -48,6 +49,7 @@ function makeApp() {
 }
 
 const PREFIX = '__it_reg_'
+const FIRST_PASSWORD = 'First-Choice-For-Them-61'
 let adminUserId: string
 
 /** A complete, valid submission — what the RegisterPage posts. */
@@ -252,9 +254,12 @@ describe.skipIf(noDb)('POST /invites/:id/approve — personal data', () => {
 
   it('writes the Team-app grant only; every other app follows the role', async () => {
     authAsAdmin()
-    const inv = await seedSubmittedInvite()
+    // A receptionist signs in to the portal, so approval needs their e-mail and a first password (D16).
+    const inv = await seedSubmittedInvite({ email: `recep.${randomUUID().slice(0, 6)}@it.local` })
 
-    expect((await approve(inv.id, { role: 'receptionist' })).status).toBe(200)
+    expect(
+      (await approve(inv.id, { role: 'receptionist', initialPassword: FIRST_PASSWORD })).status
+    ).toBe(200)
     const userId = (await staffFor(inv.id))?.userId
     if (!userId) throw new Error('approval created no sign-in account')
 
@@ -267,9 +272,18 @@ describe.skipIf(noDb)('POST /invites/:id/approve — personal data', () => {
 
   it('still honours an explicit extra grant as a one-off exception', async () => {
     authAsAdmin()
-    const inv = await seedSubmittedInvite()
+    // An explicit HR grant makes this person sign in with a password too (D16).
+    const inv = await seedSubmittedInvite({ email: `hrgrant.${randomUUID().slice(0, 6)}@it.local` })
 
-    expect((await approve(inv.id, { role: 'staff', scopes: ['pwa', 'hr'] })).status).toBe(200)
+    expect(
+      (
+        await approve(inv.id, {
+          role: 'staff',
+          scopes: ['pwa', 'hr'],
+          initialPassword: FIRST_PASSWORD,
+        })
+      ).status
+    ).toBe(200)
     const userId = (await staffFor(inv.id))?.userId
     if (!userId) throw new Error('approval created no sign-in account')
 
@@ -277,5 +291,149 @@ describe.skipIf(noDb)('POST /invites/:id/approve — personal data', () => {
       { scope: 'hr', granted: true },
       { scope: 'pwa', granted: true },
     ])
+  })
+
+  // ── E-mail case (F21) ──────────────────────────────────────────────────────
+  // The registrant types the address on a public form, so it arrives in any
+  // spelling. Better Auth looks a login up (and sends a password reset) by the
+  // lower-cased address, so it has to be stored that way, and a respelling of an
+  // address that already has a login is a duplicate, not a second account.
+
+  async function loginOf(inviteId: string) {
+    const userId = (await staffFor(inviteId))?.userId
+    if (!userId) throw new Error('approval created no sign-in account')
+    return getTestDb().query.user.findFirst({ where: eq(schema.user.id, userId) })
+  }
+
+  it('stores the e-mail the registrant typed in lower case (F21)', async () => {
+    authAsAdmin()
+    const typed = `Mixed.${randomUUID().slice(0, 6)}@Step6.TEST`
+    const inv = await seedSubmittedInvite({ email: typed })
+
+    expect((await approve(inv.id)).status).toBe(200)
+    expect((await loginOf(inv.id))?.email).toBe(typed.toLowerCase())
+  })
+
+  it('refuses an address that differs from an existing login only by case (F21)', async () => {
+    authAsAdmin()
+    const typed = `Twice.${randomUUID().slice(0, 6)}@Step6.TEST`
+    const first = await seedSubmittedInvite({ email: typed })
+    expect((await approve(first.id)).status).toBe(200)
+
+    const second = await seedSubmittedInvite({ email: typed.toUpperCase() })
+    const res = await approve(second.id)
+    expect(res.status).toBe(409)
+    expect(await staffFor(second.id)).toBeNull()
+  })
+
+  // ── First password for portal / HR roles (D16, F49) ────────────────────────
+  // A registrant is built for phone + SMS-code sign-in in the Team app, so approval used to mint a
+  // random password nobody knew. A role that signs in to the portal or the HR app uses e-mail and
+  // password, so that person could not get in until an admin reset it. Approval now asks for a
+  // first password for those roles, the person must replace it at first sign-in, and it refuses
+  // to continue without a real e-mail address.
+
+  const invitesNamed = (token: string) =>
+    getTestDb()
+      .select()
+      .from(schema.staffRegistrationInvites)
+      .where(eq(schema.staffRegistrationInvites.id, token))
+
+  it('a portal role needs a first password, and creates nothing without one', async () => {
+    authAsAdmin()
+    const addr = `nopw.${randomUUID().slice(0, 6)}@it.local`
+    const inv = await seedSubmittedInvite({ email: addr })
+
+    const res = await approve(inv.id, { role: 'receptionist' })
+
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { code?: string }).code).toBe('INITIAL_PASSWORD_REQUIRED')
+    expect(await staffFor(inv.id)).toBeNull()
+    expect((await invitesNamed(inv.id))[0].status).toBe('submitted')
+    expect(
+      await getTestDb().query.user.findFirst({ where: eq(schema.user.email, addr) })
+    ).toBeUndefined()
+  })
+
+  it('a portal role with a first password: they can sign in with it and must change it', async () => {
+    authAsAdmin()
+    const addr = `withpw.${randomUUID().slice(0, 6)}@it.local`
+    const inv = await seedSubmittedInvite({ email: addr })
+
+    const res = await approve(inv.id, { role: 'receptionist', initialPassword: FIRST_PASSWORD })
+
+    expect(res.status).toBe(200)
+    const login = await loginOf(inv.id)
+    expect(login?.mustChangePassword).toBe(true)
+    const [cred] = await getTestDb()
+      .select({ password: schema.account.password })
+      .from(schema.account)
+      .where(eq(schema.account.userId, login?.id as string))
+    expect(await verifyPassword({ hash: cred.password as string, password: FIRST_PASSWORD })).toBe(
+      true
+    )
+    expect(
+      await verifyPassword({ hash: cred.password as string, password: 'Something-Else-Entirely-9' })
+    ).toBe(false)
+  })
+
+  it.each([
+    ['one that is too short', 'Short-1'],
+    ['one on the weak-password list', 'passwordpassword12'],
+  ])('refuses %s', async (_label, weak) => {
+    authAsAdmin()
+    const inv = await seedSubmittedInvite({ email: `weak.${randomUUID().slice(0, 6)}@it.local` })
+
+    const res = await approve(inv.id, { role: 'receptionist', initialPassword: weak })
+
+    expect(res.status).toBe(400)
+    expect(await staffFor(inv.id)).toBeNull()
+  })
+
+  it('a portal role needs the registrant to have given an e-mail address', async () => {
+    authAsAdmin()
+    const inv = await seedSubmittedInvite() // no e-mail on this registration
+
+    const res = await approve(inv.id, { role: 'receptionist', initialPassword: FIRST_PASSWORD })
+
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { code?: string }).code).toBe('EMAIL_REQUIRED')
+    expect(await staffFor(inv.id)).toBeNull()
+  })
+
+  it('a Team-app-only role is unchanged: no password asked, none stored, not flagged', async () => {
+    authAsAdmin()
+    const inv = await seedSubmittedInvite()
+
+    const res = await approve(inv.id, { role: 'staff' })
+
+    expect(res.status).toBe(200)
+    expect((await loginOf(inv.id))?.mustChangePassword).toBe(false)
+  })
+
+  it('an approval with no role at all is unchanged', async () => {
+    authAsAdmin()
+    const inv = await seedSubmittedInvite()
+
+    expect((await approve(inv.id)).status).toBe(200)
+    expect((await loginOf(inv.id))?.mustChangePassword).toBe(false)
+  })
+
+  it('a first password sent for a Team-app-only role is ignored, not stored', async () => {
+    authAsAdmin()
+    const inv = await seedSubmittedInvite()
+
+    const res = await approve(inv.id, { role: 'lab_technician', initialPassword: FIRST_PASSWORD })
+
+    expect(res.status).toBe(200)
+    const login = await loginOf(inv.id)
+    const [cred] = await getTestDb()
+      .select({ password: schema.account.password })
+      .from(schema.account)
+      .where(eq(schema.account.userId, login?.id as string))
+    expect(await verifyPassword({ hash: cred.password as string, password: FIRST_PASSWORD })).toBe(
+      false
+    )
+    expect(login?.mustChangePassword).toBe(false)
   })
 })

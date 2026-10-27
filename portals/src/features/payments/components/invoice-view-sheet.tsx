@@ -32,6 +32,7 @@ import {
 import { Skeleton } from '@/shared/components/ui/skeleton'
 import { VoidDocumentDialog } from '@/shared/components/void-document-dialog'
 import { formatAmount } from '@/shared/utils/currency'
+import { additionalUnitPriceOf } from '@/shared/utils/invoice-line-display'
 
 interface Props {
   open: boolean
@@ -498,6 +499,13 @@ const InvoiceSlip = forwardRef<HTMLDivElement, SlipProps>(function InvoiceSlip(
                   }}
                 >
                   {ghs(Number(l.unitPrice))}
+                  {/* A first-unit / additional-unit line (G01) stores the first unit's price;
+                      without this the row would not add up on the patient's copy. */}
+                  {additionalUnitPriceOf(l) != null && (
+                    <div style={{ fontSize: '10px', color: '#666' }}>
+                      then {ghs(additionalUnitPriceOf(l) ?? 0)} each
+                    </div>
+                  )}
                 </td>
                 <td
                   style={{

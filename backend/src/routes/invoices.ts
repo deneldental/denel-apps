@@ -5,6 +5,7 @@ import { getDb } from '../db'
 import {
   invoiceLines,
   invoices,
+  patients,
   paymentAllocations,
   payments,
   treatmentPlanItems,
@@ -231,7 +232,10 @@ invoicesApp.patch('/:id', async (c) => {
 invoicesApp.post('/estimate', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
-  if (!(await checkPermission(c, user.id, MODULES.PAYMENTS as string, ACTIONS.CREATE as string)))
+  // `estimates:create`, not `payments:create`: a doctor quotes a treatment without
+  // any access to payments. Roles holding `payments` or `financial_records` imply it
+  // (MODULE_HIERARCHY), so reception and finance are unchanged.
+  if (!(await checkPermission(c, user.id, MODULES.ESTIMATES as string, ACTIONS.CREATE as string)))
     return c.json({ error: 'Unauthorized' }, 403)
 
   const db = getDb(process.env.DATABASE_URL!)
@@ -241,6 +245,16 @@ invoicesApp.post('/estimate', async (c) => {
   }
   if (!Array.isArray(lines) || lines.length === 0)
     return c.json({ error: 'At least one line is required' }, 400)
+  // F38: an unknown patient used to reach the insert and fail on the foreign key (a
+  // generic 500), and a malformed id reached Postgres. Both are the caller's to fix.
+  if (!z.string().uuid().safeParse(patientId).success) {
+    return c.json({ error: 'Invalid patientId' }, 400)
+  }
+  const patient = await db.query.patients.findFirst({
+    where: eq(patients.id, patientId),
+    columns: { id: true },
+  })
+  if (!patient) return c.json({ error: 'Patient not found' }, 404)
 
   // Use the existing estimate draft builder which now accepts patientId without appointmentId
   try {
@@ -276,62 +290,50 @@ invoicesApp.post('/estimate', async (c) => {
 })
 
 // POST /api/invoices/:id/send-to-reception — Push a pending estimate to reception
+//
+// A standalone estimate (no visit behind it) is already on the reception lens as a
+// synthetic visit — `loadVisits` in worklist.ts lists every draft one-time invoice
+// that has no appointment — and reception confirms it from there. So for those this
+// writes nothing. It used to invent a checked-in "walk-in" visit for whichever doctor
+// row the database returned first (audit F17, decision D7), putting a phantom visit
+// on someone's calendar, day-sheet and reports.
 invoicesApp.post('/:id/send-to-reception', async (c) => {
   const user = await getCurrentUser(c)
   if (!user) return c.json({ error: 'Not authenticated' }, 401)
-  // Generating invoice / sending to reception can be done by receptionist or doctor
-  if (!(await checkPermission(c, user.id, MODULES.PAYMENTS as string, ACTIONS.READ as string)))
+  // Sending is a write on an estimate, so `estimates:update` — it used to be gated on
+  // `payments:read`, a read permission guarding a write.
+  if (!(await checkPermission(c, user.id, MODULES.ESTIMATES as string, ACTIONS.UPDATE as string)))
     return c.json({ error: 'Unauthorized' }, 403)
 
-  const { id } = c.req.param()
+  // A malformed id is "no such estimate", and must not reach Postgres (which rejects
+  // it, and used to hand its message — the SQL — back to the browser).
+  const id = z.string().uuid().safeParse(c.req.param('id'))
+  if (!id.success) return c.json({ error: 'Not found' }, 404)
   const db = getDb(process.env.DATABASE_URL!)
 
   try {
-    const invoice = await db.query.invoices.findFirst({ where: eq(invoices.id, id) })
-    if (!invoice) return c.json({ error: 'Not found' }, 404)
+    const invoice = await db.query.invoices.findFirst({ where: eq(invoices.id, id.data) })
+    // Only an estimate (a one-time invoice) can be sent. A plan instalment or a
+    // plan total is not found here, even though it is also a draft invoice.
+    if (!invoice || invoice.type !== 'one_time') return c.json({ error: 'Not found' }, 404)
     if (invoice.status !== 'draft') return c.json({ error: 'Invoice is not a draft' }, 400)
 
-    let appointmentId = invoice.appointmentId
-
-    // If it lacks an appointment, create a walk-in appointment today so it shows on the worklist
-    if (!appointmentId) {
-      const now = new Date()
-      // Make a dummy walk-in visit so the receptionist has an actionable item on their day sheet
-      const { appointments, doctors } = await import('../db/schema')
-
-      // Fallback to first doctor since doctorId is not-null
-      const fallbackDoctor = await db.query.doctors.findFirst()
-
-      const [newAppt] = await db
-        .insert(appointments)
-        .values({
-          patientId: invoice.patientId as string,
-          doctorId: fallbackDoctor?.id as string,
-          date: now,
-          durationMinutes: 15,
-          type: 'consultation',
-          status: 'checked_in',
-          notes: 'Walk-in for Estimate Payment',
-          requiresEstimate: true,
-          checkedInAt: now,
-        })
-        .returning()
-
-      appointmentId = newAppt.id
-
-      await db.update(invoices).set({ appointmentId }).where(eq(invoices.id, invoice.id))
+    const appointmentId = invoice.appointmentId
+    if (appointmentId) {
+      // Mark the visit estimate_ready so the receptionist sees it
+      const { appointments } = await import('../db/schema')
+      await db
+        .update(appointments)
+        .set({ estimateStatus: 'estimate_ready', updatedAt: new Date() })
+        .where(eq(appointments.id, appointmentId))
     }
 
-    const { appointments } = await import('../db/schema')
-    // Mark the appointment as estimate_ready so the receptionist sees it
-    await db
-      .update(appointments)
-      .set({ estimateStatus: 'estimate_ready', updatedAt: new Date() })
-      .where(eq(appointments.id, appointmentId))
-
-    return c.json({ success: true, data: { appointmentId } })
+    return c.json({ success: true, data: { appointmentId: appointmentId ?? null } })
   } catch (error) {
-    return c.json({ error: (error as Error).message || 'Failed to send to reception' }, 500)
+    // The detail belongs in the log; a database error's message is the whole SQL
+    // statement and its bound values.
+    logError(error, { context: 'Send estimate to reception', invoiceId: id.data })
+    return c.json({ error: 'Failed to send to reception' }, 500)
   }
 })
 

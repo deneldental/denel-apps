@@ -103,6 +103,7 @@ export function LabCaseDetailDialog({ caseId, onClose, onChanged }: Props) {
     setUploading(true)
     try {
       const up = await uploadFile(file, {
+        storageCategory: 'patient_records',
         folder: 'labs',
         subfolder: `${labCase.id}/photos`,
         profile: 'image',

@@ -101,9 +101,21 @@ to reach it). `GITHUB_TOKEN` is automatic.
 ## 4. Settings that must be set (not secret)
 
 - **Backend:** `DATABASE_URL`, `BETTER_AUTH_URL`, `ALLOWED_ORIGINS` (every
-  frontend origin), `PORTAL_URL`, `PATIENT_PORTAL_URL`, and **`TRUSTED_IP_MODE`**
+  frontend origin), **`PORTAL_URL`** (the clinic portal, e.g.
+  `https://portal.deneldental.com`) and **`PATIENT_PORTAL_URL`** (the patient app,
+  e.g. `https://app.deneldental.com`), and **`TRUSTED_IP_MODE`**
   — deployed backends refuse to start without it (`dryrun` until the tunnel is
   live, then `enforce`) — with `TRUSTED_IP_HEADER` (default `cf-connecting-ip`).
+  `PORTAL_URL` and `PATIENT_PORTAL_URL` are the addresses put into
+  appointment-confirmation SMS, X-ray share links, document-signing links, the
+  return from Google and the patient-app invitation: staging and production
+  **refuse to start** without them, or with either pointing at localhost, and the
+  production deploy checks both on the VPS before replacing the container (they
+  live only in `/opt/framada/.env`, not in Doppler `prd`). **Staging (Render)
+  reads them from Doppler `stg`: add both there before the next push to
+  `staging`, or the staging backend will not start.** Until 2026-10-26 they
+  were optional and the routes guessed (the patient app's host for pages that
+  exist only in the portal, or `http://localhost:5173`).
   `NODE_ENV=production` is baked into the Docker image; `render.yaml` also sets
   `APP_ENV=staging`. Optional: `CLINIC_NAME` (default "Denel Dental Clinic"),
   `CLINIC_PHONE`, `CLINIC_ADDRESS`, `PDF_TEMPLATE_BASE_URL`, SMS text overrides

@@ -1,6 +1,11 @@
 import { Loader2, Trash2, UserPlus } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
+import {
+  type BlockTimeLike,
+  DEFAULT_APPOINTMENT_MINUTES,
+  findBlockTimeForAppointment,
+} from '@/features/appointments/conflicts'
 import {
   invalidateAppointmentPickerCache,
   useAppointmentPickers,
@@ -8,6 +13,7 @@ import {
 import { AddPatientSheet } from '@/features/patients/components/add-patient-sheet'
 import { AcceptPaymentSheet } from '@/features/payments/components/accept-payment-sheet'
 import { createAppointment } from '@/lib/actions/appointments'
+import { getDoctorUnavailability } from '@/lib/actions/doctor-availability'
 import { createPendingMedicalRecord } from '@/lib/actions/medical-records'
 import { getServices } from '@/lib/actions/services'
 import { createWalkIn } from '@/lib/actions/walk-in'
@@ -89,6 +95,34 @@ export function AddWalkInSheet({
   const [services, setServices] = useState<ServiceOption[]>([])
   const [servicesError, setServicesError] = useState(false)
 
+  // [Medium] Unlike every other booking surface, this one had no client-side
+  // block-time check at all — the backend still rejects it, but only after
+  // the whole form is filled in and submitted, not live as soon as a doctor
+  // is picked. A walk-in has no date/time picker (it's always "right now"),
+  // so the check is simply: is this doctor blocked right now?
+  const [blockTimes, setBlockTimes] = useState<BlockTimeLike[]>([])
+  useEffect(() => {
+    if (!open || !selectedDoctorId) {
+      setBlockTimes([])
+      return
+    }
+    getDoctorUnavailability(selectedDoctorId).then((r) => {
+      setBlockTimes(r.success ? ((r.data as BlockTimeLike[]) ?? []) : [])
+    })
+  }, [open, selectedDoctorId])
+
+  const blockConflict = useMemo(() => {
+    if (!selectedDoctorId) return null
+    const now = new Date()
+    const end = new Date(now.getTime() + DEFAULT_APPOINTMENT_MINUTES * 60_000)
+    return findBlockTimeForAppointment(
+      selectedDoctorId,
+      now.toISOString(),
+      end.toISOString(),
+      blockTimes
+    )
+  }, [selectedDoctorId, blockTimes])
+
   useEffect(() => {
     if (!open || services.length > 0) return
     let cancelled = false
@@ -133,7 +167,9 @@ export function AddWalkInSheet({
     setLines([])
     setNotes('')
     setRequiresEstimate(false)
-    setWalkInResult(null)
+    // Not the payment hand-off (walkInResult): recording a walk-in sets it and then
+    // resets the form in the same render, so clearing it here meant the payment sheet
+    // never opened (F39). The payment sheet clears it when it closes.
   }
 
   function closeAndReset() {
@@ -179,6 +215,10 @@ export function AddWalkInSheet({
     }
     if (!requiresEstimate && lines.length === 0) {
       toast.error('Please add at least one treatment')
+      return
+    }
+    if (blockConflict) {
+      toast.error('Doctor is unavailable during this time')
       return
     }
 
@@ -318,6 +358,13 @@ export function AddWalkInSheet({
                     ))}
                   </SelectContent>
                 </Select>
+                {blockConflict && (
+                  <p className="text-xs text-destructive" role="alert">
+                    {doctors.find((d) => d.id === selectedDoctorId)?.user?.name ?? 'Doctor'} is
+                    unavailable right now
+                    {blockConflict.reason ? ` — ${blockConflict.reason}.` : '.'}
+                  </p>
+                )}
               </div>
 
               {/* Requires-estimate routing (0168) */}
@@ -425,7 +472,11 @@ export function AddWalkInSheet({
             </div>
 
             <SheetFooter>
-              <Button type="submit" disabled={isSubmitting} className="w-full">
+              <Button
+                type="submit"
+                disabled={isSubmitting || blockConflict !== null}
+                className="w-full"
+              >
                 {isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
                 {requiresEstimate ? 'Check in for estimate' : 'Record walk-in'}
               </Button>
@@ -448,6 +499,9 @@ export function AddWalkInSheet({
             if (!v) setWalkInResult(null)
           }}
           presetPatientId={walkInResult.patientId}
+          // Name the visit on the payment. Not `appointmentId`: that pays THROUGH check-in,
+          // which refuses a walk-in (already checked in) and takes no money (F33).
+          linkAppointmentId={walkInResult.appointmentId}
           onSuccess={() => {
             setPaymentOpen(false)
             setWalkInResult(null)

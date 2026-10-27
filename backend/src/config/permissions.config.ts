@@ -50,6 +50,9 @@ export const PERMISSION_DEFINITIONS: PermissionDefinition[] = [
   { module: 'insurance', action: 'delete', description: 'Delete insurance records' },
 
   // ── Payments ──────────────────────────────────────────────────────────────
+  { module: 'estimates', action: 'read', description: 'View estimates and their lines' },
+  { module: 'estimates', action: 'create', description: 'Create estimates' },
+  { module: 'estimates', action: 'update', description: 'Send an estimate to reception' },
   { module: 'payments', action: 'read', description: 'View payments' },
   { module: 'payments', action: 'create', description: 'Record payments' },
   { module: 'payments', action: 'update', description: 'Update payment records' },

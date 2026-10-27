@@ -112,10 +112,22 @@ export interface ConfirmPaymentInput {
 }
 
 /** P4 — reception issues the estimate (posts AR) + optionally records payment(s). */
-export const confirmEstimate = (appointmentId: string, payments?: ConfirmPaymentInput[]) =>
+/** `acceptedLineItemIds` names the estimate lines reception ticked: only those are issued, and the
+ *  rest move to a new draft estimate. `sendSms` asks the server to text the patient a confirmation
+ *  of the payment taken (G08); a confirm with no payment texts nobody, and a failed text comes back
+ *  as `smsError`. */
+export const confirmEstimate = (
+  appointmentId: string,
+  payments?: ConfirmPaymentInput[],
+  opts: { sendSms?: boolean; acceptedLineItemIds?: string[] } = {}
+) =>
   api.post<{ invoiceId: string; paymentId: string | null }>(
     `/api/worklist/${appointmentId}/confirm`,
-    { payments }
+    {
+      payments,
+      ...(opts.acceptedLineItemIds ? { acceptedLineItemIds: opts.acceptedLineItemIds } : {}),
+      ...(opts.sendSms ? { sendSms: true } : {}),
+    }
   )
 
 /** P4 — reception cancels the un-issued estimate draft. */

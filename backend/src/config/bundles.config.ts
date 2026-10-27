@@ -190,6 +190,16 @@ export const SYSTEM_BUNDLES: BundleDefinition[] = [
   },
 
   {
+    id: 'bundle_estimates_manage',
+    name: 'Estimates',
+    description:
+      'Build, view and list estimates and send them to reception. No payments, ledger or refunds: a doctor quotes a treatment without seeing what anyone paid.',
+    scope: 'portal',
+    isSystem: true,
+    permissions: ['estimates:read', 'estimates:create', 'estimates:update'],
+  },
+
+  {
     id: 'bundle_payments_only',
     name: 'Payments Only',
     description: 'Create and view payments (no expenses or ledger access)',

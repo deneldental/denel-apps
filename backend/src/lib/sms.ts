@@ -4,6 +4,7 @@ import { smsMessages } from '../db/schema'
 import { getBranding } from './branding'
 import { getHubtelConfig, type HubtelConfig } from './integrations'
 import { logError, logger } from './logger'
+import { storedSmsBody } from './sms-redaction'
 import { formatPhoneNumber } from './utils/phone'
 
 export interface SMSRecipient {
@@ -11,6 +12,14 @@ export interface SMSRecipient {
   message: string
   patientId?: string
   patientName?: string
+  /**
+   * The whole message is a credential (login/reset/registration code). The
+   * recipient gets the real text; the SMS log, the logs and the dev console keep
+   * only a redaction stand-in. See lib/sms-redaction.ts.
+   */
+  sensitive?: boolean
+  /** Keep this instead of `message` — the message with only its bearer token cut out. */
+  storedMessage?: string
 }
 
 export type HubtelCredentials = { clientId: string; clientSecret: string }
@@ -74,8 +83,11 @@ export async function sendSMS(
   const redirectPhone = isDev ? env.SMS_REDIRECT_PHONE?.trim() || undefined : undefined
 
   // 1. Process recipients: variable substitution and redirectPhone.
-  const resolvedRecipients = recipients.map((r) => {
-    let msg = r.message
+  // The same substitutions and dev-redirect prefix apply to the text we KEEP
+  // (`storedMessage`) as to the text we SEND, so the log never disagrees with
+  // what the recipient was told.
+  const fill = (text: string, r: SMSRecipient): string => {
+    let msg = text
     if (msg.includes('{{firstName}}')) {
       const firstName = r.patientName ? r.patientName.split(' ')[0] : 'Valued Patient'
       msg = msg.replace(/\{\{firstName\}\}/g, firstName)
@@ -84,19 +96,24 @@ export async function sendSMS(
       const clinicName = from || 'Our Clinic'
       msg = msg.replace(/\{\{clinicName\}\}/g, clinicName)
     }
-
-    if (redirectPhone) {
-      msg = `[Dev redirect from ${r.phone}] ${msg}`
-      return { ...r, message: msg, phone: redirectPhone }
-    }
-    return { ...r, message: msg }
-  })
+    return redirectPhone ? `[Dev redirect from ${r.phone}] ${msg}` : msg
+  }
+  const resolvedRecipients = recipients.map((r) => ({
+    ...r,
+    message: fill(r.message, r),
+    storedMessage: r.storedMessage === undefined ? undefined : fill(r.storedMessage, r),
+    ...(redirectPhone ? { phone: redirectPhone } : {}),
+  }))
+  /** What Denel keeps of an outgoing message: see lib/sms-redaction.ts. */
+  const kept = (r: (typeof resolvedRecipients)[number]): string => storedSmsBody(r)
 
   // E2E test stub — when SMS_STUB_FILE is set, append every outgoing message
   // to that file (NDJSON) and return success WITHOUT calling Hubtel. The test
   // harness reads from this file to capture OTP codes. NEVER honored in
   // production: the env-var presence check is enough since SMS_STUB_FILE will
-  // never be set in the prod Doppler config.
+  // never be set in the prod Doppler config. This file is the ONE place a
+  // sensitive message stays in clear text, on purpose: the harness reads OTP
+  // codes from it. Everything below this block keeps only `kept(r)`.
   const SMS_STUB_FILE = process.env.SMS_STUB_FILE
   if (SMS_STUB_FILE && !isProd) {
     const fs = await import('node:fs')
@@ -128,7 +145,7 @@ export async function sendSMS(
         recipients: resolvedRecipients.map((r) => ({
           phone: r.phone,
           patientId: r.patientId,
-          preview: r.message.slice(0, 80),
+          preview: kept(r).slice(0, 80),
         })),
       },
       `[SMS DEV] ${reason} — simulated send`
@@ -136,7 +153,7 @@ export async function sendSMS(
     console.log(`\n[SMS DEV MODE] ${reason} — would send the following messages:`)
     for (const r of resolvedRecipients) {
       console.log(`  To: ${r.phone}${r.patientId ? ` (patient ${r.patientId})` : ''}`)
-      console.log(`  Message: ${r.message}`)
+      console.log(`  Message: ${kept(r)}`)
     }
     console.log('[SMS DEV MODE] ─────────────────────────────────────────\n')
 
@@ -147,7 +164,7 @@ export async function sendSMS(
         batchId: 'DEV_SIMULATED',
         messageId: `dev_${Date.now()}`,
         recipient: r.phone,
-        content: r.message,
+        content: kept(r),
         type,
         status: 'dev_simulated',
         patientId: r.patientId ?? null,
@@ -210,7 +227,7 @@ export async function sendSMS(
           batchId: 'FAILED',
           messageId: 'FAILED',
           recipient: r.phone,
-          content: r.message,
+          content: kept(r),
           type: type,
           status: `failed: [${response.status}] ${errorText.substring(0, 40) || 'Unknown error'}`,
           patientId: r.patientId || null,
@@ -238,7 +255,7 @@ export async function sendSMS(
         batchId: null,
         messageId: messageId,
         recipient: resolvedRecipients[0].phone,
-        content: resolvedRecipients[0].message,
+        content: kept(resolvedRecipients[0]),
         type: type,
         status: status,
         patientId: resolvedRecipients[0].patientId || null,
@@ -256,7 +273,7 @@ export async function sendSMS(
             batchId: batchId,
             messageId: msg.messageId || msg.id || msg.message_id,
             recipient: resolvedRecipients[index].phone,
-            content: resolvedRecipients[index].message,
+            content: kept(resolvedRecipients[index]),
             type: type,
             status: msg.status || 'sent',
             patientId: resolvedRecipients[index].patientId || null,
@@ -272,7 +289,7 @@ export async function sendSMS(
               batchId: batchId || 'BATCH',
               messageId: msg?.messageId || msg?.id || result.messageId || result.id || null,
               recipient: recipient.phone,
-              content: recipient.message,
+              content: kept(recipient),
               type: type,
               status: msg?.status || 'sent',
               patientId: recipient.patientId || null,
@@ -298,7 +315,7 @@ export async function sendSMS(
           batchId: 'ERROR',
           messageId: 'ERROR',
           recipient: r.phone,
-          content: r.message,
+          content: kept(r),
           type: type,
           status: 'failed',
           patientId: r.patientId || null,

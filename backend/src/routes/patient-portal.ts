@@ -5,7 +5,7 @@
  * All routes require a valid patient_session cookie (enforced by getSessionPatient).
  */
 
-import { and, asc, desc, eq, inArray, isNull, notInArray, or } from 'drizzle-orm'
+import { and, asc, desc, eq, inArray, isNull, ne, notInArray, or } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { getDb } from '../db'
 import {
@@ -36,6 +36,7 @@ import { logError } from '../lib/logger'
 import { patientIsOrtho } from '../lib/patient-tags-query'
 import { renderHtmlToPdf } from '../lib/pdf-render'
 import { sendPushToPatients } from '../lib/push'
+import { REDACTED_SMS_BODY } from '../lib/sms-redaction'
 import { renderStatementHtml } from '../lib/statement-html'
 import { uploadToCategory } from '../lib/storage-router'
 import type { HonoEnv } from '../lib/types'
@@ -792,10 +793,12 @@ patientPortalApp.get('/reminders', async (c) => {
   const patient = c.get('patientUser')!
   const db = getDb(process.env.DATABASE_URL!)
 
+  // A login code is stored only as a redaction stand-in (lib/sms-redaction.ts);
+  // it is not a reminder, so it is left out of the feed.
   const rows = await db
     .select()
     .from(smsMessages)
-    .where(eq(smsMessages.patientId, patient.id))
+    .where(and(eq(smsMessages.patientId, patient.id), ne(smsMessages.content, REDACTED_SMS_BODY)))
     .orderBy(desc(smsMessages.sentAt))
     .limit(30)
 

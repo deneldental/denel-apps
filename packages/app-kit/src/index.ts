@@ -18,6 +18,8 @@ export {
   type DenelAuth,
   type User,
 } from './auth/create-auth'
+// The password a person chooses for themselves (F20 / D8)
+export { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH, validateNewPassword } from './auth/password'
 // Permissions
 export {
   type PermissionsPayload,

@@ -337,3 +337,75 @@ describe('least privilege', () => {
     expect(roleById.get('admin')?.bundleIds).toEqual([])
   })
 })
+
+// ── Estimates (decision D2, F02) ─────────────────────────────────────────────
+//
+// Doctors build, view and list estimates but hold NO payments permission:
+// `payments:*` also opens payment history, the ledger and refunds, none of which
+// a doctor needs to quote a treatment. `estimates` is its own module, and a child
+// of `payments` and `financial_records` in the hierarchy, so every role that
+// already holds payments access keeps estimates access without a single grant.
+
+describe('estimates', () => {
+  it('a doctor reads, creates and updates estimates', () => {
+    expect(actionsOn('doctor', 'portal', 'estimates')).toEqual(['create', 'read', 'update'])
+  })
+
+  it('a receptionist does too', () => {
+    expect(actionsOn('receptionist', 'portal', 'estimates')).toEqual(['create', 'read', 'update'])
+  })
+
+  it('a doctor still holds no payments permission of any kind', () => {
+    expect(actionsOn('doctor', 'portal', 'payments')).toEqual([])
+    expect(actionsOn('doctor', 'portal', 'financial_records')).toEqual([])
+  })
+
+  it('nobody is granted estimates:delete', () => {
+    for (const role of SYSTEM_ROLES) {
+      for (const scope of ['portal', 'pwa', 'hr'] as const) {
+        expect(can(role.id, scope, 'estimates', 'delete'), `${role.id} on ${scope}`).toBe(false)
+      }
+    }
+  })
+
+  it('Team-app and HR roles hold no estimates access', () => {
+    for (const [roleId, scope] of [
+      ['staff', 'pwa'],
+      ['lab_technician', 'pwa'],
+      ['external_trainer', 'hr'],
+      ['hr_admin', 'hr'],
+    ] as const) {
+      expect(actionsOn(roleId, scope, 'estimates'), `${roleId} on ${scope}`).toEqual([])
+    }
+  })
+
+  describe('whoever already holds payments access keeps estimates access (hierarchy)', () => {
+    const expand = (module: string, action: string) =>
+      expandWithHierarchy([{ module, action }]).filter((p) => p.module === 'estimates')
+
+    it.each(['read', 'create', 'update'])('payments:%s implies estimates:%s', (action) => {
+      expect(expand('payments', action)).toEqual([{ module: 'estimates', action }])
+    })
+
+    it.each([
+      'read',
+      'create',
+      'update',
+    ])('financial_records:%s implies estimates:%s (the hierarchy is one level deep)', (action) => {
+      expect(expand('financial_records', action)).toEqual([{ module: 'estimates', action }])
+    })
+
+    it('a role with only payments:read can therefore read estimates but not create them', () => {
+      const held = expandWithHierarchy([{ module: 'payments', action: 'read' }])
+      expect(held.some((p) => p.module === 'estimates' && p.action === 'read')).toBe(true)
+      expect(held.some((p) => p.module === 'estimates' && p.action === 'create')).toBe(false)
+    })
+  })
+
+  it('every estimates permission is defined, so a bundle can grant it', () => {
+    const defined = PERMISSION_DEFINITIONS.filter((p) => p.module === 'estimates').map(
+      (p) => p.action
+    )
+    expect(defined.sort()).toEqual(['create', 'read', 'update'])
+  })
+})

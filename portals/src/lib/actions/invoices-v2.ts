@@ -30,6 +30,12 @@ export type InvoiceLine = {
   specialist?: { id: string; name: string }
 }
 
+/**
+ * A service recorded on an invoice's legacy `treatments` column. Invoices raised by the old
+ * payment-plan path have no invoice lines; this is the only record of what they were for.
+ */
+export type LegacyTreatment = { treatmentId?: string; name: string; amount: number }
+
 export type InvoiceDraft = {
   id: string
   invoiceNumber: string
@@ -48,6 +54,10 @@ export type InvoiceDraft = {
   voidedAt: string | null
   voidReason: string | null
   journalEntryId: string | null
+  /** The services of a legacy plan invoice, which has no invoice lines (see `LegacyTreatment`). */
+  treatments?: LegacyTreatment[] | null
+  /** Put away (archived): not owed any more as far as the ledger's totals go. */
+  archived?: boolean | null
 }
 
 export type IssueInvoiceResult = {
@@ -117,6 +127,8 @@ export interface PlanInvoiceSummary {
   balance: number
   dueDate: string | null
   description: string | null
+  /** The services of a legacy plan invoice, which has no invoice lines (see `LegacyTreatment`). */
+  treatments?: LegacyTreatment[] | null
 }
 
 export async function listPlanInvoices(planId: string) {

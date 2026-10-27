@@ -1,9 +1,16 @@
 import { and, asc, eq, gte, lte, sql } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { z } from 'zod'
-import { getDb } from '../db'
+import { type DB, getDb } from '../db'
 import { appointments, patients } from '../db/schema'
 import { handleOnBookingReminders } from '../lib/appointment-reminders-service'
+import {
+  canChangeStatus,
+  isCreatableStatus,
+  isKnownAppointmentStatus,
+  pastDayDecision,
+  TERMINAL_APPOINTMENT_STATUSES,
+} from '../lib/appointment-status'
 import { createAuditLog } from '../lib/audit'
 import { checkDoctorAvailable } from '../lib/doctor-availability'
 import {
@@ -14,11 +21,12 @@ import {
 } from '../lib/google-calendar'
 import { logError } from '../lib/logger'
 import { ACTIONS, MODULES } from '../lib/modules'
+import { ensurePendingMedicalRecord } from '../lib/pending-medical-record-service'
 import { checkPermission, getCurrentUser } from '../lib/rbac'
 import { sendSMS } from '../lib/sms'
 import { resolveSmsTemplate } from '../lib/sms-templates'
 import type { HonoEnv } from '../lib/types'
-import { rejectPastAppointmentDate } from '../lib/validate-date'
+import { isPastAppointmentDate, rejectPastAppointmentDate } from '../lib/validate-date'
 
 const appointmentsApp = new Hono<HonoEnv>()
 
@@ -268,20 +276,35 @@ appointmentsApp.post('/', async (c) => {
     const { data: appointmentData, sendSMS: shouldSendSMS, dateStr, timeStr } = parseResult.data
     const db = getDb(process.env.DATABASE_URL!)
 
+    // A visit starts as a booking or a walk-in, never already completed, in the chair or
+    // a no-show (and never as arbitrary text): see lib/appointment-status.ts.
+    if (!isCreatableStatus(appointmentData.status)) {
+      return c.json(
+        {
+          error: `A new appointment can’t start as "${appointmentData.status}"`,
+          code: 'INVALID_STATUS',
+        },
+        400
+      )
+    }
+
     // Hard guard: no booking for dates that have already passed. Same-day
     // past times are allowed (walk-in documentation). Past dates are not.
     // (`date` is already a Date — coerced by the schema above.)
     const guard = rejectPastAppointmentDate(appointmentData.date)
     if (guard) return c.json(guard, 400)
 
-    // Hard guard: a doctor who blocked this window can't be booked into it.
-    // The clients pre-check too, but this is the rule — website-booking
-    // conversion, reschedules and API callers all land here.
+    // Hard guard: a doctor who blocked this window, already has another
+    // active appointment then, or whose chair is already occupied then,
+    // can't be booked into it. The clients pre-check too, but this is the
+    // rule — website-booking conversion, reschedules and API callers all
+    // land here.
     const blocked = await checkDoctorAvailable(
       db,
       appointmentData.doctorId,
       appointmentData.date,
-      appointmentData.durationMinutes
+      appointmentData.durationMinutes,
+      { chairId: appointmentData.chairId }
     )
     if (blocked) return c.json(blocked, 409)
 
@@ -389,28 +412,74 @@ appointmentsApp.patch('/:id', async (c) => {
     })
     if (!existing) return c.json({ error: 'Appointment not found' }, 404)
 
-    const startOfToday = new Date()
-    startOfToday.setHours(0, 0, 0, 0)
-    const isPast = new Date(existing.date) < startOfToday
-    if (isPast) {
-      if (user.roleId !== 'admin') {
-        return c.json(
-          {
-            error: 'Past appointments are read-only',
-            code: 'APPOINTMENT_PAST_LOCKED',
-          },
-          403
-        )
-      }
-      if (!overrideReason || String(overrideReason).trim().length < 3) {
-        return c.json(
-          {
-            error: 'Editing a past appointment requires a reason (3+ chars)',
-            code: 'OVERRIDE_REASON_REQUIRED',
-          },
-          400
-        )
-      }
+    // Status changes go through the machine in lib/appointment-status.ts (F19).
+    // Saving a visit WITHOUT changing its status (the edit form resends the current
+    // one) is not a transition and is never refused here.
+    const requestedStatus = typeof updateData.status === 'string' ? updateData.status : null
+    const statusChange = requestedStatus !== null && requestedStatus !== existing.status
+
+    if (statusChange && !isKnownAppointmentStatus(requestedStatus)) {
+      return c.json(
+        { error: `Unknown appointment status "${requestedStatus}"`, code: 'INVALID_STATUS' },
+        400
+      )
+    }
+
+    // A terminal appointment (completed/cancelled/no_show) can't be reopened via a
+    // status change here — mirrors appointment-workflow.ts's /transition. Non-status
+    // edits (e.g. fixing a typo in notes) on a terminal appointment still go through
+    // the past-appointment lock below, which already requires an admin + a reason.
+    if (statusChange && TERMINAL_APPOINTMENT_STATUSES.has(existing.status)) {
+      return c.json(
+        {
+          error: `This appointment is already ${existing.status.replace('_', ' ')} and can't be changed further.`,
+          code: 'APPOINTMENT_TERMINAL',
+        },
+        409
+      )
+    }
+    if (statusChange && !canChangeStatus(existing.status, requestedStatus)) {
+      return c.json(
+        {
+          error: `A ${existing.status.replace('_', ' ')} appointment can't be moved to ${requestedStatus.replace('_', ' ')}.`,
+          code: 'APPOINTMENT_INVALID_TRANSITION',
+        },
+        409
+      )
+    }
+
+    // Past-appointment lock (decision D6): history is immutable for non-admins,
+    // except that yesterday's visit may be closed out as no-show or completed by a
+    // status-only change. Admins can edit anything but must supply a reason, which
+    // we persist on the audit row.
+    const STATUS_ONLY_KEYS = new Set(['status', 'checkedInAt', 'inChairAt', 'completedAt'])
+    const statusOnly =
+      statusChange && Object.keys(updateData).every((key) => STATUS_ONLY_KEYS.has(key))
+    const pastDecision = pastDayDecision({
+      appointmentDate: new Date(existing.date),
+      now: new Date(),
+      isAdmin: user.roleId === 'admin',
+      targetStatus: statusChange ? requestedStatus : null,
+      statusOnly,
+    })
+    if (pastDecision === 'locked') {
+      return c.json(
+        {
+          error: 'Past appointments are read-only',
+          code: 'APPOINTMENT_PAST_LOCKED',
+        },
+        403
+      )
+    }
+    const isPast = pastDecision === 'needs_reason'
+    if (isPast && (!overrideReason || String(overrideReason).trim().length < 3)) {
+      return c.json(
+        {
+          error: 'Editing a past appointment requires a reason (3+ chars)',
+          code: 'OVERRIDE_REASON_REQUIRED',
+        },
+        400
+      )
     }
 
     // `date` is already a Date — coerced by the schema above.
@@ -423,20 +492,29 @@ appointmentsApp.patch('/:id', async (c) => {
       if (guard) return c.json(guard, 400)
     }
 
-    // Block-time guard, but only when the booking actually MOVES (new time or
-    // new doctor). A status-only PATCH — check-in, complete, cancel — must keep
-    // working on an appointment that a later block happens to overlap;
-    // otherwise blocking a day would freeze the visits already on it.
+    // Conflict guard (block-time, another active appointment for the same
+    // doctor, or the same chair), but only when the booking actually MOVES
+    // (new time, new doctor, or new chair). A status-only PATCH — check-in,
+    // complete, cancel — must keep working on an appointment that a later
+    // block/booking happens to overlap; otherwise blocking a day (or booking
+    // a neighbouring slot) would freeze the visits already on it.
+    // excludeAppointmentId is this row's own id — without it, a reschedule
+    // would always "conflict" with itself.
     const movesTime = updateData.date instanceof Date
     const movesDoctor = typeof updateData.doctorId === 'string'
-    if (movesTime || movesDoctor) {
+    const movesChair = updateData.chairId !== undefined
+    if (movesTime || movesDoctor || movesChair) {
       const nextDate = movesTime ? (updateData.date as Date) : new Date(existing.date)
       const nextDoctorId = movesDoctor ? (updateData.doctorId as string) : existing.doctorId
+      const nextChairId = movesChair ? updateData.chairId : existing.chairId
       const nextDuration =
         typeof updateData.durationMinutes === 'number'
           ? updateData.durationMinutes
           : existing.durationMinutes
-      const blocked = await checkDoctorAvailable(db, nextDoctorId, nextDate, nextDuration)
+      const blocked = await checkDoctorAvailable(db, nextDoctorId, nextDate, nextDuration, {
+        excludeAppointmentId: id,
+        chairId: nextChairId,
+      })
       if (blocked) return c.json(blocked, 409)
     }
 
@@ -451,11 +529,40 @@ appointmentsApp.patch('/:id', async (c) => {
 
     c.set('skipAudit', true)
 
-    const [updatedItem] = await db
-      .update(appointments)
-      .set(updateData)
-      .where(eq(appointments.id, id))
-      .returning()
+    // The status change is conditional on the status we just checked it against,
+    // so two overlapping requests cannot both pass the machine; the loser is told
+    // the visit changed. A booked patient who is checked in becomes the doctor's
+    // next to-do, in the same transaction as the status (F18).
+    const becameCheckedIn = statusChange && requestedStatus === 'checked_in'
+    const updatedRows = await db.transaction(async (tx) => {
+      const rows = await tx
+        .update(appointments)
+        .set(updateData)
+        .where(
+          statusChange
+            ? and(eq(appointments.id, id), eq(appointments.status, existing.status))
+            : eq(appointments.id, id)
+        )
+        .returning()
+      if (rows.length > 0 && becameCheckedIn) {
+        await ensurePendingMedicalRecord(tx as unknown as DB, {
+          patientId: rows[0].patientId,
+          doctorId: rows[0].doctorId,
+          appointmentId: id,
+        })
+      }
+      return rows
+    })
+    const updatedItem = updatedRows[0]
+    if (!updatedItem) {
+      return c.json(
+        {
+          error: 'This appointment was just changed by someone else. Refresh and try again.',
+          code: 'APPOINTMENT_CHANGED',
+        },
+        409
+      )
+    }
 
     // Fetch context for audit log
     const appointment = await db.query.appointments.findFirst({
@@ -564,9 +671,7 @@ appointmentsApp.delete('/:id', async (c) => {
     // the override reason via the `?reason=` query string (the action wrapper
     // uses GET-style cancellation with no body).
     if (appointment) {
-      const startOfToday = new Date()
-      startOfToday.setHours(0, 0, 0, 0)
-      const isPast = new Date(appointment.date) < startOfToday
+      const isPast = isPastAppointmentDate(new Date(appointment.date))
       const overrideReason = (c.req.query('reason') ?? '').trim()
       if (isPast) {
         if (user.roleId !== 'admin') {

@@ -40,6 +40,19 @@ interface WeekViewProps {
   appointmentTypesLookup: Map<string, { colour?: string }>
 }
 
+const PX_PER_HOUR = 80 // h-20 = 5rem = 80px, matches the hour-row height below.
+const MIN_EVENT_HEIGHT_PX = 24 // Keeps very short visits readable/clickable.
+const DEFAULT_DURATION_MINUTES = 30
+
+// [Medium] Every appointment card used to render at a fixed 70px regardless
+// of length — a 15-min and a 2-hour visit looked identical. durationMinutes
+// was already available (used correctly elsewhere for a text end-time
+// label); the calendar grid just never read it.
+function eventHeightPx(durationMinutes: unknown): number {
+  const minutes = Number(durationMinutes) || DEFAULT_DURATION_MINUTES
+  return Math.max(MIN_EVENT_HEIGHT_PX, (minutes / 60) * PX_PER_HOUR)
+}
+
 export function WeekView({
   date,
   events,
@@ -51,8 +64,11 @@ export function WeekView({
   // highlight, themeColor for the time-axis labels.
   const { accentColor, themeColor } = useBranding()
 
-  const weekStart = startOfWeek(date)
-  const weekEnd = endOfWeek(date)
+  // [Medium] Was Sunday-start (date-fns default) while the sidebar's
+  // week-strip uses Monday-start (weekStartsOn: 1) — two different
+  // definitions of "this week" visible on the same page.
+  const weekStart = startOfWeek(date, { weekStartsOn: 1 })
+  const weekEnd = endOfWeek(date, { weekStartsOn: 1 })
   const weekDays = eachDayOfInterval({ start: weekStart, end: weekEnd })
 
   // Generate hours 8 AM to 8 PM
@@ -165,7 +181,7 @@ export function WeekView({
                       )}
                       style={{
                         top: `${topOffset}px`,
-                        height: '70px',
+                        height: `${eventHeightPx(event.appointment?.durationMinutes)}px`,
                         backgroundColor: colour.background,
                         color: colour.text,
                       }}

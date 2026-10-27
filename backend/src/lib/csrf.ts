@@ -19,6 +19,7 @@
  *  - /api/health           — public, no state change
  *  - /api/website-bookings — authenticated by API key, not session cookie
  *  - /api/xrays/public/*   — public share-token endpoints
+ *  - /api/appointment-workflow/public/* — the patient's SMS confirm/cancel link (token-authenticated)
  *  - /api/csrf             — issues the token, must be reachable without it
  *  - /api/staff/attendance/webhook — the Anviz device, authenticated by its password
  *  - /api/internal/cron/*  — called server-to-server (the "Run now" self-call,
@@ -69,13 +70,24 @@ const BYPASS_PATTERNS: RegExp[] = [
   /^\/api\/auth(\/|$)/,
   /^\/api\/website-bookings(\/|$)/,
   /^\/api\/xrays\/public(\/|$)/,
+  // The patient's SMS confirm/cancel link. Authenticated by the token in the URL
+  // (rate-limited per token and per address), with no session or cookie to forge,
+  // from a page on another origin that cannot hold a CSRF pair. Without this the
+  // page's POST was answered 403 and no patient could ever confirm (F32).
+  /^\/api\/appointment-workflow\/public(\/|$)/,
   /^\/api\/staff\/attendance\/webhook(\/|$)/,
   /^\/api\/internal\/cron(\/|$)/,
 ]
 
-function shouldBypass(path: string): boolean {
+/**
+ * True for the paths that carry no session cookie by design (see the list above).
+ * Exported so other session-aware layers can leave the same routes alone.
+ */
+export function isCsrfBypassPath(path: string): boolean {
   return BYPASS_PATTERNS.some((re) => re.test(path))
 }
+
+const shouldBypass = isCsrfBypassPath
 
 function generateToken(): string {
   const buf = new Uint8Array(TOKEN_BYTES)

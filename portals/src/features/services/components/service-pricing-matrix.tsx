@@ -24,7 +24,7 @@ import {
 } from '@/shared/components/ui/select'
 import { Skeleton } from '@/shared/components/ui/skeleton'
 import { Switch } from '@/shared/components/ui/switch'
-import { formatAmount } from '@/shared/utils/currency'
+import { formatAmount, parseCurrency } from '@/shared/utils/currency'
 
 interface Props {
   serviceId: string
@@ -68,6 +68,9 @@ export function ServicePricingMatrix({ serviceId, isAdmin, onDirtyChange }: Prop
 
   const [variantsEnabled, setVariantsEnabled] = useState(false)
   const [cells, setCells] = useState<CellRow[]>([])
+  /** Cedis text of the price of each unit after the first ('' = none); asked for only while the
+   *  service's application type is billed in steps. */
+  const [additionalUnitPrice, setAdditionalUnitPrice] = useState('')
 
   const [snapshot, setSnapshot] = useState<string>('')
   const [saving, setSaving] = useState(false)
@@ -93,30 +96,33 @@ export function ServicePricingMatrix({ serviceId, isAdmin, onDirtyChange }: Prop
   // initial load, or after a successful save's refetch. Structural sharing
   // keeps `matrixQuery.data` the same reference across a no-op background
   // refetch, so this doesn't clobber an in-progress edit.
+  // The "nothing changed yet" snapshot is taken here, from the same values the fields are seeded
+  // with: an effect of its own would run in the same commit and read the fields before the seeding
+  // landed, so a service with variants (or an additional-unit price) opened as unsaved.
   useEffect(() => {
     const mx = matrixQuery.data
     if (!mx) return
     const svc = mx.service
-    setLoadedScope(mx.scope ?? null)
-    setServiceCode((svc.serviceCode as string | null) ?? null)
-    setBaseAmount(Number(svc.amount) || 0)
-    setVariantsEnabled(Boolean(svc.variantsEnabled) && mx.cells.length >= 0)
-    setCells(
-      mx.cells.map((c) => ({
+    const seeded = {
+      variantsEnabled: Boolean(svc.variantsEnabled) && mx.cells.length >= 0,
+      cells: mx.cells.map((c) => ({
         variantName: c.variantName ?? '',
         toothClassId: c.toothClassId ?? '',
         price: centsToCedisInput(c.price ?? 0),
-      }))
-    )
+      })),
+      additionalUnitPrice:
+        svc.additionalUnitPrice != null ? centsToCedisInput(Number(svc.additionalUnitPrice)) : '',
+    }
+    setLoadedScope(mx.scope ?? null)
+    setServiceCode((svc.serviceCode as string | null) ?? null)
+    setBaseAmount(Number(svc.amount) || 0)
+    setVariantsEnabled(seeded.variantsEnabled)
+    setCells(seeded.cells)
+    setAdditionalUnitPrice(seeded.additionalUnitPrice)
+    setSnapshot(JSON.stringify(seeded))
   }, [matrixQuery.data])
 
-  useEffect(() => {
-    if (!loading && snapshot === '') {
-      setSnapshot(JSON.stringify({ variantsEnabled, cells }))
-    }
-  }, [loading, snapshot, variantsEnabled, cells])
-
-  const current = JSON.stringify({ variantsEnabled, cells })
+  const current = JSON.stringify({ variantsEnabled, cells, additionalUnitPrice })
   const dirty = snapshot !== '' && current !== snapshot
 
   useEffect(() => {
@@ -126,6 +132,8 @@ export function ServicePricingMatrix({ serviceId, isAdmin, onDirtyChange }: Prop
   const variantType = loadedScope?.variantType ?? 'none'
   const showVariants = variantType !== 'none'
   const showClass = variantType === 'tooth_class'
+  // The first-unit / additional-unit tariff is the type's to switch on (Application types tab).
+  const steppedType = loadedScope?.additionalUnitPriceEnabled === true
 
   const setCell = useCallback((idx: number, patch: Partial<CellRow>) => {
     setCells((prev) => prev.map((c, i) => (i === idx ? { ...c, ...patch } : c)))
@@ -153,10 +161,24 @@ export function ServicePricingMatrix({ serviceId, isAdmin, onDirtyChange }: Prop
         return
       }
     }
+    // Sent only while the type is billed in steps, so a save of another type's service never
+    // touches a price it does not show. Empty → none: every unit at the full price.
+    let additionalUnitPriceCents: number | null = null
+    if (steppedType && additionalUnitPrice.trim() !== '') {
+      const typed = Number(additionalUnitPrice)
+      if (!Number.isFinite(typed) || typed < 0) {
+        toast.error('Enter a price of 0 or more for each additional unit, or leave it empty.')
+        return
+      }
+      additionalUnitPriceCents = parseCurrency(additionalUnitPrice)
+    }
 
     setSaving(true)
     try {
-      const svcRes = await updateService(serviceId, { variantsEnabled })
+      const svcRes = await updateService(serviceId, {
+        variantsEnabled,
+        ...(steppedType ? { additionalUnitPrice: additionalUnitPriceCents } : {}),
+      })
       if (!svcRes.success) {
         toast.error(svcRes.error || 'Failed to save')
         setSaving(false)
@@ -215,6 +237,28 @@ export function ServicePricingMatrix({ serviceId, isAdmin, onDirtyChange }: Prop
         Application type: <strong className="mx-1">{loadedScope?.displayName ?? 'Flat'}</strong> ·
         base price {ghs(baseAmount)}.
       </p>
+
+      {steppedType && (
+        <div className="space-y-1.5 rounded-md border px-3 py-2.5">
+          <Label htmlFor="additional-unit-price">Price of each additional unit</Label>
+          <p className="text-xs text-muted-foreground">
+            {loadedScope?.displayName} is billed in steps: the base price (or the chosen variant's
+            price) covers the first unit, and each further unit costs this. Leave it empty to bill
+            every unit at the full price.
+          </p>
+          <Input
+            id="additional-unit-price"
+            type="number"
+            min="0"
+            step="0.01"
+            placeholder="e.g. 60.00"
+            value={additionalUnitPrice}
+            onChange={(e) => setAdditionalUnitPrice(e.target.value)}
+            disabled={!isAdmin}
+            className="h-9"
+          />
+        </div>
+      )}
 
       {!showVariants ? (
         <div className="rounded-md border border-dashed p-4 text-center text-sm text-muted-foreground">

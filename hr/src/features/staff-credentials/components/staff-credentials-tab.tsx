@@ -434,6 +434,7 @@ function CredentialFormDialog({
     if (!file) return
     setUploading(true)
     const up = await uploadFile(file, {
+      storageCategory: 'staff',
       folder: 'credentials',
       subfolder: staffId,
       profile: 'imageOrPdf',

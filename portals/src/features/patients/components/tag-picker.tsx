@@ -18,7 +18,7 @@ export function TagPicker({
   label?: string
   onCatalogLoaded?: (catalog: PatientTag[]) => void
 }) {
-  const { catalog } = usePatientTagCatalog({ activeOnly: true })
+  const { catalog, isLoading } = usePatientTagCatalog({ activeOnly: true })
 
   // Bubble the loaded catalog up to the parent form (e.g. to resolve the
   // 'insurance' system tag) once it's fetched, same contract as before.
@@ -30,7 +30,21 @@ export function TagPicker({
     onChange(value.includes(id) ? value.filter((t) => t !== id) : [...value, id])
   }
 
-  if (catalog.length === 0) return null
+  // Loading: render nothing rather than flash an empty-state message that's
+  // about to be replaced. [Medium] Genuinely empty (no active tags
+  // configured) used to also render nothing — an admin with zero tags set
+  // up saw no sign the section existed at all, let alone why.
+  if (isLoading) return null
+  if (catalog.length === 0) {
+    return (
+      <div className="space-y-2">
+        <p className="text-sm font-semibold">{label}</p>
+        <p className="text-xs text-muted-foreground">
+          No tags configured yet — add one in Settings → Patient Tags.
+        </p>
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-2">

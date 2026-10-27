@@ -29,6 +29,10 @@ const envSchema = z.object({
 
   // ── CORS ───────────────────────────────────────────────────────────────────
   ALLOWED_ORIGINS: z.string().optional(),
+  // Where people are sent by a link: the clinic portal (confirmation SMS, X-ray share links,
+  // document signing, the return from Google) and the patient app (the invitation text). Optional
+  // here so development runs without them (lib/public-urls.ts falls back to the local servers);
+  // staging and production must set both (assertPublicUrlsConfigured).
   PORTAL_URL: z.string().url().optional(),
   PATIENT_PORTAL_URL: z.string().url().optional(),
 
@@ -128,10 +132,67 @@ export function validateBackendEnv(): BackendEnv {
     console.error(message)
     throw new Error(message)
   }
-  cached = result.data
-  assertTrustedIpConfigured(cached)
-  assertPrivateFileSecretConfigured(cached)
+  // Cached only once the deploy-time checks have passed: a configuration that was refused must not
+  // be served to the next caller as if it had been accepted.
+  const parsed = result.data
+  assertTrustedIpConfigured(parsed)
+  assertPrivateFileSecretConfigured(parsed)
+  assertPublicUrlsConfigured(parsed)
+  cached = parsed
   return cached
+}
+
+/**
+ * A deployed backend has to say where the portal and the patient app live, and neither address may
+ * point at the machine itself. They are the addresses put into appointment-confirmation SMS, X-ray
+ * share links, document-signing links, the return from Google and the patient-app invitation.
+ * `PORTAL_URL` used to be optional and the routes fell back to the patient app's host (which has
+ * none of those pages) or to `http://localhost:5173`, so a deploy that lacked them started and
+ * quietly sent people dead links. Development is exempt: lib/public-urls.ts uses the local servers.
+ */
+function assertPublicUrlsConfigured(e: BackendEnv): void {
+  const deployed = (e.APP_ENV ?? e.NODE_ENV) !== 'development'
+  if (!deployed) return
+
+  const problems: string[] = []
+  for (const [name, value] of [
+    ['PORTAL_URL', e.PORTAL_URL],
+    ['PATIENT_PORTAL_URL', e.PATIENT_PORTAL_URL],
+  ] as const) {
+    if (!value) problems.push(`${name} is not set`)
+    else if (pointsAtThisMachine(value)) problems.push(`${name} points at this machine (${value})`)
+  }
+  if (problems.length === 0) return
+
+  const message = [
+    `❌ ${problems.join('; ')}.`,
+    '',
+    'These are the addresses put into appointment-confirmation SMS, X-ray share links, document-signing',
+    'links, the return from Google and the patient-app invitation. A backend that does not know them',
+    'would send people to a page that does not exist.',
+    '',
+    '  PORTAL_URL          the clinic portal, e.g. https://portal.deneldental.com',
+    '  PATIENT_PORTAL_URL  the patient app,   e.g. https://app.deneldental.com',
+  ].join('\n')
+  console.error(message)
+  throw new Error(message)
+}
+
+/** localhost, loopback, 0.0.0.0 and *.localhost: an address that only means something on the machine it is read on. */
+function pointsAtThisMachine(address: string): boolean {
+  let host: string
+  try {
+    host = new URL(address).hostname.toLowerCase()
+  } catch {
+    return false // not a URL at all: the schema's own check reports that
+  }
+  return (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host === '0.0.0.0' ||
+    host === '[::1]' ||
+    /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
+  )
 }
 
 /**

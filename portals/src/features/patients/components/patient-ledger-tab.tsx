@@ -209,7 +209,7 @@ export function PatientLedgerTab({ patientId, isAdmin = false, onLedgerChange }:
 
           {/* Tab 4: archived invoices + plans (combined, filterable). */}
           <TabsContent value="archived" className="mt-4">
-            <ArchivedTab patientId={patientId} isAdmin={isAdmin} />
+            <ArchivedTab patientId={patientId} isAdmin={isAdmin} onRefresh={refreshLedger} />
           </TabsContent>
         </Tabs>
       </div>

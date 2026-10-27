@@ -12,7 +12,7 @@ import { Checkbox } from '@/shared/components/ui/checkbox'
 import { Input } from '@/shared/components/ui/input'
 import { Label } from '@/shared/components/ui/label'
 import { useSubmitGuard } from '@/shared/hooks/use-submit-guard'
-import { parseCurrency } from '@/shared/utils/currency'
+import { centsToInput, parseCurrency } from '@/shared/utils/currency'
 import { ghs } from './shared'
 
 type PaymentSource = {
@@ -63,7 +63,11 @@ export function ConfirmEstimateSheet({
   onCreatePlan,
 }: Props) {
   const [takePayment, setTakePayment] = useState(true)
+  /** Text the patient a confirmation of the payment taken (G08); there is none without a payment. */
+  const [sendSms, setSendSms] = useState(true)
   const [sources, setSources] = useState<PaymentSource[]>([newSource('cash')])
+  /** Reception typed an amount: from then on the sheet leaves the amounts alone. */
+  const [amountTyped, setAmountTyped] = useState(false)
 
   const [selectedLineIds, setSelectedLineIds] = useState<Set<string>>(new Set())
 
@@ -95,15 +99,18 @@ export function ConfirmEstimateSheet({
           .reduce((acc, l) => acc + Number(l.lineTotal), 0)
       : estimateTotal
 
-  // Seed the first source amount to the active total whenever it changes and
-  // the user hasn't typed into any other sources yet.
+  // The one method's amount follows the ticked lines' total — unticking a line takes it off the
+  // payment too — until reception types an amount or splits the payment. (It used to be set once
+  // and never again, which mattered once the unticked lines stopped being invoiced.)
   useEffect(() => {
+    if (amountTyped) return
     setSources((prev) => {
-      if (prev.length !== 1 || prev[0]?.amount !== '') return prev
+      if (prev.length !== 1) return prev
       // The input holds cedis TEXT; `activeTotal` is cents.
-      return [{ ...prev[0], amount: (activeTotal / 100).toFixed(2) }]
+      const amount = centsToInput(activeTotal)
+      return prev[0].amount === amount ? prev : [{ ...prev[0], amount }]
     })
-  }, [activeTotal])
+  }, [activeTotal, amountTyped])
 
   // Reset/derive the line-selection whenever the loaded lines change (a fresh
   // fetch for this invoice, or the sheet closing/clearing to no invoice).
@@ -179,7 +186,11 @@ export function ConfirmEstimateSheet({
     }
 
     await submit(async () => {
-      const res = await confirmEstimate(appointmentId, payments)
+      const res = await confirmEstimate(appointmentId, payments, {
+        sendSms: takePayment && sendSms,
+        // Only the ticked lines are issued; the server moves the rest to a new draft estimate.
+        acceptedLineItemIds,
+      })
 
       if (!res.success) {
         setStatusMessage(res.error || 'Failed to confirm')
@@ -190,6 +201,9 @@ export function ConfirmEstimateSheet({
       toast.success(
         takePayment ? 'Confirmed — payment recorded.' : 'Estimate issued — collect later.'
       )
+      if (res.smsError) {
+        toast.warning(`Payment recorded, but the confirmation text was not sent: ${res.smsError}`)
+      }
 
       if (takePayment) {
         try {
@@ -319,7 +333,10 @@ export function ConfirmEstimateSheet({
                     min="0"
                     step="0.01"
                     value={src.amount}
-                    onChange={(e) => updateSource(src.key, { amount: e.target.value })}
+                    onChange={(e) => {
+                      setAmountTyped(true)
+                      updateSource(src.key, { amount: e.target.value })
+                    }}
                   />
                 </div>
                 <div className="col-span-6 sm:col-span-4 space-y-1.5">
@@ -369,6 +386,17 @@ export function ConfirmEstimateSheet({
                 Wallet credit available is {ghs(walletBalance)}; you've entered {ghs(walletUsed)}.
               </p>
             )}
+
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="confirm-send-sms"
+                checked={sendSms}
+                onCheckedChange={(v) => setSendSms(v === true)}
+              />
+              <Label htmlFor="confirm-send-sms" className="cursor-pointer text-sm font-normal">
+                Text the patient a payment confirmation (SMS)
+              </Label>
+            </div>
           </div>
         )}
       </div>

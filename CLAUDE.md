@@ -61,7 +61,7 @@ Framada Dental Clinic management system. Multi-app pnpm monorepo orchestrated by
 - **Doppler** — source of truth for all app secrets. Project: `framada-projects`, configs: `dev`, `stg`, `prd`.
 - **GitHub Secrets** — platform tokens only (Cloudflare, Render deploy hook, `HETZNER_HOST`/`HETZNER_USERNAME`/`HETZNER_SSH_KEY`, Doppler service tokens).
 - **Render env** — backend staging runtime env vars. Synced from Doppler `stg` via Doppler-Render native integration (configured in Doppler dashboard, not CI). Service config lives in `render.yaml` at the repo root.
-- **Hetzner VPS env** — backend production runtime env vars live in `/opt/framada/.env` on the VPS. Every production deploy merges Doppler `prd` into it (`.github/workflows/deploy.yml`, since 2026-09-04): keys Doppler defines win, keys only on the VPS (e.g. `DATABASE_URL`) are kept and can only be read or changed on the server, and the deploy aborts before touching the container if `DATABASE_URL`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `ALLOWED_ORIGINS` or `PRIVATE_FILE_REF_SECRET` is empty after the merge.
+- **Hetzner VPS env** — backend production runtime env vars live in `/opt/framada/.env` on the VPS. Every production deploy merges Doppler `prd` into it (`.github/workflows/deploy.yml`, since 2026-09-04): keys Doppler defines win, keys only on the VPS (e.g. `DATABASE_URL`) are kept and can only be read or changed on the server, and the deploy aborts before touching the container if `DATABASE_URL`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `ALLOWED_ORIGINS`, `PRIVATE_FILE_REF_SECRET`, `PORTAL_URL` or `PATIENT_PORTAL_URL` is empty after the merge. The backend itself also refuses to start in staging or production without `PORTAL_URL` and `PATIENT_PORTAL_URL`, or with either pointing at localhost (`config/env.ts`).
 - **Full inventory** of every secret, third-party credential (Hubtel, Resend, R2, Sentry, Google, …) and setup switch, with where each one goes: `project-docs/secrets-and-integrations.md`.
 - **Local dev** — run with `doppler run -- pnpm dev` to inject secrets from the `dev` config.
 - Frontend env strategy:
@@ -144,6 +144,10 @@ pnpm --filter backend db:local:reset  # wipe the volume and redo up + setup
 # Login: admin@framada.app / password123 (fresh seeds since 2026-09-28 use admin@deneldental.com). See project-docs/local-dev-database.md.
 # Engine: db:local:* uses Podman if installed, else Docker. Force with
 # FRAMADA_CONTAINER_ENGINE=podman|docker. Same plain compose file for both.
+# Compose project is pinned to `denel-local` (top-level `name:` in backend/docker-compose.dev.yml)
+# so it can't collide with another clone's `backend/` compose project (2026-10-26: an
+# unpinned `up` would have recreated the Framada clone's `denel-dev-db` container).
+# Container `framada-dev-db`, volume `denel-local_framada-dev-db`.
 
 # Backend dev — Neon fallback (no container engine)
 cd backend
@@ -155,6 +159,8 @@ pnpm build                           # tsup (bundles workspace packages)
 pnpm lint             # Biome check (all apps)
 pnpm lint:fix         # Biome check + auto-fix
 pnpm format           # Biome format
+pnpm audit:contracts  # backend routes vs every frontend call (strict: a ${…} hole matches a route parameter only)
+pnpm test:contract-audit # the audit's own self-test (CI runs it before the audit)
 
 # Build
 pnpm build:all                       # Build all apps
@@ -163,15 +169,16 @@ pnpm turbo run build --filter=portal # Build specific app
 
 ## CI/CD
 
-Defined in `.github/workflows/deploy.yml`. Branch-based:
+Defined in `.github/workflows/deploy.yml`. Staging deploys automatically; **production deploys only by hand**:
 
-| Branch | What happens |
+| Trigger | What happens |
 |--------|-------------|
 | `staging` push | Quality gates (lint, typecheck, test) → deploy to staging (Render, CF Pages staging) + staging DB migrations |
-| `main` push | Quality gates → build backend image + push to GHCR → SSH to Hetzner (`docker compose pull`/`up -d`, then `migrate.mjs` — production migrations run **on the VPS**, as part of the deploy) + CF Pages prod |
+| `main` push | Quality gates only. It never reaches production. |
+| **Actions → Deploy → Run workflow, on `main`** (`workflow_dispatch`) | Quality gates → build backend image + push to GHCR → SSH to Hetzner (`docker compose pull`/`up -d`, then `migrate.mjs` — production migrations run **on the VPS**, as part of the deploy) + every frontend and the website to Cloudflare, built with Doppler `prd` (a manual run has no diff, so it rebuilds all apps). Manual runs are never cancelled by a later push |
 | PR to `main`/`staging` | Quality gates only (no deploy) |
 
-Promotion: merge `staging` → `main` via PR.
+Promotion: merge `staging` → `main` via PR, then run the workflow by hand when you want it live.
 
 ## Project docs
 
@@ -191,6 +198,10 @@ All technical documentation lives in `project-docs/`. Do not create new .md file
 | `project-docs/api-edge-topology.md` | API edge topology — Cloudflare Tunnel (app side done, infrastructure pending) |
 | `project-docs/lookups_audit_report.md` | Lookups audit & master CSV specification (`master_lookups.csv` alongside) |
 | `project-docs/neon-legacy-data-migration-runbook.md` | Runbook for the one-off legacy data migration from Neon |
+| `project-docs/rbac-doctor-role-desync.md` | RBAC `doctor`/`external_trainer` role vs. `specialists`-table desync (2026-09-29): root cause, the 5 "become a doctor" paths, what was fixed vs. deliberately left, remaining gaps |
+| `project-docs/patient-records-and-scheduling-audit.md` | Patient Records & Scheduling domain audit (2026-09-29): full backend+frontend review — no double-booking prevention anywhere, check-in payment never transitions status, patient hard-delete cascades through all financial history, medical-records route bypasses RBAC and locks out receptionists, patient-edit doesn't refresh the page, plus High/Medium/Low findings — nothing fixed yet, prioritized list for the next pass |
+| `project-docs/DENEL_FRAMADA_AUDIT_2026-10-25.md` | Denel↔Framada comparison + clinic workflow audit (2026-10-25), verified the same day against the working tree: register F01–F98 (P0: `roleId` self-promotion via `/api/auth/update-user`, OTPs readable in the SMS log — both fixed), Framada gap groups G01–G12, owner decisions D1–D23 (§7; D14 on `errMessage()` SQL exposure is still open; D15–D17 on account-creation roles/first passwords/specialist sync are decided and built, D18 closed; D19–D20 on which payments count as plan money and on applying the plan-tag backfill to production are open; D21 on keeping invoice numbers unique under concurrency and D22 on whether the API documents stay public are open; D23, an unknown payment method, is decided: refuse), and the step-by-step implementation plan (Steps 0–10). **Steps 0–9 and the remaining findings F26–F43 are done (2026-10-26), with records in §8.1–§8.14** (§8.9 = the account-creation review, §8.10 = D15–D18, §8.11 = Step 7: the payment-plan page, ledger-payment tagging and its dry-run backfill, `docker compose run --rm backend node dist/scripts/backfill-payment-plan-tags.js`, §8.12 = Step 8: upload kinds with server-made object keys, lookup-only CSV import that reports the rows it leaves out, and `denyUnless` on the endpoints that used to check only for a session, §8.13 = Step 9: every link built through `lib/public-urls.ts` and a deployed backend refusing to start without `PORTAL_URL`/`PATIENT_PORTAL_URL`, the strict contract audit, duplicates answered instead of crashed (`lib/pg-errors.ts`) and the case-number retry, and production deployed only by hand, §8.14 = the adversarial review of Steps 8–9: F61–F70 and F76 fixed — a staff member is created in one transaction with one lock-protected staff-ID allocator, uploads that skipped the policy now follow it, lab-case numbers retry, and an error answer no longer carries a stack trace). **Step 10 is done (2026-10-27), record in §8.15:** the shared service-line editor (G02), one-time payments in several methods (G03), receipts that itemise a one-time payment and tell the truth about reversals (G04), Receive Payment's services, server-side outstanding balance, automatic receipt and balance slip (G05), the first-unit / additional-unit tariff (G01, migration 0234) and the once-only payment-confirmation SMS (G08, migration 0235); F77–F88 found on the way are fixed; **the adversarial review of Step 10 is done (§8.16): F89–F95 fixed (a split's itemisation was counted per method, a payment group could mix patients, a one-time wallet payment moved no money, a plan from an estimate was scheduled from the wrong total, a stepped line did not add up on three screens, a `null` body failed a posted payment, an oversized amount leaked the database's text), F96–F98 accepted with reasons, and an unknown payment method is refused (D23)** |
+| `project-docs/account-creation-workflows.md` | Who creates which kind of person and where (2026-10-26, verified against the running backend): receptionist/staff/admin via the HR app's Add Staff, doctors via the portal's Add specialist, the difference between a `doctor`-role login, a staff record, a specialist and a doctors row, step-by-step workflows, what each admin role can do, and the known gaps |
 
 > The earlier plan/tracker documents this table used to list (admin-v1, finance,
 > HR, PWA split, launch readiness, …) are not in this clone; the table only
@@ -211,9 +222,28 @@ All technical documentation lives in `project-docs/`. Do not create new .md file
 - `can()` in `@denel/rbac` is a pure helper for UI gating
 - Where someone can sign in (portal, Team app `pwa`, HR `hr`) follows the role's scopes (`ROLE_SCOPES` in `@denel/rbac` mirrors `roles.config.ts`); `user_scopes` rows are per-person exceptions only
 - Role bundles and per-user bundles apply only on the apps their scope covers (`applicableBundleScopes`)
+- A password an admin sets for someone else flags the account (`user.mustChangePassword`, `lib/password-change.ts`); the backend then refuses every portal and HR-app call except `/api/auth/*` (not `/admin/*`) and the public routes, with `403 { code: "PASSWORD_CHANGE_REQUIRED" }` (`rbac/middleware/enforcePasswordChange`), until the person changes it. Any new route that sets a password for another person must call `requirePasswordChange`; any flow where the person picks their own must call `clearPasswordChange`. The Team app is not covered, on purpose: it is passwordless (phone number + SMS code, `routes/staff-auth.ts`), so there is nothing to change and enforcing the refusal there would lock its users out (D18)
+- Who may assign roles is `@denel/rbac`'s `canDelegateRoleChange` / `assignableRoleIds`, enforced in `routes/access-management.ts` and the registration approval: `access_management:update` (administrators) assigns any assignable role to anyone; `staff:update` (HR administrators) assigns only Staff, Receptionist and Lab Technician, only to people who hold one of those or none. `doctor` is never assignable from a role screen (it needs a specialist record). A role that signs in to the portal or HR app (`roleSignsInWithPassword`) needs a first password when it is given by registration approval
+- Logins are stored with a lower-cased e-mail (`lib/normalize-email.ts`) because Better Auth looks them up that way; compare with `lower(user.email)`, never `eq(user.email, …)` on raw input
 - Team-app bundles grant only `dashboard` + the self-service tab modules (`my_payslips`, `my_requests`, `my_training`), never admin modules; `/api/staff`, `/api/hr`, `/api/hr3` and `/api/payroll` refuse Team-app sessions
 - Portal route guard and sidebar share `portals/src/app/route-access.ts` — map every new route prefix there, or its page is denied and its link hidden
+- An endpoint that needs a module but no per-record check states its rule with `denyUnless` from `backend/src/lib/route-access.ts` (`apps` that may call it + `anyOf` module permissions); never leave a handler at "signed in is enough" unless it serves the caller's own data. Every lookup type needs a read rule in `lib/lookup-access.ts`: `routes/lookups.ts` refuses to load without one
+- `POST /api/upload` accepts only the kinds of file listed in `backend/src/lib/upload-policy.ts` (each fixes the storage category, the apps, the permission and the file checks; the server makes the object key). A screen that uploads to a new folder needs a new kind, or it gets a 400: `tests/unit/upload-policy-callers.test.ts` reads the portal, HR and Team sources and fails when a folder is not covered
+- Admin CSV import (`/api/database/import/:table`) works only for the lookup tables in `IMPORTABLE_TABLES` (`lib/table-import.ts`); columns another screen owns and checks (an expense category's ledger account and petty-cash type) are in `NOT_FROM_A_FILE`. The server parses the CSV and returns the rows it left out
 - See `project-docs/access-control-remediation.md`
+
+### Backend conventions that tests enforce
+- Links sent to people (confirmation SMS, X-ray share links, signing links, OAuth returns, the patient-app invitation) are built with `backend/src/lib/public-urls.ts` (`portalLink`, `patientAppUrl`), never from `process.env.PORTAL_URL` or a literal address: the portal serves the token pages (`/c/:token`, `/xray-share/:token`), the patient app only its own sign-in. `tests/unit/no-hardcoded-public-urls.test.ts` fails if a route builds its own
+- A Postgres error is read only through `lib/pg-errors.ts` (`isUniqueViolation`, `uniqueViolationOf`): Drizzle wraps the driver's error, so `err.code === '23505'` (or a look at the message text) never matches. `tests/unit/no-raw-sqlstate-checks.test.ts` fails if a route does it. A numbered sequence read as `MAX + 1` (case numbers) must retry on a collision inside a savepoint (`insertCase` in `lib/patient-case-service.ts`, `insertLabCase` in `lib/lab-case-service.ts`; `tests/unit/no-direct-lab-case-inserts.test.ts` keeps lab cases from being inserted anywhere else)
+- A person is created in ONE transaction (`POST /api/staff`, `setup-credentials`, the registration approval, doctor onboarding): the login, credential, second-factor row, staff record, doctor record, app grant and bundle all exist or none do. Do not undo a failure by hand — `staff.userId` and `specialists.userId` are `ON DELETE SET NULL`, so deleting the login leaves the staff record behind. The next staff ID comes only from `nextStaffId(tx)` in `lib/staff-id.ts` (it counts `FDM-S` IDs only and takes an advisory lock; call it first inside the transaction)
+- A file a user uploads goes through `validateUpload()` (the extension must agree with the declared type, and with no declared type the extension names it) and gets a server-built object key — never one made from a file name or a CSV cell, and none that two different people's files can share unless replacing is the point (a branding slot, a document's own signed PDF). The one known exception is the public registration CV (F74: declared type and size only). An error answer to the browser is a sentence; the detail goes to `logError`, and never `error.stack`
+
+### Payments, receipts and pricing (Step 10)
+- `POST /api/payments` takes one payment in several methods as `sources[]` (parsed by `lib/payment-sources.ts`): one payment per method sharing a `paymentGroupId`, each posted as unallocated patient credit, all in one transaction. The server works the total out from what it recorded (the receipt text and the audit entry use it), never from the client. A method that is not set up in Settings, or has been switched off, is refused with `unknown payment method "…"` in every shape (D23: `createDraftPayment` checks every payment, so the one-method form, the draft route, check-in, the estimate confirm and the patient-app confirm all say so and post nothing). A payment amount above `MAX_PAYMENT_AMOUNT` (the 32-bit column) is refused there too, with a sentence. A payment group is one patient's: a draft may not join a group that holds another patient's payment, and the receipt and the confirmation text count only the patient's own payments of a group. What a split was for (`payments.treatments`) is stored once, on its first payment (the revenue-by-treatment figures add it up per payment). Wallet credit can only pay an invoice (`recordLegacyPayment` refuses a wallet amount that pays none); the one-time sheet does not offer it. A route that reads its body after posting must not throw on a body that parses to `null`
+- The receipt (`GET /api/payments/:id/receipt`) counts only the payments in force: it reports `status` (`reversed` / `partly_reversed`), `reversedAmount` and each method's own `status`, lists a split's methods by time then payment number, and itemises a one-time payment from its own items without inventing an invoice (`lib/receipt-allocations.ts`). A print window writes no dynamic text unescaped (`escapeHtml` in `portals/src/shared/utils/receipt-display.ts`)
+- A payment-confirmation text from Receive Payment's draft → post or the estimate confirm goes through `lib/payment-confirmation-sms.ts`: the amount is the posted total of the payment or of its whole group, and the event's dedupe key is claimed in `payment_sms_sends` before anything is sent, so it goes out at most once (a failed text is recorded and not retried). Ask for it (`sendSms: true`) with the LAST payment of a group. It never throws; a failure comes back as `smsError` beside a success
+- First-unit / additional-unit tariff (migration 0234): `computeLine` takes `additionalUnitPrice`, which `resolveServicePrice` reports only while the service's application type has `additionalUnitPriceEnabled` and the service has the price (whichever variant is chosen). Only the catalog-priced paths pass it (estimates, the walk-in); a manual invoice line and the X-ray and lab auto-charges never do, and a stored invoice is never re-priced. The portal's preview (`previewServiceLine` in `portals/src/shared/components/service-lines-editor.tsx`) mirrors it, and a type billed once keeps the switch off (the routes refuse it). A stored stepped line holds the FIRST unit's price as its `unitPrice`: any screen that shows a line's price reads it with `linePriceReading` / `additionalUnitPriceOf` (`portals/src/shared/utils/invoice-line-display.ts`), never as unit price × quantity
+- A money figure a screen could not read is said to be unread, never shown as zero (Receive Payment's wallet credit, outstanding balance and invoice list)
 
 ### Reports visibility
 - **Not implemented.** No backend route serves `finance_visibility` and no portal
@@ -224,7 +254,7 @@ All technical documentation lives in `project-docs/`. Do not create new .md file
 
 ## Environment
 
-- Runtime: Node.js 20, pnpm 9
+- Runtime: Node.js 24 (`.nvmrc`, the backend `Dockerfile`, and every CI job except `deploy-website`, which stays on 22), pnpm 9. Moved from 20 on 2026-10-26 after the backend suite, all-app typecheck, all five frontend builds, schema-drift check and a booted Docker image all passed on 24 (Node 20 reached end-of-life in April 2026). Playwright E2E jobs only discover tests on 24; they need staging URLs to actually run.
 - Build: Turborepo (replaces Nx)
 - Backend bundler: tsup (bundles workspace packages inline)
 - Linting/formatting: Biome 2.x (replaces ESLint + Prettier)
@@ -293,7 +323,7 @@ login only** (not a PWA). Served at `hr.deneldental.com`; dev port **5176**. Log
 | `src/lib/` | `auth` (`@denel/app-kit` `createAuth`), `api`/`api-client`, `actions/*`, `db/schema` (type re-export of backend), `modules`, `sanitize`, `utils` |
 | `src/shared/` | `components/{data-table,*-dialog,...}`, `hooks/{use-permissions,use-form-dirty-guard,use-submit-guard}`, `lib/{dates,api-error,upload-blob,error-reporting}` |
 
-- Built on **`@denel/app-kit`** (headless shell: `createApiClient`, `createAuth`, `createErrorReporter`, `AppErrorBoundary`, `RouteSkeleton`). `@/` → `hr/src/`.
+- Built on **`@denel/app-kit`** (headless shell: `createApiClient`, `createAuth`, `createErrorReporter`, `AppErrorBoundary`, `RouteSkeleton`; its auth glue carries `mustChangePassword` and sends a flagged person to `/auth/change-password`). `@/` → `hr/src/`. The package has its own vitest suite (`pnpm --filter @denel/app-kit test`). The HR app has a minimal Node-only vitest setup (`pnpm --filter hr test`) for the pure logic behind its screens (`src/features/staff/role-access.ts`); it has no DOM component tests.
 - In dev, `vite.config.ts` points the API/auth base at the app's own origin so `/api` is proxied to the backend (no cross-origin CORS); production uses the real injected URLs.
 - RBAC: `hr_admin` role (scope `['hr']`), `admin` also has `'hr'`, `external_trainer` re-scoped to `['hr']`. Seed via `pnpm --filter backend seed:rbac`. Backend `trustedOrigins` + `ALLOWED_ORIGINS` must include the HR origin per env.
 
